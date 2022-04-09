@@ -4,16 +4,16 @@ use std::ops;
 use failure::bail;
 
 
-pub struct Tensor {
+pub struct Mat {
     width: usize,
     height: usize,
     data: Vec<f32>
 }
 
-impl Tensor {
-    pub fn constant(consts: &[&[f32]]) -> Result<Tensor, failure::Error> {
+impl Mat {
+    pub fn constant(consts: &[&[f32]]) -> Result<Mat, failure::Error> {
         if consts.len() == 0 {
-            return Ok(Tensor{
+            return Ok(Mat{
                 width: 0,
                 height: 0,
                 data: Vec::new()
@@ -32,7 +32,7 @@ impl Tensor {
             data.extend(*c);
         }
 
-        return Ok(Tensor{
+        return Ok(Mat{
             width: width,
             height: height,
             data: data
@@ -48,11 +48,11 @@ impl Tensor {
     }
 }
 
-impl ops::Mul for Tensor {
+impl ops::Mul for Mat {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        let mut tensor = Tensor{
+        let mut tensor = Mat{
             width: self.width,
             height: self.height,
             data: Vec::with_capacity(self.data.len())
@@ -66,11 +66,11 @@ impl ops::Mul for Tensor {
     }
 }
 
-impl<'a, 'b> ops::Mul<&'b Tensor> for Tensor {
+impl<'a, 'b> ops::Mul<&'b Mat> for Mat {
     type Output = Self;
 
-    fn mul(self, rhs: &'b Tensor) -> Self::Output {
-        let mut tensor = Tensor{
+    fn mul(self, rhs: &'b Mat) -> Self::Output {
+        let mut tensor = Mat{
             width: self.width,
             height: self.height,
             data: Vec::with_capacity(self.data.len())
@@ -84,7 +84,7 @@ impl<'a, 'b> ops::Mul<&'b Tensor> for Tensor {
     }
 }
 
-impl ops::MulAssign for Tensor {
+impl ops::MulAssign for Mat {
     fn mul_assign(&mut self, rhs: Self) {
         if self.data.len() != rhs.data.len() {
             panic!("Two tensors need to be same size to multiply");
@@ -96,8 +96,8 @@ impl ops::MulAssign for Tensor {
     }
 }
 
-impl<'a, 'b> ops::MulAssign<&'b Tensor> for Tensor {
-    fn mul_assign(&mut self, rhs: &'b Tensor) {
+impl<'a, 'b> ops::MulAssign<&'b Mat> for Mat {
+    fn mul_assign(&mut self, rhs: &'b Mat) {
         if self.data.len() != rhs.data.len() {
             panic!("Two tensors need to be same size to multiply");
         }
@@ -108,7 +108,7 @@ impl<'a, 'b> ops::MulAssign<&'b Tensor> for Tensor {
     }
 }
 
-impl ops::Add for Tensor {
+impl ops::Add for Mat {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -116,7 +116,7 @@ impl ops::Add for Tensor {
             panic!("Two tensors need to be same size to add");
         }
 
-        let mut tensor = Tensor{
+        let mut tensor = Mat{
             width: self.width,
             height: self.height,
             data: Vec::with_capacity(self.data.len()),
@@ -130,15 +130,15 @@ impl ops::Add for Tensor {
     }
 }
 
-impl<'a, 'b> ops::Add<&'b Tensor> for Tensor {
+impl<'a, 'b> ops::Add<&'b Mat> for Mat {
     type Output = Self;
 
-    fn add(self, rhs: &'b Tensor) -> Self::Output {
+    fn add(self, rhs: &'b Mat) -> Self::Output {
         if self.data.len() != rhs.data.len() {
             panic!("Two tensors need to be same size to add");
         }
 
-        let mut tensor = Tensor{
+        let mut tensor = Mat{
             width: self.width,
             height: self.height,
             data: Vec::with_capacity(self.data.len()),
@@ -152,8 +152,8 @@ impl<'a, 'b> ops::Add<&'b Tensor> for Tensor {
     }
 }
 
-impl ops::AddAssign for Tensor {
-    fn add_assign(&mut self, rhs: Tensor) {
+impl ops::AddAssign for Mat {
+    fn add_assign(&mut self, rhs: Mat) {
         if self.data.len() != rhs.data.len() {
             panic!("Two tensors need to be same size to add");
         }
@@ -164,8 +164,8 @@ impl ops::AddAssign for Tensor {
     }
 }
 
-impl<'a, 'b> ops::AddAssign<&'b Tensor> for Tensor {
-    fn add_assign(&mut self, rhs: &'b Tensor) {
+impl<'a, 'b> ops::AddAssign<&'b Mat> for Mat {
+    fn add_assign(&mut self, rhs: &'b Mat) {
         if self.data.len() != rhs.data.len() {
             panic!("Two tensors need to be same size to add");
         }
@@ -176,7 +176,7 @@ impl<'a, 'b> ops::AddAssign<&'b Tensor> for Tensor {
     }
 }
 
-impl fmt::Display for Tensor {
+impl fmt::Display for Mat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut i = 0;
         for n in &self.data {
