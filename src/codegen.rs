@@ -940,6 +940,7 @@ mod tests {
     #[test]
     fn generates_simple_function() {
         let func = FuncDecl {
+            exported: false,
             name: "add_one".to_string(),
             params: vec![Param {
                 name: "x".to_string(),

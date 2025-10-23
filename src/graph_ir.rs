@@ -76,6 +76,7 @@ pub struct GraphFunction {
     pub params: Vec<GraphParam>,
     pub body: GraphBlock,
     pub nodes: Vec<Node>,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +190,7 @@ fn lower_function(func: &FuncDecl) -> GraphFunction {
         params,
         body,
         nodes: builder.into_nodes(),
+        exported: func.exported,
     }
 }
 
@@ -478,6 +480,7 @@ mod tests {
     #[test]
     fn lowers_function_parameter_return() {
         let func = FuncDecl {
+            exported: false,
             name: "id".to_string(),
             params: vec![Param {
                 name: "x".to_string(),
@@ -512,8 +515,24 @@ mod tests {
     }
 
     #[test]
+    fn preserves_export_flag_on_functions() {
+        let func = FuncDecl {
+            exported: true,
+            name: "api".to_string(),
+            params: vec![],
+            body: Block {
+                stmts: vec![Stmt::Return(literal_int(0))],
+            },
+        };
+
+        let graph_fn = lower_single_function(func);
+        assert!(graph_fn.exported);
+    }
+
+    #[test]
     fn lowers_let_and_binary_expression() {
         let func = FuncDecl {
+            exported: false,
             name: "add_one".to_string(),
             params: vec![Param {
                 name: "x".to_string(),
@@ -565,6 +584,7 @@ mod tests {
     #[test]
     fn lowers_for_loop_with_binding_scope() {
         let func = FuncDecl {
+            exported: false,
             name: "loop_fn".to_string(),
             params: vec![],
             body: Block {

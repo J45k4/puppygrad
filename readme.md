@@ -37,7 +37,7 @@ AttrValue     = INT | FLOAT | BOOL | STRING ;
 KVArgsOpt     = [ KVArg { "," KVArg } ] ;
 KVArg         = IDENT "=" Expr ;
 
-FuncDecl      = "fn" IDENT "(" ParamListOpt ")" Block ;
+FuncDecl      = ["export"] "fn" IDENT "(" ParamListOpt ")" Block ;
 ParamListOpt  = [ Param { "," Param } ] ;
 Param         = IDENT [ ":" Type ] ;
 

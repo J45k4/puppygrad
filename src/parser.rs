@@ -33,6 +33,7 @@ pub enum Dim {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FuncDecl {
+    pub exported: bool,
     pub name: String,
     pub params: Vec<Param>,
     pub body: Block,
@@ -283,6 +284,7 @@ enum TokenKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Keyword {
     Tensor,
+    Export,
     Fn,
     Let,
     For,
@@ -499,6 +501,7 @@ impl<'a> Lexer<'a> {
 
         let (kind, literal) = match ident.as_str() {
             "Tensor" => (TokenKind::Keyword(Keyword::Tensor), None),
+            "export" => (TokenKind::Keyword(Keyword::Export), None),
             "fn" => (TokenKind::Keyword(Keyword::Fn), None),
             "let" => (TokenKind::Keyword(Keyword::Let), None),
             "for" => (TokenKind::Keyword(Keyword::For), None),
@@ -822,7 +825,7 @@ impl Parser {
     }
 
     fn parse_top_level_decl(&mut self) -> Result<TopLevelDecl, ParseError> {
-        if self.check_keyword(Keyword::Fn) {
+        if self.check_keyword(Keyword::Fn) || self.is_export_function() {
             Ok(TopLevelDecl::FuncDecl(self.parse_func_decl()?))
         } else if self.check_keyword(Keyword::Tensor)
             && self.lookahead_is_ident()
@@ -832,6 +835,10 @@ impl Parser {
         } else {
             Ok(TopLevelDecl::Stmt(self.parse_stmt()?))
         }
+    }
+
+    fn is_export_function(&self) -> bool {
+        self.check_keyword(Keyword::Export) && self.lookahead_keyword(1, Keyword::Fn)
     }
 
     fn parse_tensor_decl(&mut self) -> Result<TensorDecl, ParseError> {
@@ -862,7 +869,12 @@ impl Parser {
     }
 
     fn parse_func_decl(&mut self) -> Result<FuncDecl, ParseError> {
-        self.consume_keyword(Keyword::Fn, "expected 'fn'")?;
+        let exported = self.match_keyword(Keyword::Export);
+        if exported {
+            self.consume_keyword(Keyword::Fn, "expected 'fn' after 'export'")?;
+        } else {
+            self.consume_keyword(Keyword::Fn, "expected 'fn'")?;
+        }
         let name = self.consume_ident("expected function name")?;
         self.consume(TokenKind::LParen, "expected '(' after function name")?;
         let params = if self.check_kind(TokenKind::RParen) {
@@ -872,7 +884,12 @@ impl Parser {
         };
         self.consume(TokenKind::RParen, "expected ')' after parameters")?;
         let body = self.parse_block()?;
-        Ok(FuncDecl { name, params, body })
+        Ok(FuncDecl {
+            exported,
+            name,
+            params,
+            body,
+        })
     }
 
     fn parse_param_list(&mut self) -> Result<Vec<Param>, ParseError> {
@@ -1500,6 +1517,13 @@ impl Parser {
             .unwrap_or(false)
     }
 
+    fn lookahead_keyword(&self, offset: usize, keyword: Keyword) -> bool {
+        self.tokens
+            .get(self.current + offset)
+            .map(|token| matches!(token.kind, TokenKind::Keyword(k) if k == keyword))
+            .unwrap_or(false)
+    }
+
     fn lookahead_is_ident(&self) -> bool {
         self.tokens
             .get(self.current + 1)
@@ -1600,6 +1624,25 @@ mod tests {
         );
         assert_eq!(program.items.len(), 1);
         assert!(matches!(program.items[0], TopLevelDecl::FuncDecl(_)));
+    }
+
+    #[test]
+    fn parses_exported_function() {
+        let program = parse_program(
+            r#"
+                export fn foo() {
+                    return 0;
+                }
+            "#,
+        );
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            TopLevelDecl::FuncDecl(func) => {
+                assert!(func.exported);
+                assert_eq!(func.name, "foo");
+            }
+            other => panic!("expected function declaration, found {:?}", other),
+        }
     }
 
     #[test]
