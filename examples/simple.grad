@@ -1,0 +1,5 @@
+
+let a = Tensor(2);
+let b = Tensor(2);
+let c = a + b;
+    
