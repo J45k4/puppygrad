@@ -122,9 +122,15 @@ pub enum Expr {
     Call(CallExpr),
     Field(FieldExpr),
     MethodCall(MethodCallExpr),
-    TensorCtor(Vec<Dim>),
+    TensorCtor(TensorCtor),
     Array(Vec<Expr>),
     Grouping(Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TensorCtor {
+    Shape(Vec<Dim>),
+    Value(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -553,7 +559,9 @@ impl<'a> Lexer<'a> {
 
         let mut is_float = started_with_dot;
 
-        if self.peek_char() == Some('.') && self.peek_next_char().map_or(false, |c| c.is_ascii_digit()) {
+        if self.peek_char() == Some('.')
+            && self.peek_next_char().map_or(false, |c| c.is_ascii_digit())
+        {
             is_float = true;
             num.push('.');
             self.consume_char();
@@ -596,7 +604,9 @@ impl<'a> Lexer<'a> {
 
         let end = self.current_index();
         if is_float {
-            let value = num.parse::<f64>().map_err(|_| self.error(start, "invalid float literal"))?;
+            let value = num
+                .parse::<f64>()
+                .map_err(|_| self.error(start, "invalid float literal"))?;
             Ok(Token {
                 kind: TokenKind::Float,
                 lexeme: num,
@@ -609,7 +619,9 @@ impl<'a> Lexer<'a> {
                 },
             })
         } else {
-            let value = num.parse::<i64>().map_err(|_| self.error(start, "invalid integer literal"))?;
+            let value = num
+                .parse::<i64>()
+                .map_err(|_| self.error(start, "invalid integer literal"))?;
             Ok(Token {
                 kind: TokenKind::Int,
                 lexeme: num,
@@ -710,7 +722,13 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn make_token(&self, start: usize, len: usize, kind: TokenKind, literal: Option<LiteralValue>) -> Token {
+    fn make_token(
+        &self,
+        start: usize,
+        len: usize,
+        kind: TokenKind,
+        literal: Option<LiteralValue>,
+    ) -> Token {
         Token {
             kind,
             lexeme: self.input[start..start + len].to_string(),
@@ -761,7 +779,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn current_index(&mut self) -> usize {
-        self.chars.peek().map(|(idx, _)| *idx).unwrap_or(self.input.len())
+        self.chars
+            .peek()
+            .map(|(idx, _)| *idx)
+            .unwrap_or(self.input.len())
     }
 
     fn error(&self, index: usize, message: &str) -> ParseError {
@@ -924,11 +945,9 @@ impl Parser {
     fn parse_dim(&mut self) -> Result<Dim, ParseError> {
         if self.check_kind(TokenKind::Int) {
             let tok = self.advance().clone();
-            let value = tok.literal_as_int().ok_or_else(|| {
-                ParseError {
-                    message: "invalid integer literal".to_string(),
-                    span: tok.span,
-                }
+            let value = tok.literal_as_int().ok_or_else(|| ParseError {
+                message: "invalid integer literal".to_string(),
+                span: tok.span,
             })?;
             Ok(Dim::Int(value))
         } else {
@@ -968,9 +987,7 @@ impl Parser {
             return Ok(Stmt::Return(value));
         }
 
-        if self.peek_is_ident()
-            && self.lookahead_kind(1, TokenKind::Equal)
-        {
+        if self.peek_is_ident() && self.lookahead_kind(1, TokenKind::Equal) {
             let name = self.consume_ident("expected identifier in assignment")?;
             self.consume(TokenKind::Equal, "expected '=' in assignment")?;
             let value = self.parse_expr()?;
@@ -998,7 +1015,9 @@ impl Parser {
                 span: start_token.span,
             })?;
             self.consume(TokenKind::RangeDots, "expected '..' in range")?;
-            let end_token = self.consume(TokenKind::Int, "expected integer after '..'")?.clone();
+            let end_token = self
+                .consume(TokenKind::Int, "expected integer after '..'")?
+                .clone();
             let end = end_token.literal_as_int().ok_or_else(|| ParseError {
                 message: "invalid integer literal".to_string(),
                 span: end_token.span,
@@ -1322,13 +1341,20 @@ impl Parser {
         if self.check_keyword(Keyword::Tensor) && self.lookahead_kind(1, TokenKind::LParen) {
             self.consume_keyword(Keyword::Tensor, "expected 'Tensor'")?;
             self.consume(TokenKind::LParen, "expected '(' after Tensor")?;
-            let shape = if self.check_kind(TokenKind::RParen) {
-                Vec::new()
-            } else {
-                self.parse_shape_list()?
-            };
+            if self.check_kind(TokenKind::RParen) {
+                self.consume(TokenKind::RParen, "expected ')' after tensor constructor")?;
+                return Ok(Expr::TensorCtor(TensorCtor::Shape(Vec::new())));
+            }
+
+            if self.check_kind(TokenKind::LBracket) {
+                let value = self.parse_expr()?;
+                self.consume(TokenKind::RParen, "expected ')' after tensor constructor")?;
+                return Ok(Expr::TensorCtor(TensorCtor::Value(Box::new(value))));
+            }
+
+            let shape = self.parse_shape_list()?;
             self.consume(TokenKind::RParen, "expected ')' after tensor constructor")?;
-            return Ok(Expr::TensorCtor(shape));
+            return Ok(Expr::TensorCtor(TensorCtor::Shape(shape)));
         }
 
         if self.match_kind(TokenKind::LBracket) {
@@ -1363,17 +1389,23 @@ impl Parser {
 
     fn literal_from_token(&self, token: &Token) -> Result<Literal, ParseError> {
         match token.kind {
-            TokenKind::Int => Ok(Literal::Int(token.literal_as_int().ok_or_else(|| ParseError {
-                message: "invalid integer literal".to_string(),
-                span: token.span,
+            TokenKind::Int => Ok(Literal::Int(token.literal_as_int().ok_or_else(|| {
+                ParseError {
+                    message: "invalid integer literal".to_string(),
+                    span: token.span,
+                }
             })?)),
-            TokenKind::Float => Ok(Literal::Float(token.literal_as_float().ok_or_else(|| ParseError {
-                message: "invalid float literal".to_string(),
-                span: token.span,
-            })?)),
-            TokenKind::Bool => Ok(Literal::Bool(token.literal_as_bool().ok_or_else(|| ParseError {
-                message: "invalid bool literal".to_string(),
-                span: token.span,
+            TokenKind::Float => Ok(Literal::Float(token.literal_as_float().ok_or_else(
+                || ParseError {
+                    message: "invalid float literal".to_string(),
+                    span: token.span,
+                },
+            )?)),
+            TokenKind::Bool => Ok(Literal::Bool(token.literal_as_bool().ok_or_else(|| {
+                ParseError {
+                    message: "invalid bool literal".to_string(),
+                    span: token.span,
+                }
             })?)),
             TokenKind::String => Ok(Literal::String(token.lexeme.clone())),
             _ => Err(ParseError {
@@ -1809,5 +1841,49 @@ mod tests {
         ));
 
         assert!(matches!(inner_target.as_ref(), Expr::Ident(id) if id == "tensor"));
+    }
+
+    #[test]
+    fn parses_tensor_ctor_with_array_literal() {
+        let program = parse_program("let x = Tensor([1, 2, 3, 4, 5]);");
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            TopLevelDecl::Stmt(Stmt::Let { value, .. }) => match value {
+                Expr::TensorCtor(TensorCtor::Value(array_expr)) => match &**array_expr {
+                    Expr::Array(elements) => {
+                        assert_eq!(elements.len(), 5);
+                    }
+                    other => panic!("expected array literal, found {:?}", other),
+                },
+                other => panic!("expected tensor ctor with value, found {:?}", other),
+            },
+            other => panic!("expected let statement, found {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_tensor_ctor_with_nested_array_literal() {
+        let program = parse_program("let x = Tensor([[1, 2, 3], [1, 2, 3]]);");
+        assert_eq!(program.items.len(), 1);
+        match &program.items[0] {
+            TopLevelDecl::Stmt(Stmt::Let { value, .. }) => match value {
+                Expr::TensorCtor(TensorCtor::Value(array_expr)) => match &**array_expr {
+                    Expr::Array(rows) => {
+                        assert_eq!(rows.len(), 2);
+                        for row in rows {
+                            match row {
+                                Expr::Array(cols) => {
+                                    assert_eq!(cols.len(), 3);
+                                }
+                                other => panic!("expected nested array, found {:?}", other),
+                            }
+                        }
+                    }
+                    other => panic!("expected array literal, found {:?}", other),
+                },
+                other => panic!("expected tensor ctor with value, found {:?}", other),
+            },
+            other => panic!("expected let statement, found {:?}", other),
+        }
     }
 }

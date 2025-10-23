@@ -97,7 +97,7 @@ ArgListOpt    = [ Arg { "," Arg } ] ;
 Arg           = Expr | KVArg ;
 
 FieldAccess   = Primary "." IDENT [ "(" ArgListOpt ")" ] ;
-TensorCtor    = "Tensor" "(" ShapeList ")" ;
+TensorCtor    = "Tensor" "(" [ ShapeList | ArrayCtor ] ")" ;
 ArrayCtor     = "[" [ Expr { "," Expr } ] "]" ;
 ```
 

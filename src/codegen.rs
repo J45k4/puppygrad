@@ -153,7 +153,8 @@ impl<'a> ExprEmitter<'a> {
             NodeKind::Call { .. }
             | NodeKind::Field { .. }
             | NodeKind::MethodCall { .. }
-            | NodeKind::TensorCtor(_)
+            | NodeKind::TensorCtorShape(_)
+            | NodeKind::TensorCtorValue(_)
             | NodeKind::Array(_)
             | NodeKind::Symbol { .. } => CType::Unknown,
             NodeKind::LoopVar { .. } => CType::Int,
@@ -217,7 +218,7 @@ impl<'a> ExprEmitter<'a> {
                 arg_list.extend(args.iter().map(|arg| self.emit_call_arg(arg)));
                 format!("{}({})", method, arg_list.join(", "))
             }
-            NodeKind::TensorCtor(dims) => {
+            NodeKind::TensorCtorShape(dims) => {
                 let dims_str = if dims.is_empty() {
                     String::new()
                 } else {
@@ -227,6 +228,10 @@ impl<'a> ExprEmitter<'a> {
                         .join(", ")
                 };
                 format!("tensor_ctor({})", dims_str)
+            }
+            NodeKind::TensorCtorValue(value) => {
+                let value_expr = self.expr(*value);
+                format!("tensor_from_array({})", value_expr.code)
             }
             NodeKind::Array(items) => {
                 let values = items

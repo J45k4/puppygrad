@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::parser::{
     Attr, BinaryOp, Block, CallArg, CallExpr, Dim, Expr, ForIter, ForStmt, FuncDecl, Literal,
-    Pattern, Program, Stmt, TopLevelDecl, TypeExpr, UnaryOp,
+    Pattern, Program, Stmt, TensorCtor, TopLevelDecl, TypeExpr, UnaryOp,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,7 +130,8 @@ pub enum NodeKind {
         method: String,
         args: Vec<GraphCallArg>,
     },
-    TensorCtor(Vec<Dim>),
+    TensorCtorShape(Vec<Dim>),
+    TensorCtorValue(NodeId),
     Array(Vec<NodeId>),
     Symbol {
         name: String,
@@ -400,7 +401,13 @@ impl GraphBuilder {
                     args,
                 })
             }
-            Expr::TensorCtor(dims) => self.add_node(NodeKind::TensorCtor(dims.clone())),
+            Expr::TensorCtor(tensor_ctor) => match tensor_ctor {
+                TensorCtor::Shape(dims) => self.add_node(NodeKind::TensorCtorShape(dims.clone())),
+                TensorCtor::Value(value_expr) => {
+                    let value_id = self.lower_expr(value_expr);
+                    self.add_node(NodeKind::TensorCtorValue(value_id))
+                }
+            },
             Expr::Array(items) => {
                 let values = items.iter().map(|item| self.lower_expr(item)).collect();
                 self.add_node(NodeKind::Array(values))
