@@ -984,6 +984,10 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        if self.is_print_stmt_start() {
+            return self.parse_print_stmt();
+        }
+
         if self.match_keyword(Keyword::Let) {
             let name = self.consume_ident("expected identifier after 'let'")?;
             self.consume(TokenKind::Equal, "expected '=' in let statement")?;
@@ -1015,6 +1019,50 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.consume(TokenKind::Semi, "expected ';' after expression statement")?;
         Ok(Stmt::Expr(expr))
+    }
+
+    fn is_print_stmt_start(&self) -> bool {
+        self.peek_is_ident()
+            && self.peek().lexeme == "print"
+            && !self.lookahead_kind(1, TokenKind::Equal)
+    }
+
+    fn parse_print_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // Consume the leading 'print' identifier.
+        self.advance();
+
+        let mut args = Vec::new();
+        if self.match_kind(TokenKind::LParen) {
+            if !self.check_kind(TokenKind::RParen) {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !self.match_kind(TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.consume(TokenKind::RParen, "expected ')' after print arguments")?;
+        } else if !self.check_kind(TokenKind::Semi) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+
+        self.consume(TokenKind::Semi, "expected ';' after print statement")?;
+
+        let call_args = args
+            .into_iter()
+            .map(CallArg::Positional)
+            .collect::<Vec<_>>();
+        let call_expr = Expr::Call(CallExpr {
+            callee: Box::new(Expr::Ident("print".to_string())),
+            args: call_args,
+        });
+
+        Ok(Stmt::Expr(call_expr))
     }
 
     fn parse_for_head(&mut self) -> Result<ForHead, ParseError> {
