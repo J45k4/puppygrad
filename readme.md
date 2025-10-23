@@ -9,7 +9,8 @@ hexDigit      = digit | "A"…"F" | "a"…"f" ;
 
 IDENT         = letter , { letter | digit } ;
 INT           = digit , { digit } ;
-FLOAT         = INT , "." , { digit } , [ exponent ] | "." , digit , { digit } , [ exponent ] ;
+FLOAT         = INT , "." , { digit } , [ exponent ]
+              | "." , digit , { digit } , [ exponent ] ;
 exponent      = ( "e" | "E" ) , [ "+" | "-" ] , INT ;
 BOOL          = "true" | "false" ;
 STRING        = "\"" , { anyCharExceptQuoteOrNewline | escape } , "\"" ;
@@ -21,21 +22,18 @@ TopLevelDecl  =
     | FuncDecl
     | Stmt
     ;
-    
+
 Type          = "Tensor" [ "[" DType [ "," Shape ] "]" ] ;
 DType         = "f16" | "bf16" | "f32" | "f64" | "i32" | "i64" | "bool" ;
 Shape         = Dim { "," Dim } ;
 Dim           = INT | IDENT ;
 
-TensorDecl    = "Tensor" IDENT "(" ShapeList ")" [ TensorAttrs ] ;
-ShapeList     = Dim { "," Dim } ;
-TensorAttrs   = "," AttrList ;
+TensorDecl    = "Tensor" IDENT "(" TensorSpecListOpt ")" [ "," AttrList ] [ ";" ] ;
+TensorSpecListOpt = [ TensorSpec { "," TensorSpec } ] ;
+TensorSpec    = Dim | Attr ;
 AttrList      = Attr { "," Attr } ;
 Attr          = IDENT "=" AttrValue ;
 AttrValue     = INT | FLOAT | BOOL | STRING ;
-
-KVArgsOpt     = [ KVArg { "," KVArg } ] ;
-KVArg         = IDENT "=" Expr ;
 
 FuncDecl      = ["export"] "fn" IDENT "(" ParamListOpt ")" Block ;
 ParamListOpt  = [ Param { "," Param } ] ;
@@ -50,17 +48,28 @@ Stmt          =
     | ReturnStmt ";"
     ;
 
-LetStmt       = "let" IDENT "=" Expr ;
-AssignStmt    = IDENT "=" Expr ;
+LetStmt       = "let" Binding "=" Expr ;
+Binding       = IDENT | TupleBinding ;
+TupleBinding  = "(" IDENT { "," IDENT } ")" ;
+
+AssignStmt    = IDENT AssignOp Expr ;
+AssignOp      = "=" | "+=" | "-=" | "*=" | "/=" ;
+
 ExprStmt      = Expr ;
 ReturnStmt    = "return" Expr ;
 
 ForStmt       = "for" ForHead Block ;
-ForHead       = IDENT "in" ( "range" "(" RangeSpec ")" | INT ".." INT | "(" IDENT ")" ) ;
-RangeSpec     = Expr ;
+ForHead       = IDENT "in"
+    ( "range" "(" CallArgListOpt ")"
+    | INT ".." INT
+    | "(" IDENT ")"
+    ) ;
+
+CallArgListOpt = [ CallArg { "," CallArg } ] ;
+CallArg       = Expr | IDENT "=" Expr ;
 
 Expr          =
-    | IfExpr
+      IfExpr
     | MatchExpr
     | LogicOr
     ;
@@ -72,6 +81,7 @@ CaseClause    = "case" Pattern ":" Expr ;
 Pattern       = "_" | Literal | IDENT | CallPat ;
 CallPat       = IDENT "(" PatListOpt ")" ;
 PatListOpt    = [ Pattern { "," Pattern } ] ;
+
 Literal       = INT | FLOAT | BOOL | STRING ;
 
 LogicOr       = LogicAnd { "||" LogicAnd } ;
@@ -80,24 +90,28 @@ Equality      = Rel { ( "==" | "!=" ) Rel } ;
 Rel           = Add { ( "<" | "<=" | ">" | ">=" ) Add } ;
 Add           = Mul { ( "+" | "-" ) Mul } ;
 Mul           = Unary { ( "*" | "/" ) Unary } ;
-Unary         = [ "-" | "!" ] Primary ;
+
+Unary         = [ "-" | "!" ] Unary | Postfix ;
+Postfix       = Primary { PostfixSuffix } ;
+PostfixSuffix =
+      "(" CallArgListOpt ")"
+    | "." IDENT [ "(" CallArgListOpt ")" ]
+    | "[" IndexSpec "]"
+    ;
+IndexSpec     = Expr [ ":" Expr ] ;
 
 Primary       =
       "(" Expr ")"
     | Literal
     | IDENT
-    | Call
     | TensorCtor
     | ArrayCtor
-    | FieldAccess
     ;
 
-Call          = IDENT "(" ArgListOpt ")" ;
-ArgListOpt    = [ Arg { "," Arg } ] ;
-Arg           = Expr | KVArg ;
+TensorCtor    = "Tensor" "(" [ TensorCtorBody ] ")" ;
+TensorCtorBody = ArrayCtor | ShapeList ;
 
-FieldAccess   = Primary "." IDENT [ "(" ArgListOpt ")" ] ;
-TensorCtor    = "Tensor" "(" [ ShapeList | ArrayCtor ] ")" ;
+ShapeList     = Dim { "," Dim } ;
 ArrayCtor     = "[" [ Expr { "," Expr } ] "]" ;
 ```
 

@@ -268,9 +268,13 @@ enum TokenKind {
     Bang,
     BangEq,
     Plus,
+    PlusEqual,
     Minus,
+    MinusEqual,
     Star,
+    StarEqual,
     Slash,
+    SlashEqual,
     Less,
     LessEq,
     Greater,
@@ -388,10 +392,42 @@ impl<'a> Lexer<'a> {
                             self.simple_token(TokenKind::Bang)
                         }
                     }
-                    '+' => self.simple_token(TokenKind::Plus),
-                    '-' => self.simple_token(TokenKind::Minus),
-                    '*' => self.simple_token(TokenKind::Star),
-                    '/' => self.simple_token(TokenKind::Slash),
+                    '+' => {
+                        if self.peek_is('=', 1) {
+                            self.consume_char();
+                            self.consume_char();
+                            self.make_token(idx, 2, TokenKind::PlusEqual, None)
+                        } else {
+                            self.simple_token(TokenKind::Plus)
+                        }
+                    }
+                    '-' => {
+                        if self.peek_is('=', 1) {
+                            self.consume_char();
+                            self.consume_char();
+                            self.make_token(idx, 2, TokenKind::MinusEqual, None)
+                        } else {
+                            self.simple_token(TokenKind::Minus)
+                        }
+                    }
+                    '*' => {
+                        if self.peek_is('=', 1) {
+                            self.consume_char();
+                            self.consume_char();
+                            self.make_token(idx, 2, TokenKind::StarEqual, None)
+                        } else {
+                            self.simple_token(TokenKind::Star)
+                        }
+                    }
+                    '/' => {
+                        if self.peek_is('=', 1) {
+                            self.consume_char();
+                            self.consume_char();
+                            self.make_token(idx, 2, TokenKind::SlashEqual, None)
+                        } else {
+                            self.simple_token(TokenKind::Slash)
+                        }
+                    }
                     '<' => {
                         if self.peek_is('=', 1) {
                             self.consume_char();
@@ -845,12 +881,35 @@ impl Parser {
         self.consume_keyword(Keyword::Tensor, "expected 'Tensor'")?;
         let name = self.consume_ident("expected tensor name")?;
         self.consume(TokenKind::LParen, "expected '(' after tensor name")?;
-        let shape = self.parse_shape_list()?;
-        self.consume(TokenKind::RParen, "expected ')' after tensor shape")?;
+        let mut shape = Vec::new();
         let mut attrs = Vec::new();
-        if self.match_kind(TokenKind::Comma) {
-            attrs = self.parse_attr_list()?;
+        if !self.check_kind(TokenKind::RParen) {
+            loop {
+                if self.peek_is_ident() && self.lookahead_kind(1, TokenKind::Equal) {
+                    let attr_name = self.consume_ident("expected attribute name")?;
+                    self.consume(TokenKind::Equal, "expected '=' in attribute")?;
+                    let value = self.parse_literal()?;
+                    attrs.push(Attr {
+                        name: attr_name,
+                        value,
+                    });
+                } else {
+                    shape.push(self.parse_dim()?);
+                }
+
+                if !self.match_kind(TokenKind::Comma) {
+                    break;
+                }
+            }
         }
+        self.consume(TokenKind::RParen, "expected ')' after tensor shape")?;
+        if self.match_kind(TokenKind::Comma) {
+            let mut more_attrs = self.parse_attr_list()?;
+            attrs.append(&mut more_attrs);
+        }
+        // Consume an optional trailing semicolon to support declaration syntax like
+        // `Tensor W(4, 4, rand="he");`.
+        let _ = self.match_kind(TokenKind::Semi);
         Ok(TensorDecl { name, shape, attrs })
     }
 
@@ -989,7 +1048,17 @@ impl Parser {
         }
 
         if self.match_keyword(Keyword::Let) {
-            let name = self.consume_ident("expected identifier after 'let'")?;
+            let name = if self.match_kind(TokenKind::LParen) {
+                let first = self.consume_ident("expected identifier in tuple binding")?;
+                while self.match_kind(TokenKind::Comma) {
+                    // Consume and ignore additional binding identifiers.
+                    self.consume_ident("expected identifier in tuple binding")?;
+                }
+                self.consume(TokenKind::RParen, "expected ')' after tuple binding")?;
+                first
+            } else {
+                self.consume_ident("expected identifier after 'let'")?
+            };
             self.consume(TokenKind::Equal, "expected '=' in let statement")?;
             let value = self.parse_expr()?;
             self.consume(TokenKind::Semi, "expected ';' after let statement")?;
@@ -1008,12 +1077,41 @@ impl Parser {
             return Ok(Stmt::Return(value));
         }
 
-        if self.peek_is_ident() && self.lookahead_kind(1, TokenKind::Equal) {
-            let name = self.consume_ident("expected identifier in assignment")?;
-            self.consume(TokenKind::Equal, "expected '=' in assignment")?;
-            let value = self.parse_expr()?;
-            self.consume(TokenKind::Semi, "expected ';' after assignment")?;
-            return Ok(Stmt::Assign { name, value });
+        if self.peek_is_ident() {
+            if self.lookahead_kind(1, TokenKind::Equal) {
+                let name = self.consume_ident("expected identifier in assignment")?;
+                self.consume(TokenKind::Equal, "expected '=' in assignment")?;
+                let value = self.parse_expr()?;
+                self.consume(TokenKind::Semi, "expected ';' after assignment")?;
+                return Ok(Stmt::Assign { name, value });
+            } else if self.lookahead_kind(1, TokenKind::PlusEqual)
+                || self.lookahead_kind(1, TokenKind::MinusEqual)
+                || self.lookahead_kind(1, TokenKind::StarEqual)
+                || self.lookahead_kind(1, TokenKind::SlashEqual)
+            {
+                let name = self.consume_ident("expected identifier in assignment")?;
+                let op_token = self.advance().clone();
+                let rhs = self.parse_expr()?;
+                self.consume(TokenKind::Semi, "expected ';' after assignment")?;
+
+                let binary_op = match op_token.kind {
+                    TokenKind::PlusEqual => BinaryOp::Add,
+                    TokenKind::MinusEqual => BinaryOp::Sub,
+                    TokenKind::StarEqual => BinaryOp::Mul,
+                    TokenKind::SlashEqual => BinaryOp::Div,
+                    _ => unreachable!(
+                        "unexpected token kind {:?} for compound assignment",
+                        op_token.kind
+                    ),
+                };
+
+                let value = Expr::Binary {
+                    op: binary_op,
+                    left: Box::new(Expr::Ident(name.clone())),
+                    right: Box::new(rhs),
+                };
+                return Ok(Stmt::Assign { name, value });
+            }
         }
 
         let expr = self.parse_expr()?;
@@ -1070,9 +1168,17 @@ impl Parser {
         self.consume_keyword(Keyword::In, "expected 'in' in for loop")?;
         let iter = if self.match_keyword(Keyword::Range) {
             self.consume(TokenKind::LParen, "expected '(' after range")?;
-            let spec = self.parse_expr()?;
+            let args = if self.check_kind(TokenKind::RParen) {
+                Vec::new()
+            } else {
+                self.parse_arg_list()?
+            };
             self.consume(TokenKind::RParen, "expected ')' after range spec")?;
-            ForIter::RangeCall(spec)
+            let call = Expr::Call(CallExpr {
+                callee: Box::new(Expr::Ident("range".to_string())),
+                args,
+            });
+            ForIter::RangeCall(call)
         } else if self.check_kind(TokenKind::Int) && self.lookahead_kind(1, TokenKind::RangeDots) {
             let start_token = self.advance().clone();
             let start = start_token.literal_as_int().ok_or_else(|| ParseError {
@@ -1374,6 +1480,23 @@ impl Parser {
                         field,
                     });
                 }
+            } else if self.match_kind(TokenKind::LBracket) {
+                let first = self.parse_expr()?;
+                let (method, args) = if self.match_kind(TokenKind::Colon) {
+                    let end = self.parse_expr()?;
+                    (
+                        "slice".to_string(),
+                        vec![CallArg::Positional(first), CallArg::Positional(end)],
+                    )
+                } else {
+                    ("index".to_string(), vec![CallArg::Positional(first)])
+                };
+                self.consume(TokenKind::RBracket, "expected ']' after index expression")?;
+                expr = Expr::MethodCall(MethodCallExpr {
+                    target: Box::new(expr),
+                    method,
+                    args,
+                });
             } else {
                 break;
             }
@@ -1420,6 +1543,10 @@ impl Parser {
             let shape = self.parse_shape_list()?;
             self.consume(TokenKind::RParen, "expected ')' after tensor constructor")?;
             return Ok(Expr::TensorCtor(TensorCtor::Shape(shape)));
+        }
+
+        if self.match_keyword(Keyword::Tensor) {
+            return Ok(Expr::Ident("Tensor".to_string()));
         }
 
         if self.match_kind(TokenKind::LBracket) {
@@ -1712,8 +1839,17 @@ mod tests {
         assert_eq!(for_stmt.head.binding, "i");
         match &for_stmt.head.iter {
             ForIter::RangeCall(expr) => match expr {
-                Expr::Literal(Literal::Int(value)) => assert_eq!(*value, 10),
-                other => panic!("expected literal range bound, found {:?}", other),
+                Expr::Call(CallExpr { callee, args }) => {
+                    assert!(matches!(callee.as_ref(), Expr::Ident(name) if name == "range"));
+                    assert_eq!(args.len(), 1);
+                    match &args[0] {
+                        CallArg::Positional(Expr::Literal(Literal::Int(value))) => {
+                            assert_eq!(*value, 10)
+                        }
+                        other => panic!("unexpected range argument {:?}", other),
+                    }
+                }
+                other => panic!("expected range call expression, found {:?}", other),
             },
             other => panic!("expected range call iterator, found {:?}", other),
         }
@@ -1976,5 +2112,16 @@ mod tests {
             },
             other => panic!("expected let statement, found {:?}", other),
         }
+    }
+
+    #[test]
+    fn parses_mnist_example() {
+        let source = include_str!("../examples/mnist.grad");
+        let program = parse_program(source);
+
+        assert!(
+            !program.items.is_empty(),
+            "mnist example should produce at least one top-level item"
+        );
     }
 }
