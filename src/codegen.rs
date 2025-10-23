@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use crate::graph_ir::{
     GraphBlock, GraphCallArg, GraphForIter, GraphForStmt, GraphFunction, GraphMatchCase,
@@ -19,7 +20,10 @@ enum CType {
     Bool,
     String,
     Void,
-    Custom(String),
+    Tensor {
+        elem_type: String,
+        dims: Vec<String>,
+    },
     Unknown,
 }
 
@@ -31,7 +35,7 @@ impl CType {
             CType::Bool => "bool".to_string(),
             CType::String => "const char*".to_string(),
             CType::Void => "void".to_string(),
-            CType::Custom(name) => name.clone(),
+            CType::Tensor { elem_type, .. } => format!("{}*", elem_type),
             CType::Unknown => "double".to_string(),
         }
     }
@@ -51,6 +55,19 @@ impl CType {
             (CType::Int, CType::Int) => CType::Int,
             (CType::String, CType::String) => CType::String,
             (CType::Bool, CType::Bool) => CType::Bool,
+            (
+                CType::Tensor {
+                    elem_type: a_elem,
+                    dims: a_dims,
+                },
+                CType::Tensor {
+                    elem_type: b_elem,
+                    dims: b_dims,
+                },
+            ) if a_elem == b_elem && a_dims == b_dims => CType::Tensor {
+                elem_type: a_elem.clone(),
+                dims: a_dims.clone(),
+            },
             _ => CType::Unknown,
         }
     }
@@ -62,11 +79,19 @@ struct CExpr {
     ty: CType,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TensorHelperKind {
+    Alloc { elem_type: String },
+    Add { elem_type: String },
+}
+
 struct ExprEmitter<'a> {
     nodes: &'a [Node],
     type_cache: HashMap<NodeId, CType>,
     expr_cache: HashMap<NodeId, String>,
     needs_string_header: bool,
+    node_aliases: HashMap<NodeId, String>,
+    required_helpers: HashSet<TensorHelperKind>,
 }
 
 impl<'a> ExprEmitter<'a> {
@@ -76,6 +101,8 @@ impl<'a> ExprEmitter<'a> {
             type_cache: HashMap::new(),
             expr_cache: HashMap::new(),
             needs_string_header: false,
+            node_aliases: HashMap::new(),
+            required_helpers: HashSet::new(),
         }
     }
 
@@ -83,15 +110,31 @@ impl<'a> ExprEmitter<'a> {
         self.needs_string_header
     }
 
+    fn take_required_helpers(&mut self) -> Vec<TensorHelperKind> {
+        self.required_helpers.drain().collect()
+    }
+
+    fn alias_node(&mut self, node_id: NodeId, name: &str) {
+        let alias = name.to_string();
+        self.node_aliases.insert(node_id, alias.clone());
+        self.expr_cache.insert(node_id, alias);
+    }
+
     fn expr(&mut self, node_id: NodeId) -> CExpr {
         let ty = self.node_type(node_id);
+        if let Some(alias) = self.node_aliases.get(&node_id) {
+            return CExpr {
+                code: alias.clone(),
+                ty,
+            };
+        }
         if let Some(code) = self.expr_cache.get(&node_id) {
             return CExpr {
                 code: code.clone(),
                 ty,
             };
         }
-        let code = self.compute_expr(node_id);
+        let code = self.compute_expr(node_id, &ty);
         self.expr_cache.insert(node_id, code.clone());
         CExpr { code, ty }
     }
@@ -118,7 +161,28 @@ impl<'a> ExprEmitter<'a> {
                 match op {
                     BinaryOp::Or | BinaryOp::And | BinaryOp::Eq | BinaryOp::NotEq => CType::Bool,
                     BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => CType::Bool,
-                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                    BinaryOp::Add => {
+                        if let (
+                            CType::Tensor {
+                                elem_type: left_elem,
+                                dims: left_dims,
+                            },
+                            CType::Tensor {
+                                elem_type: right_elem,
+                                dims: right_dims,
+                            },
+                        ) = (&left_ty, &right_ty)
+                        {
+                            if left_elem == right_elem && left_dims == right_dims {
+                                left_ty
+                            } else {
+                                CType::Unknown
+                            }
+                        } else {
+                            combine_numeric_types(left_ty, right_ty)
+                        }
+                    }
+                    BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
                         combine_numeric_types(left_ty, right_ty)
                     }
                 }
@@ -150,13 +214,21 @@ impl<'a> ExprEmitter<'a> {
                 }
                 ty
             }
-            NodeKind::Call { .. }
-            | NodeKind::Field { .. }
-            | NodeKind::MethodCall { .. }
-            | NodeKind::TensorCtorShape(_)
-            | NodeKind::TensorCtorValue(_)
-            | NodeKind::Array(_)
-            | NodeKind::Symbol { .. } => CType::Unknown,
+            NodeKind::Call { .. } | NodeKind::Field { .. } | NodeKind::MethodCall { .. } => {
+                CType::Unknown
+            }
+            NodeKind::TensorCtorShape(dims) => CType::Tensor {
+                elem_type: "double".to_string(),
+                dims: dims.iter().map(dim_to_string).collect(),
+            },
+            NodeKind::TensorCtorValue(value) => self
+                .infer_array_dims(*value)
+                .map(|dims| CType::Tensor {
+                    elem_type: "double".to_string(),
+                    dims,
+                })
+                .unwrap_or(CType::Unknown),
+            NodeKind::Array(_) | NodeKind::Symbol { .. } => CType::Unknown,
             NodeKind::LoopVar { .. } => CType::Int,
         };
 
@@ -164,7 +236,31 @@ impl<'a> ExprEmitter<'a> {
         ty
     }
 
-    fn compute_expr(&mut self, node_id: NodeId) -> String {
+    fn infer_array_dims(&mut self, node_id: NodeId) -> Option<Vec<String>> {
+        let node = self.nodes.get(node_id.0)?;
+        match &node.kind {
+            NodeKind::Array(items) => {
+                let mut inner_dims: Option<Vec<String>> = None;
+                for &item in items {
+                    let dims = self.infer_array_dims(item)?;
+                    match &mut inner_dims {
+                        Some(existing) if *existing != dims => return None,
+                        Some(_) => {}
+                        None => inner_dims = Some(dims),
+                    }
+                }
+                let mut result = vec![items.len().to_string()];
+                if let Some(mut dims) = inner_dims {
+                    result.append(&mut dims);
+                }
+                Some(result)
+            }
+            NodeKind::Literal(_) => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
+    fn compute_expr(&mut self, node_id: NodeId, ty: &CType) -> String {
         let node = self
             .nodes
             .get(node_id.0)
@@ -218,17 +314,7 @@ impl<'a> ExprEmitter<'a> {
                 arg_list.extend(args.iter().map(|arg| self.emit_call_arg(arg)));
                 format!("{}({})", method, arg_list.join(", "))
             }
-            NodeKind::TensorCtorShape(dims) => {
-                let dims_str = if dims.is_empty() {
-                    String::new()
-                } else {
-                    dims.iter()
-                        .map(dim_to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                format!("tensor_ctor({})", dims_str)
-            }
+            NodeKind::TensorCtorShape(dims) => self.emit_tensor_ctor_shape(dims, ty),
             NodeKind::TensorCtorValue(value) => {
                 let value_expr = self.expr(*value);
                 format!("tensor_from_array({})", value_expr.code)
@@ -274,7 +360,26 @@ impl<'a> ExprEmitter<'a> {
             BinaryOp::LtEq => format!("({} <= {})", left_expr.code, right_expr.code),
             BinaryOp::Gt => format!("({} > {})", left_expr.code, right_expr.code),
             BinaryOp::GtEq => format!("({} >= {})", left_expr.code, right_expr.code),
-            BinaryOp::Add => format!("({} + {})", left_expr.code, right_expr.code),
+            BinaryOp::Add => match (&left_expr.ty, &right_expr.ty) {
+                (
+                    CType::Tensor {
+                        elem_type: left_elem,
+                        dims: left_dims,
+                    },
+                    CType::Tensor {
+                        elem_type: right_elem,
+                        dims: right_dims,
+                    },
+                ) if left_elem == right_elem && left_dims == right_dims => {
+                    let helper = self.register_tensor_add(left_elem);
+                    let size_expr = dims_product(left_dims);
+                    format!(
+                        "{}({}, {}, {})",
+                        helper, left_expr.code, right_expr.code, size_expr
+                    )
+                }
+                _ => format!("({} + {})", left_expr.code, right_expr.code),
+            },
             BinaryOp::Sub => format!("({} - {})", left_expr.code, right_expr.code),
             BinaryOp::Mul => format!("({} * {})", left_expr.code, right_expr.code),
             BinaryOp::Div => format!("({} / {})", left_expr.code, right_expr.code),
@@ -331,8 +436,40 @@ impl<'a> ExprEmitter<'a> {
             Pattern::Call { callee, .. } => format!("/* unsupported pattern {} */ false", callee),
         }
     }
-}
 
+    fn emit_tensor_ctor_shape(&mut self, dims: &[Dim], ty: &CType) -> String {
+        if let CType::Tensor { elem_type, dims } = ty {
+            let helper = self.register_tensor_alloc(elem_type);
+            let size_expr = dims_product(dims);
+            format!("{}({})", helper, size_expr)
+        } else {
+            let dims_str = if dims.is_empty() {
+                String::new()
+            } else {
+                dims.iter()
+                    .map(dim_to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!("tensor_ctor({})", dims_str)
+        }
+    }
+
+    fn register_tensor_alloc(&mut self, elem_type: &str) -> String {
+        self.required_helpers.insert(TensorHelperKind::Alloc {
+            elem_type: elem_type.to_string(),
+        });
+        tensor_alloc_name(elem_type)
+    }
+
+    fn register_tensor_add(&mut self, elem_type: &str) -> String {
+        self.register_tensor_alloc(elem_type);
+        self.required_helpers.insert(TensorHelperKind::Add {
+            elem_type: elem_type.to_string(),
+        });
+        tensor_add_name(elem_type)
+    }
+}
 fn combine_numeric_types(left: CType, right: CType) -> CType {
     if matches!(left, CType::Unknown) || matches!(right, CType::Unknown) {
         return CType::Unknown;
@@ -344,6 +481,33 @@ fn combine_numeric_types(left: CType, right: CType) -> CType {
         return CType::Int;
     }
     CType::Unknown
+}
+
+fn sanitize_helper_suffix(elem_type: &str) -> String {
+    elem_type
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
+fn dims_product(dims: &[String]) -> String {
+    match dims.len() {
+        0 => "1".to_string(),
+        1 => dims[0].clone(),
+        _ => dims
+            .iter()
+            .map(|dim| format!("({})", dim))
+            .reduce(|acc, dim| format!("{} * {}", acc, dim))
+            .unwrap(),
+    }
+}
+
+fn tensor_alloc_name(elem_type: &str) -> String {
+    format!("tensor_alloc_{}", sanitize_helper_suffix(elem_type))
+}
+
+fn tensor_add_name(elem_type: &str) -> String {
+    format!("tensor_add_{}", sanitize_helper_suffix(elem_type))
 }
 
 fn literal_ctype(literal: &Literal) -> CType {
@@ -389,11 +553,20 @@ fn escape_c_string(input: &str) -> String {
 
 fn type_expr_to_ctype(ty: &TypeExpr) -> CType {
     match ty {
-        TypeExpr::Tensor { dtype, .. } => {
+        TypeExpr::Tensor { dtype, shape } => {
             let base = dtype
                 .map(|d| dtype_to_c_primitive(d).to_string())
-                .unwrap_or_else(|| "float".to_string());
-            CType::Custom(format!("{}*", base))
+                .unwrap_or_else(|| "double".to_string());
+            let dims = shape
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|dim| dim_to_string(&dim))
+                .collect();
+            CType::Tensor {
+                elem_type: base,
+                dims,
+            }
         }
     }
 }
@@ -411,12 +584,14 @@ fn dtype_to_c_primitive(dtype: DType) -> &'static str {
 
 struct CCodeGenerator {
     needs_string_header: bool,
+    tensor_helpers: HashSet<TensorHelperKind>,
 }
 
 impl CCodeGenerator {
     fn new() -> Self {
         Self {
             needs_string_header: false,
+            tensor_helpers: HashSet::new(),
         }
     }
 
@@ -427,6 +602,7 @@ impl CCodeGenerator {
             let mut emitter = ExprEmitter::new(&module.nodes);
             let body = self.emit_block(&mut emitter, &module.body, 4);
             self.needs_string_header |= emitter.needs_string_header();
+            self.collect_helpers(emitter.take_required_helpers());
             let mut section = String::from("void module_body(void) {\n");
             section.push_str(&body);
             section.push_str("}\n");
@@ -437,11 +613,18 @@ impl CCodeGenerator {
             sections.push(self.generate_function(function));
         }
 
+        if let Some(helper_defs) = self.emit_tensor_helpers() {
+            sections.insert(0, helper_defs);
+        }
+
         let mut output = String::new();
         output.push_str("#include <stdint.h>\n");
         output.push_str("#include <stdbool.h>\n");
         if self.needs_string_header {
             output.push_str("#include <string.h>\n");
+        }
+        if !self.tensor_helpers.is_empty() {
+            output.push_str("#include <stdlib.h>\n");
         }
 
         if sections.is_empty() {
@@ -495,6 +678,7 @@ impl CCodeGenerator {
         result.push_str(&self.emit_block(&mut emitter, &function.body, 4));
         result.push_str("}\n");
         self.needs_string_header |= emitter.needs_string_header();
+        self.collect_helpers(emitter.take_required_helpers());
         result
     }
 
@@ -544,17 +728,21 @@ impl CCodeGenerator {
                 if ty == CType::Void {
                     ty = CType::Unknown;
                 }
-                format!(
+                let result = format!(
                     "{}{} {} = {};\n",
                     indent_str,
                     ty.to_c_decl(),
                     name,
                     expr.code
-                )
+                );
+                emitter.alias_node(*value, name);
+                result
             }
             GraphStmt::Assign { name, value } => {
                 let expr = emitter.expr(*value);
-                format!("{}{} = {};\n", indent_str, name, expr.code)
+                let result = format!("{}{} = {};\n", indent_str, name, expr.code);
+                emitter.alias_node(*value, name);
+                result
             }
             GraphStmt::Expr(node) => {
                 let expr = emitter.expr(*node);
@@ -677,13 +865,69 @@ impl CCodeGenerator {
         let end = end?;
         Some((start, end, step))
     }
+
+    fn collect_helpers(&mut self, helpers: Vec<TensorHelperKind>) {
+        for helper in helpers {
+            self.tensor_helpers.insert(helper);
+        }
+    }
+
+    fn emit_tensor_helpers(&self) -> Option<String> {
+        if self.tensor_helpers.is_empty() {
+            return None;
+        }
+
+        let mut helpers: Vec<_> = self.tensor_helpers.iter().cloned().collect();
+        helpers.sort_by(|a, b| match (a, b) {
+            (
+                TensorHelperKind::Alloc { elem_type: a_elem },
+                TensorHelperKind::Alloc { elem_type: b_elem },
+            )
+            | (
+                TensorHelperKind::Add { elem_type: a_elem },
+                TensorHelperKind::Add { elem_type: b_elem },
+            ) => a_elem.cmp(b_elem),
+            (TensorHelperKind::Alloc { .. }, TensorHelperKind::Add { .. }) => Ordering::Less,
+            (TensorHelperKind::Add { .. }, TensorHelperKind::Alloc { .. }) => Ordering::Greater,
+        });
+
+        let mut output = String::new();
+        for (index, helper) in helpers.iter().enumerate() {
+            match helper {
+                TensorHelperKind::Alloc { elem_type } => {
+                    let name = tensor_alloc_name(elem_type);
+                    output.push_str(&format!(
+                        "static {elem}* {name}(size_t size) {{\n    {elem}* buffer = malloc(sizeof({elem}) * size);\n    return buffer;\n}}\n",
+                        elem = elem_type,
+                        name = name,
+                    ));
+                }
+                TensorHelperKind::Add { elem_type } => {
+                    let name = tensor_add_name(elem_type);
+                    let alloc_name = tensor_alloc_name(elem_type);
+                    output.push_str(&format!(
+                        "static {elem}* {name}(const {elem}* lhs, const {elem}* rhs, size_t size) {{\n    {elem}* result = {alloc}(size);\n    for (size_t i = 0; i < size; ++i) {{\n        result[i] = lhs[i] + rhs[i];\n    }}\n    return result;\n}}\n",
+                        elem = elem_type,
+                        name = name,
+                        alloc = alloc_name,
+                    ));
+                }
+            }
+
+            if index + 1 != helpers.len() {
+                output.push('\n');
+            }
+        }
+
+        Some(output)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph_ir::lower_program;
-    use crate::parser::{Block, Expr, FuncDecl, Param, Program, Stmt, TopLevelDecl};
+    use crate::parser::{Block, Expr, FuncDecl, Param, Program, Stmt, TensorCtor, TopLevelDecl};
 
     fn ident(name: &str) -> Expr {
         Expr::Ident(name.to_string())
@@ -725,7 +969,54 @@ mod tests {
         let expected = "#include <stdint.h>\n#include <stdbool.h>\n\n".to_string()
             + "double add_one(double x) {\n"
             + "    double y = (x + 1);\n"
-            + "    return (x + 1);\n"
+            + "    return y;\n"
+            + "}\n";
+
+        assert_eq!(code, expected);
+    }
+
+    #[test]
+    fn generates_tensor_addition() {
+        let program = Program {
+            items: vec![
+                TopLevelDecl::Stmt(Stmt::Let {
+                    name: "a".to_string(),
+                    value: Expr::TensorCtor(TensorCtor::Shape(vec![Dim::Int(2)])),
+                }),
+                TopLevelDecl::Stmt(Stmt::Let {
+                    name: "b".to_string(),
+                    value: Expr::TensorCtor(TensorCtor::Shape(vec![Dim::Int(2)])),
+                }),
+                TopLevelDecl::Stmt(Stmt::Let {
+                    name: "c".to_string(),
+                    value: Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(ident("a")),
+                        right: Box::new(ident("b")),
+                    },
+                }),
+            ],
+        };
+
+        let module = lower_program(&program);
+        let code = generate_c_code(&module);
+        let expected = "#include <stdint.h>\n#include <stdbool.h>\n#include <stdlib.h>\n\n"
+            .to_string()
+            + "static double* tensor_alloc_double(size_t size) {\n"
+            + "    double* buffer = malloc(sizeof(double) * size);\n"
+            + "    return buffer;\n"
+            + "}\n\n"
+            + "static double* tensor_add_double(const double* lhs, const double* rhs, size_t size) {\n"
+            + "    double* result = tensor_alloc_double(size);\n"
+            + "    for (size_t i = 0; i < size; ++i) {\n"
+            + "        result[i] = lhs[i] + rhs[i];\n"
+            + "    }\n"
+            + "    return result;\n"
+            + "}\n\n"
+            + "void module_body(void) {\n"
+            + "    double* a = tensor_alloc_double(2);\n"
+            + "    double* b = tensor_alloc_double(2);\n"
+            + "    double* c = tensor_add_double(a, b, 2);\n"
             + "}\n";
 
         assert_eq!(code, expected);
