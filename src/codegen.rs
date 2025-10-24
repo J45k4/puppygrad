@@ -584,6 +584,7 @@ fn dtype_to_c_primitive(dtype: DType) -> &'static str {
 
 struct CCodeGenerator {
     needs_string_header: bool,
+    needs_stdio: bool,
     tensor_helpers: HashSet<TensorHelperKind>,
 }
 
@@ -591,6 +592,7 @@ impl CCodeGenerator {
     fn new() -> Self {
         Self {
             needs_string_header: false,
+            needs_stdio: false,
             tensor_helpers: HashSet::new(),
         }
     }
@@ -598,16 +600,14 @@ impl CCodeGenerator {
     fn generate_module(&mut self, module: &GraphModule) -> String {
         let mut sections = Vec::new();
 
-        if !module.body.statements.is_empty() {
-            let mut emitter = ExprEmitter::new(&module.nodes);
-            let body = self.emit_block(&mut emitter, &module.body, 4);
-            self.needs_string_header |= emitter.needs_string_header();
-            self.collect_helpers(emitter.take_required_helpers());
-            let mut section = String::from("void module_body(void) {\n");
-            section.push_str(&body);
-            section.push_str("}\n");
-            sections.push(section);
-        }
+        let mut module_emitter = ExprEmitter::new(&module.nodes);
+        let body = self.emit_block(&mut module_emitter, &module.body, 4);
+        self.needs_string_header |= module_emitter.needs_string_header();
+        self.collect_helpers(module_emitter.take_required_helpers());
+        let mut section = String::from("void module_body(void) {\n");
+        section.push_str(&body);
+        section.push_str("}\n");
+        sections.push(section);
 
         for function in &module.functions {
             sections.push(self.generate_function(function));
@@ -617,11 +617,22 @@ impl CCodeGenerator {
             sections.insert(0, helper_defs);
         }
 
+        let has_user_main = module
+            .functions
+            .iter()
+            .any(|function| function.name == "main");
+        if !has_user_main {
+            sections.push(self.generate_entrypoint());
+        }
+
         let mut output = String::new();
         output.push_str("#include <stdint.h>\n");
         output.push_str("#include <stdbool.h>\n");
         if self.needs_string_header {
             output.push_str("#include <string.h>\n");
+        }
+        if self.needs_stdio {
+            output.push_str("#include <stdio.h>\n");
         }
         if !self.tensor_helpers.is_empty() {
             output.push_str("#include <stdlib.h>\n");
@@ -745,6 +756,9 @@ impl CCodeGenerator {
                 result
             }
             GraphStmt::Expr(node) => {
+                if let Some(print_stmt) = self.try_emit_print_stmt(emitter, *node, indent) {
+                    return print_stmt;
+                }
                 let expr = emitter.expr(*node);
                 format!("{}{};\n", indent_str, expr.code)
             }
@@ -921,6 +935,73 @@ impl CCodeGenerator {
 
         Some(output)
     }
+
+    fn try_emit_print_stmt(
+        &mut self,
+        emitter: &mut ExprEmitter<'_>,
+        node_id: NodeId,
+        indent: usize,
+    ) -> Option<String> {
+        let node = emitter.nodes.get(node_id.0)?;
+        let (callee, args) = match &node.kind {
+            NodeKind::Call { callee, args } => (callee, args),
+            _ => return None,
+        };
+
+        let callee_node = emitter.nodes.get(callee.0)?;
+        if let NodeKind::Symbol { name } = &callee_node.kind {
+            if name == "print" {
+                self.needs_stdio = true;
+                let indent_str = " ".repeat(indent);
+                let mut result = String::new();
+
+                if args.is_empty() {
+                    result.push_str(&format!("{}printf(\"\\n\");\n", indent_str));
+                    return Some(result);
+                }
+
+                for (index, arg) in args.iter().enumerate() {
+                    let expr = match arg {
+                        GraphCallArg::Positional(expr) => emitter.expr(*expr),
+                        GraphCallArg::Keyword { value, .. } => emitter.expr(*value),
+                    };
+                    let (format_spec, value_expr) = self.print_format_for_expr(&expr);
+                    result.push_str(&format!(
+                        "{}printf(\"{}\", {});\n",
+                        indent_str, format_spec, value_expr
+                    ));
+                    if index + 1 != args.len() {
+                        result.push_str(&format!("{}printf(\" \");\n", indent_str));
+                    }
+                }
+                result.push_str(&format!("{}printf(\"\\n\");\n", indent_str));
+                return Some(result);
+            }
+        }
+
+        None
+    }
+
+    fn print_format_for_expr(&self, expr: &CExpr) -> (String, String) {
+        match &expr.ty {
+            CType::Int => ("%lld".to_string(), format!("(long long)({})", expr.code)),
+            CType::Float => ("%g".to_string(), expr.code.clone()),
+            CType::Bool => (
+                "%s".to_string(),
+                format!("({} ? \"true\" : \"false\")", expr.code),
+            ),
+            CType::String => ("%s".to_string(), expr.code.clone()),
+            _ => ("%s".to_string(), "\"<unsupported>\"".to_string()),
+        }
+    }
+
+    fn generate_entrypoint(&self) -> String {
+        let mut result = String::from("int main(void) {\n");
+        result.push_str("    module_body();\n");
+        result.push_str("    return 0;\n");
+        result.push_str("}\n");
+        result
+    }
 }
 
 #[cfg(test)]
@@ -967,10 +1048,17 @@ mod tests {
         let module = lower_program(&program);
 
         let code = generate_c_code(&module);
-        let expected = "#include <stdint.h>\n#include <stdbool.h>\n\n".to_string()
+        let expected = "#include <stdint.h>\n".to_string()
+            + "#include <stdbool.h>\n\n"
+            + "void module_body(void) {\n"
+            + "}\n\n"
             + "double add_one(double x) {\n"
             + "    double y = (x + 1);\n"
             + "    return y;\n"
+            + "}\n\n"
+            + "int main(void) {\n"
+            + "    module_body();\n"
+            + "    return 0;\n"
             + "}\n";
 
         assert_eq!(code, expected);
@@ -1018,6 +1106,10 @@ mod tests {
             + "    double* a = tensor_alloc_double(2);\n"
             + "    double* b = tensor_alloc_double(2);\n"
             + "    double* c = tensor_add_double(a, b, 2);\n"
+            + "}\n\n"
+            + "int main(void) {\n"
+            + "    module_body();\n"
+            + "    return 0;\n"
             + "}\n";
 
         assert_eq!(code, expected);

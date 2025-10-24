@@ -65,3 +65,43 @@ fn emit_c_from_file() {
         stdout
     );
 }
+
+#[test]
+fn run_inline_program() {
+    let output = Command::new(puppygrad_bin())
+        .arg("run")
+        .arg("fn main() { return 0; }")
+        .output()
+        .expect("failed to run puppygrad binary");
+
+    assert!(
+        output.status.success(),
+        "process exited with status {} stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn run_example_program() {
+    let output = Command::new(puppygrad_bin())
+        .arg("run")
+        .arg("examples/simple.grad")
+        .output()
+        .expect("failed to run puppygrad binary");
+
+    assert!(
+        output.status.success(),
+        "process exited with status {} stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout was not valid UTF-8");
+    assert_eq!(
+        stdout.trim(),
+        "sum 5",
+        "unexpected program output: {}",
+        stdout
+    );
+}
