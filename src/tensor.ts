@@ -189,34 +189,6 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
 
     // --- Core elementwise ops with broadcasting ---
 
-    private elementwiseOp<S2 extends Shape, D2 extends DType>(
-        other: Tensor<S2, D2>,
-        fn: (a: number, b: number) => number
-    ): Tensor<Shape, Promote<D, D2>> {
-        const aShape = [...this.shape] as number[]
-        const bShape = [...other.shape] as number[]
-        const outShape = broadcastShapes(aShape, bShape)
-        const outSize = outShape.reduce((a, b) => a * b, 1)
-
-        const aStrides = computeStrides(aShape)
-        const bStrides = computeStrides(bShape)
-        const outData = new Array(outSize)
-
-        for (let outIdx = 0; outIdx < outSize; outIdx++) {
-            const coords = indexToCoords(outIdx, outShape)
-            const aCoords = alignCoords(coords, outShape, aShape)
-            const bCoords = alignCoords(coords, outShape, bShape)
-            const aIndex = coordsToIndex(aCoords, aStrides)
-            const bIndex = coordsToIndex(bCoords, bStrides)
-            const av = this._data[aIndex]!
-            const bv = other._data[bIndex]!
-            outData[outIdx] = fn(av, bv)
-        }
-
-        const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
-        return new Tensor(outData, outShape, outDType)
-    }
-
     public add<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
         const outShape = broadcastShapes([...this.shape], [...other.shape])
         const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
@@ -226,46 +198,40 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
     }
 
     public sub<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
-        return this.elementwiseOp(other, (a, b) => a - b)
+        const outShape = broadcastShapes([...this.shape], [...other.shape])
+        const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
+        const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
+        out.op = Op.sub(this.op, other.op)
+        return out
+    }
+
+    public mul<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
+        const outShape = broadcastShapes([...this.shape], [...other.shape])
+        const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
+        const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
+        out.op = Op.mul(this.op, other.op)
+        return out
     }
 
     // --- Reductions ---
 
     public sum(axis?: number): Tensor<Shape, SumDType<D>> {
         const inShape = [...this.shape] as number[]
-        const size = this._data.length
 
         // Sum all elements → keep as [sum] to match tests
-        if (axis === undefined) {
-            const total = this._data.reduce((a, b) => a + b, 0)
-            return new Tensor([total], [1], sumDType(this.dtype) as SumDType<D>)
-        }
-
-        if (inShape.length === 0) {
-            return new Tensor([this._data[0] ?? 0], [1], sumDType(this.dtype) as SumDType<D>)
-        }
-
         const rank = inShape.length
-        const ax = axis < 0 ? rank + axis : axis
-        if (ax < 0 || ax >= rank) {
+        const ax = axis === undefined ? undefined : axis < 0 ? rank + axis : axis
+        if (ax !== undefined && (ax < 0 || ax >= rank)) {
             throw new Error(`Axis ${axis} out of range for shape [${inShape}]`)
         }
 
-        const outShapeRaw = inShape.slice(0, ax).concat(inShape.slice(ax + 1))
+        const outShapeRaw =
+            ax === undefined ? [] : inShape.slice(0, ax).concat(inShape.slice(ax + 1))
         const outShape = outShapeRaw.length === 0 ? [1] : outShapeRaw
         const outSize = outShape.reduce((a, b) => a * b, 1)
-        const outData = new Array(outSize).fill(0)
-
-        const outStrides = computeStrides(outShape)
-
-        for (let idx = 0; idx < size; idx++) {
-            const coords = indexToCoords(idx, inShape)
-            const outCoords = coords.slice(0, ax).concat(coords.slice(ax + 1))
-            const outIdx = outShapeRaw.length === 0 ? 0 : coordsToIndex(outCoords, outStrides)
-            outData[outIdx] += this._data[idx]
-        }
-
-        return new Tensor(outData, outShape, sumDType(this.dtype) as SumDType<D>)
+        const out = new Tensor(new Array(outSize).fill(0), outShape, sumDType(this.dtype) as SumDType<D>)
+        out.op = Op.sum(this.op, ax)
+        return out
     }
 
     // --- Transpose (2D only for now) ---

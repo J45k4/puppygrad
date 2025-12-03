@@ -168,9 +168,22 @@ export interface LazyNode {
 
 
 export class Op {
-    constructor(public kind: OpKind = "Const", public inputs: readonly Op[] = []) {}
+    constructor(public kind: OpKind = "Const", public inputs: readonly Op[] = [], public attrs?: Omit<OpAttrs, "kind">) {}
 
     public static add(left: Op, right: Op): Op {
         return new Op("Add", [left, right])
+    }
+
+    public static sub(left: Op, right: Op): Op {
+        return new Op("Sub", [left, right])
+    }
+
+    public static mul(left: Op, right: Op): Op {
+        return new Op("Mul", [left, right])
+    }
+
+    public static sum(input: Op, axis?: number): Op {
+        const attrs: Omit<OpAttrs, "kind"> = axis === undefined ? {} : { axis }
+        return new Op("Sum", [input], attrs as any)
     }
 }
