@@ -184,7 +184,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
 
     // Flat data + shape
     constructor(private _data: number[], public shape: S, public dtype: D, op?: Op) {
-        this.op = op ?? new Op()
+        this.op = op ?? new Op("Const", [], undefined, { shape, dtype })
     }
 
     // --- Core elementwise ops with broadcasting ---
@@ -193,7 +193,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
         const outShape = broadcastShapes([...this.shape], [...other.shape])
         const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
         const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
-        out.op = Op.add(this.op, other.op)
+        out.op = Op.add(this.op, other.op, { shape: outShape, dtype: outDType })
         return out
     }
 
@@ -201,7 +201,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
         const outShape = broadcastShapes([...this.shape], [...other.shape])
         const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
         const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
-        out.op = Op.sub(this.op, other.op)
+        out.op = Op.sub(this.op, other.op, { shape: outShape, dtype: outDType })
         return out
     }
 
@@ -209,7 +209,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
         const outShape = broadcastShapes([...this.shape], [...other.shape])
         const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
         const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
-        out.op = Op.mul(this.op, other.op)
+        out.op = Op.mul(this.op, other.op, { shape: outShape, dtype: outDType })
         return out
     }
 
@@ -230,7 +230,7 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
         const outShape = outShapeRaw.length === 0 ? [1] : outShapeRaw
         const outSize = outShape.reduce((a, b) => a * b, 1)
         const out = new Tensor(new Array(outSize).fill(0), outShape, sumDType(this.dtype) as SumDType<D>)
-        out.op = Op.sum(this.op, ax)
+        out.op = Op.sum(this.op, ax, { shape: outShape, dtype: out.dtype })
         return out
     }
 
@@ -315,7 +315,8 @@ export function tensor<const T extends NestedArray<number>, D extends DType = "f
     const shape = computeShape(data) as ShapeOf<T>
     const flat = flatten(data)
     const dtype = (opts?.dtype ?? "float32") as D
-    return new Tensor(flat, shape, dtype)
+    const op = new Op("Const", [], { value: flat[0] ?? 0, data: flat }, { shape, dtype })
+    return new Tensor(flat, shape, dtype, op)
 }
 
 export function zeros<const Dims extends number[], D extends DType = "float32">(...dims: Dims): Tensor<Dims, D>

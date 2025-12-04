@@ -100,7 +100,7 @@ type AttrfulKind =
     | "Contiguous"
 
 export type OpAttrs =
-    | { kind: "Const"; value: number; dtype?: DType }
+    | { kind: "Const"; value: number; dtype?: DType; data?: readonly number[] }
     | { kind: "Full"; shape: Shape; value: number; dtype?: DType }
     | { kind: "Uniform"; shape: Shape; low?: number; high?: number; dtype?: DType }
 
@@ -130,60 +130,180 @@ export type OpAttrs =
 
 // ---- Graph node ------------------------------------------------------------
 
-export type NodeId = string
-
-export interface LazyNode {
-    id: NodeId
-    op: OpKind
-    inputs: readonly LazyNode[]
-
-    // These are the key invariants. They should be
-    // - inferable from inputs + attrs
-    // - cached for fast checks
-    shape: Shape
-    dtype: DType
-
-    // Operation-specific attributes.
-    // (Keep as plain object for easy hashing/serialization.)
-    attrs?: Omit<OpAttrs, "kind">
-}
-
-// ---- Roadmap notes ---------------------------------------------------------
-//
-// 1) Fusion-friendly v0 primitives:
-//    - elementwise unary/binary
-//    - reductions
-//    - matmul
-//    - movement/view
-//
-// 2) Composites (build from primitives first, then add fused kernels):
-//    - softmax = exp(x - max(x)) / sum(exp(...))
-//    - layernorm/rmsnorm
-//    - attention blocks
-//
-// 3) Future ops (don’t add until you need them):
-//    - conv2d, pool, gather/scatter, pad, dropout
-//    - advanced indexing
-//    - quantize/dequantize
-
+export type NodeId = number
 
 export class Op {
-    constructor(public kind: OpKind = "Const", public inputs: readonly Op[] = [], public attrs?: Omit<OpAttrs, "kind">) {}
+    private static counter = 0
 
-    public static add(left: Op, right: Op): Op {
-        return new Op("Add", [left, right])
+    public readonly id: NodeId
+    public readonly shape: Shape
+    public readonly dtype: DType
+    private readonly _attrs?: Omit<OpAttrs, "kind">
+
+    constructor(
+        public kind: OpKind = "Const",
+        public inputs: readonly Op[] = [],
+        public attrs?: Omit<OpAttrs, "kind">,
+        opts?: { id?: NodeId; shape?: Shape; dtype?: DType }
+    ) {
+        this.id = opts?.id ?? Op.counter++
+        this.shape = opts?.shape ?? []
+        this.dtype = opts?.dtype ?? "float32"
+        this._attrs = attrs
     }
 
-    public static sub(left: Op, right: Op): Op {
-        return new Op("Sub", [left, right])
+    public get op(): OpKind {
+        return this.kind
     }
 
-    public static mul(left: Op, right: Op): Op {
-        return new Op("Mul", [left, right])
+    public get attrsView(): Omit<OpAttrs, "kind"> | undefined {
+        return this._attrs
     }
 
-    public static sum(input: Op, axis?: number): Op {
+    private static makeOpts(left: Op, right?: Op, opts?: { shape?: Shape; dtype?: DType; id?: NodeId }) {
+        return {
+            id: opts?.id,
+            shape: opts?.shape ?? left.shape,
+            dtype: opts?.dtype ?? (right ? right.dtype : left.dtype),
+        }
+    }
+
+    public static add(left: Op, right: Op, opts?: { shape?: Shape; dtype?: DType; id?: NodeId }): Op {
+        return new Op("Add", [left, right], undefined, this.makeOpts(left, right, opts))
+    }
+
+    public static sub(left: Op, right: Op, opts?: { shape?: Shape; dtype?: DType; id?: NodeId }): Op {
+        return new Op("Sub", [left, right], undefined, this.makeOpts(left, right, opts))
+    }
+
+    public static mul(left: Op, right: Op, opts?: { shape?: Shape; dtype?: DType; id?: NodeId }): Op {
+        return new Op("Mul", [left, right], undefined, this.makeOpts(left, right, opts))
+    }
+
+    public static sum(input: Op, axis?: number, opts?: { shape?: Shape; dtype?: DType; id?: NodeId }): Op {
         const attrs: Omit<OpAttrs, "kind"> = axis === undefined ? {} : { axis }
-        return new Op("Sum", [input], attrs as any)
+        return new Op("Sum", [input], attrs as any, {
+            id: opts?.id,
+            shape: opts?.shape ?? input.shape,
+            dtype: opts?.dtype ?? input.dtype,
+        })
     }
+
+    public topo(): Op[] {
+        return topo([this])
+    }
+}
+
+/**
+ * Collect a DAG of ops starting from `roots` and return them in
+ * topologically-sorted order (inputs before consumers).
+ */
+export const topo = (roots: readonly Op[]): Op[] => {
+    const visited = new Set<NodeId>()
+    const ordered: Op[] = []
+
+    function dfs(node: Op) {
+        if (visited.has(node.id)) return
+        visited.add(node.id)
+        for (const inp of node.inputs) dfs(inp)
+        ordered.push(node)
+    }
+
+    for (const root of roots) dfs(root)
+    return ordered
+}
+
+// LazyNode is the runtime Op (graph node)
+export type LazyNode = Op
+
+const dtypeToCType = (dtype?: DType): string => {
+    switch (dtype) {
+        case "bool":
+            return "bool"
+        case "int32":
+            return "int"
+        case "float16":
+            return "uint16_t" // placeholder for half type
+        case "float64":
+            return "double"
+        case "float32":
+        default:
+            return "float"
+    }
+}
+
+const varName = (op: Op) => `v${op.id}`
+
+const emitOpToC = (op: Op): string[] => {
+    const inputs = op.inputs.map(varName)
+    const attrs = op.attrs as any
+    const lines: string[] = []
+
+    switch (op.kind) {
+        case "Const": {
+            const ctype = dtypeToCType(attrs?.dtype)
+            lines.push(`${ctype} ${varName(op)} = ${attrs?.value ?? 0};`)
+            break
+        }
+        case "Full": {
+            const ctype = dtypeToCType(attrs?.dtype)
+            lines.push(
+                `// Full(${attrs?.value ?? 0}) shape=${JSON.stringify(attrs?.shape ?? [])}`,
+                `${ctype} ${varName(op)} = ${attrs?.value ?? 0}; // scalar placeholder`
+            )
+            break
+        }
+        case "Uniform": {
+            const ctype = dtypeToCType(attrs?.dtype)
+            lines.push(
+                `// Uniform${attrs?.low !== undefined ? ` low=${attrs.low}` : ""}${attrs?.high !== undefined ? ` high=${attrs.high}` : ""} shape=${JSON.stringify(attrs?.shape ?? [])}`,
+                `${ctype} ${varName(op)} = 0; // TODO: random generation`
+            )
+            break
+        }
+        case "Add":
+            lines.push(`auto ${varName(op)} = ${inputs[0]} + ${inputs[1]};`)
+            break
+        case "Sub":
+            lines.push(`auto ${varName(op)} = ${inputs[0]} - ${inputs[1]};`)
+            break
+        case "Mul":
+            lines.push(`auto ${varName(op)} = ${inputs[0]} * ${inputs[1]};`)
+            break
+        case "Sum":
+            lines.push(`// Sum axis=${attrs?.axis ?? "all"}`)
+            lines.push(`auto ${varName(op)} = sum(${inputs[0]}); // TODO: expand over shape`)
+            break
+        default:
+            lines.push(`// TODO: codegen for ${op.kind}`)
+            lines.push(`auto ${varName(op)} = ${inputs[0] ?? "0"};`)
+    }
+
+    return lines
+}
+
+/**
+ * Very small C-ish code generator: takes a topo-sorted op list and emits a string.
+ * This is intentionally minimal and leaves shape/loop details as TODOs.
+ */
+export const generateC = (ops: readonly Op[]): string => {
+    const lines: string[] = [
+        "// Generated C (skeleton)",
+        "#include <math.h>",
+        "#include <stdbool.h>",
+        "#include <stdint.h>",
+        "",
+        "int main() {",
+    ]
+
+    for (const op of ops) {
+        for (const ln of emitOpToC(op)) {
+            lines.push(`  ${ln}`)
+        }
+    }
+
+    lines.push("  return 0;")
+    lines.push("}")
+
+    return lines.join("\n")
 }
