@@ -1,4 +1,4 @@
-import { Op } from "./op"
+import { Op, type OpKind } from "./op"
 
 type Shape = readonly number[]
 
@@ -189,28 +189,47 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
 
     // --- Core elementwise ops with broadcasting ---
 
-    public add<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
-        const outShape = broadcastShapes([...this.shape], [...other.shape])
+    private elementwiseOp<S2 extends Shape, D2 extends DType>(
+        other: Tensor<S2, D2>,
+        fn: (a: number, b: number) => number,
+        kind: OpKind
+    ): Tensor<Shape, Promote<D, D2>> {
+        const aShape = [...this.shape] as number[]
+        const bShape = [...other.shape] as number[]
+        const outShape = broadcastShapes(aShape, bShape)
+        const outSize = outShape.reduce((a, b) => a * b, 1)
+
+        const aStrides = computeStrides(aShape)
+        const bStrides = computeStrides(bShape)
+        const outData = new Array(outSize)
+
+        for (let outIdx = 0; outIdx < outSize; outIdx++) {
+            const coords = indexToCoords(outIdx, outShape)
+            const aCoords = alignCoords(coords, outShape, aShape)
+            const bCoords = alignCoords(coords, outShape, bShape)
+            const aIndex = coordsToIndex(aCoords, aStrides)
+            const bIndex = coordsToIndex(bCoords, bStrides)
+            const av = this._data[aIndex]!
+            const bv = other._data[bIndex]!
+            outData[outIdx] = fn(av, bv)
+        }
+
         const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
-        const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
-        out.op = Op.add(this.op, other.op, { shape: outShape, dtype: outDType })
+        const out = new Tensor(outData, outShape, outDType)
+        out.op = new Op("Const", [], { value: outData[0] ?? 0, data: outData }, { shape: outShape, dtype: outDType })
         return out
+    }
+
+    public add<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
+        return this.elementwiseOp(other, (a, b) => a + b, "Add")
     }
 
     public sub<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
-        const outShape = broadcastShapes([...this.shape], [...other.shape])
-        const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
-        const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
-        out.op = Op.sub(this.op, other.op, { shape: outShape, dtype: outDType })
-        return out
+        return this.elementwiseOp(other, (a, b) => a - b, "Sub")
     }
 
     public mul<S2 extends Shape, D2 extends DType>(other: Tensor<S2, D2>): Tensor<Shape, Promote<D, D2>> {
-        const outShape = broadcastShapes([...this.shape], [...other.shape])
-        const outDType = promoteDType(this.dtype, other.dtype) as Promote<D, D2>
-        const out = new Tensor(new Array(outShape.reduce((a, b) => a * b, 1)).fill(0), outShape, outDType)
-        out.op = Op.mul(this.op, other.op, { shape: outShape, dtype: outDType })
-        return out
+        return this.elementwiseOp(other, (a, b) => a * b, "Mul")
     }
 
     // --- Reductions ---
@@ -229,8 +248,26 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
             ax === undefined ? [] : inShape.slice(0, ax).concat(inShape.slice(ax + 1))
         const outShape = outShapeRaw.length === 0 ? [1] : outShapeRaw
         const outSize = outShape.reduce((a, b) => a * b, 1)
-        const out = new Tensor(new Array(outSize).fill(0), outShape, sumDType(this.dtype) as SumDType<D>)
-        out.op = Op.sum(this.op, ax, { shape: outShape, dtype: out.dtype })
+        const outData = new Array(outSize).fill(0)
+
+        const outStrides = computeStrides(outShape)
+
+        if (ax === undefined) {
+            const total = this._data.reduce((a, b) => a + b, 0)
+            const out = new Tensor([total], [1], sumDType(this.dtype) as SumDType<D>)
+            out.op = new Op("Const", [], { value: total, data: [total] }, { shape: [1], dtype: out.dtype })
+            return out
+        }
+
+        for (let idx = 0; idx < this._data.length; idx++) {
+            const coords = indexToCoords(idx, inShape)
+            const outCoords = coords.slice(0, ax).concat(coords.slice(ax + 1))
+            const outIdx = outShapeRaw.length === 0 ? 0 : coordsToIndex(outCoords, outStrides)
+            outData[outIdx] += this._data[idx] ?? 0
+        }
+
+        const out = new Tensor(outData, outShape, sumDType(this.dtype) as SumDType<D>)
+        out.op = new Op("Const", [], { value: outData[0] ?? 0, data: outData }, { shape: outShape, dtype: out.dtype })
         return out
     }
 
@@ -296,12 +333,11 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
         return new Tensor(outData, outShape, outDType)
     }
 
-    // Convert back to nested JS arrays (legacy eager path)
-    public list(): any {
-        return unflatten(this._data, this.shape)
+    public get data(): Promise<any> {
+        return this.realize().then((t) => unflatten(t._data, t.shape))
     }
 
-    // Async realize: compile/execute and return a *new* Tensor with computed data
+    // Realize: compile/execute and return a *new* Tensor with computed data
     public async realize(): Promise<Tensor<S, D>> {
         const { realize } = await import("./realize")
         const result = await realize([this])
