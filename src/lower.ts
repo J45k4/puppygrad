@@ -171,7 +171,5 @@ export const generateCLowered = (lowerings: readonly Lowering[], outputs: readon
     }
     lines.push(`}`, "", `int entry_size() { return ${outSize}; }`)
 
-    lines.push("", "int main() { return 0; }")
-
     return lines.join("\n")
 }

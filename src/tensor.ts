@@ -296,14 +296,20 @@ export class Tensor<S extends Shape = Shape, D extends DType = "float32"> {
         return new Tensor(outData, outShape, outDType)
     }
 
-    // Placeholder for future lazy execution / backends
-    public realize(): Tensor<S, D> {
-        return this
-    }
-
-    // Convert back to nested JS arrays
+    // Convert back to nested JS arrays (legacy eager path)
     public list(): any {
         return unflatten(this._data, this.shape)
+    }
+
+    // Async realize: compile/execute and return a *new* Tensor with computed data
+    public async realize(): Promise<Tensor<S, D>> {
+        const { realize } = await import("./realize")
+        const result = await realize([this])
+        if (result.output) {
+            const data = Array.from(result.output as any as number[])
+            return new Tensor(data, this.shape, this.dtype, this.op)
+        }
+        return this
     }
 }
 
