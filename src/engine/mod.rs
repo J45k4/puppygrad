@@ -1,8 +1,36 @@
-use anyhow::{bail, Result};
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::error;
+use std::fmt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error {
+    message: String,
+}
+
+impl Error {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl error::Error for Error {}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(Error::new(format!($($arg)*)))
+    };
+}
 
 static NEXT_NODE_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -38,7 +66,7 @@ impl Storage {
         }
         shape.iter().try_fold(1usize, |acc, dim| {
             acc.checked_mul(*dim)
-                .ok_or_else(|| anyhow::anyhow!("shape {:?} overflows numel", shape))
+                .ok_or_else(|| Error::new(format!("shape {:?} overflows numel", shape)))
         })
     }
 
@@ -138,7 +166,7 @@ impl Tensor {
             .borrow()
             .grad
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no grad available"))?
+            .ok_or_else(|| Error::new("no grad available".to_string()))?
             .clone();
         grad.scalar_value()
     }
@@ -172,7 +200,7 @@ impl Tensor {
         let grad = node
             .grad
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("parameter step called before backward"))?
+            .ok_or_else(|| Error::new("parameter step called before backward".to_string()))?
             .clone();
         if grad.shape != node.storage.shape {
             bail!(
@@ -625,8 +653,7 @@ fn topo_sort(root: &Tensor) -> Vec<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use super::Tensor;
-    use anyhow::Result;
+    use super::{Result, Tensor};
 
     #[test]
     fn scalar_autograd_matches_expected_derivative() -> Result<()> {

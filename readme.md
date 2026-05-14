@@ -2,7 +2,7 @@
 
 Rust-first deep learning sandbox with:
 - an in-house tinygrad-inspired computation engine, and
-- a `qwen` CLI path for running Qwen2.5-0.5B on CPU.
+- a planned native transformer runtime built directly on puppygrad primitives.
 
 ## Build
 
@@ -10,7 +10,7 @@ Rust-first deep learning sandbox with:
 cargo build --release
 ```
 
-## Run Qwen 0.5B (CPU)
+## Qwen Runtime Placeholder
 
 ```bash
 ./target/release/puppygrad qwen \
@@ -19,7 +19,9 @@ cargo build --release
   --max-new-tokens 120
 ```
 
-or from local files:
+The `qwen` command is currently a stub. The previous external runtime was removed so model work can focus on low-level implementation inside this project.
+
+The CLI still accepts local model paths for future native loading work:
 
 ```bash
 ./target/release/puppygrad qwen \
@@ -56,4 +58,3 @@ Current limits:
 - No advanced broadcasting rules beyond scalar broadcast.
 - No kernel fusion or SIMD tuning yet.
 - No transformer runtime yet; this phase focuses on building our own core engine first.
-
