@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+safetensors = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.23"

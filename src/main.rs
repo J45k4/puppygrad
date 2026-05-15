@@ -1,6 +1,12 @@
 use clap::{Parser, Subcommand};
-use puppygrad::engine::{Result, Tensor};
+use puppygrad::engine::Tensor;
+use puppygrad::models::gpt2::{
+    default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
+    Gpt2Runtime,
+};
 use std::path::PathBuf;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser, Debug)]
 #[command(name = "puppygrad")]
@@ -11,6 +17,33 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run GPT-2 small through puppygrad's native reference model.
+    Gpt2 {
+        /// Local directory containing config.json, tokenizer.json, and model.safetensors.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long, default_value = "gpt2")]
+        model_id: String,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Prompt text.
+        #[arg(long)]
+        prompt: String,
+
+        /// Max new tokens to generate.
+        #[arg(long, default_value_t = 32)]
+        max_new_tokens: usize,
+    },
+
     /// Placeholder for the future in-house Qwen runtime.
     Qwen {
         /// Local model directory reserved for future native weight loading.
@@ -92,6 +125,21 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Command::Gpt2 {
+            model_dir,
+            model_id,
+            revision,
+            download,
+            prompt,
+            max_new_tokens,
+        } => run_gpt2(RunGpt2Args {
+            model_dir,
+            model_id,
+            revision,
+            download,
+            prompt,
+            max_new_tokens,
+        }),
         Command::Qwen {
             model_dir,
             model_id,
@@ -132,6 +180,15 @@ fn main() -> Result<()> {
     }
 }
 
+struct RunGpt2Args {
+    model_dir: Option<PathBuf>,
+    model_id: String,
+    revision: String,
+    download: bool,
+    prompt: String,
+    max_new_tokens: usize,
+}
+
 struct RunQwenArgs {
     model_dir: Option<PathBuf>,
     model_id: String,
@@ -147,6 +204,27 @@ struct RunQwenArgs {
     repeat_last_n: usize,
     dtype: Option<String>,
     instruct: bool,
+}
+
+fn run_gpt2(args: RunGpt2Args) -> Result<()> {
+    let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
+    if args.download {
+        eprintln!(
+            "downloading missing GPT-2 assets into {}",
+            model_dir.display()
+        );
+        if args.model_id == "gpt2" && args.revision == "main" {
+            download_gpt2_small_assets(&model_dir)?;
+        } else {
+            download_huggingface_gpt2_assets(&args.model_id, &args.revision, &model_dir)?;
+        }
+    }
+
+    eprintln!("loading GPT-2 from {}", model_dir.display());
+    let runtime = Gpt2Runtime::from_dir(&model_dir)?;
+    let output = runtime.generate_greedy_text(&args.prompt, args.max_new_tokens)?;
+    println!("{output}");
+    Ok(())
 }
 
 fn run_qwen(args: RunQwenArgs) -> Result<()> {
@@ -237,5 +315,5 @@ fn run_matmul_check() -> Result<()> {
 fn mse(x: &Tensor, y: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
     let pred = x.mul(w)?.add(b)?;
     let diff = pred.sub(y)?;
-    diff.mul(&diff)?.mean()
+    Ok(diff.mul(&diff)?.mean()?)
 }
