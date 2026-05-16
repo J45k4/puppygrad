@@ -12,6 +12,7 @@ use crate::models::generation::{argmax_logits as argmax, LogitsSampler, Sampling
 use crate::models::safetensors::{
     parse_safetensors, read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError,
 };
+use crate::models::streaming::{IncrementalTextStreamer, TokenDecoder};
 use crate::runtime::thread_pool::ThreadPool;
 
 use super::{
@@ -286,6 +287,14 @@ impl Gpt2Tokenizer {
     }
 }
 
+impl TokenDecoder for Gpt2Tokenizer {
+    type Error = Gpt2Error;
+
+    fn decode_tokens(&self, token_ids: &[usize]) -> Result<String> {
+        self.decode(token_ids)
+    }
+}
+
 #[derive(Clone)]
 pub struct Gpt2Runtime {
     pub model: Gpt2Model,
@@ -397,18 +406,19 @@ impl Gpt2Runtime {
     {
         let input_ids = self.tokenizer.encode(prompt)?;
         let mut output_ids = input_ids.clone();
-        let mut decoded = self.tokenizer.decode(&output_ids)?;
+        let decoded = self.tokenizer.decode(&output_ids)?;
+        let mut streamer = IncrementalTextStreamer::new(decoded);
 
-        on_text(&decoded)?;
+        on_text(streamer.decoded())?;
 
         self.model
             .stream_greedy_tokens::<_, E>(&input_ids, max_new_tokens, |token_id| {
                 output_ids.push(token_id);
-                self.stream_decoded_token(&output_ids, &mut decoded, token_id, &mut on_text)?;
+                streamer.stream_token(&self.tokenizer, &output_ids, token_id, &mut on_text)?;
                 Ok(())
             })?;
 
-        Ok(decoded)
+        Ok(streamer.decoded().to_string())
     }
 
     pub fn stream_greedy_text_with_stats<F, E>(
@@ -455,9 +465,10 @@ impl Gpt2Runtime {
 
         let mut output_ids = input_ids.clone();
         let decode_text_start = Instant::now();
-        let mut decoded = self.tokenizer.decode(&output_ids)?;
+        let decoded = self.tokenizer.decode(&output_ids)?;
         operation_profile.decoding += decode_text_start.elapsed();
-        on_text(&decoded)?;
+        let mut streamer = IncrementalTextStreamer::new(decoded);
+        on_text(streamer.decoded())?;
 
         let mut cache = self.model.new_kv_cache()?;
         let first_token_start = Instant::now();
@@ -485,9 +496,10 @@ impl Gpt2Runtime {
             }
 
             output_ids.push(token_id);
-            self.stream_decoded_token_profiled(
+            stream_decoded_token_profiled(
+                &self.tokenizer,
                 &output_ids,
-                &mut decoded,
+                &mut streamer,
                 token_id,
                 &mut operation_profile,
                 &mut on_text,
@@ -519,73 +531,26 @@ impl Gpt2Runtime {
             operation_profile,
         };
 
-        Ok((decoded, stats))
-    }
-
-    fn stream_decoded_token<F, E>(
-        &self,
-        output_ids: &[usize],
-        decoded: &mut String,
-        token_id: usize,
-        on_text: &mut F,
-    ) -> std::result::Result<(), E>
-    where
-        F: FnMut(&str) -> std::result::Result<(), E>,
-        E: From<Gpt2Error>,
-    {
-        let token_text = self.tokenizer.decode(&[token_id])?;
-        if is_incremental_decode_safe(&token_text) {
-            on_text(&token_text)?;
-            decoded.push_str(&token_text);
-            return Ok(());
-        }
-
-        let next_decoded = self.tokenizer.decode(output_ids)?;
-        if let Some(delta) = next_decoded.strip_prefix(decoded.as_str()) {
-            on_text(delta)?;
-        } else {
-            on_text(&token_text)?;
-        }
-        *decoded = next_decoded;
-        Ok(())
-    }
-
-    fn stream_decoded_token_profiled<F, E>(
-        &self,
-        output_ids: &[usize],
-        decoded: &mut String,
-        token_id: usize,
-        profile: &mut Gpt2OperationProfile,
-        on_text: &mut F,
-    ) -> std::result::Result<(), E>
-    where
-        F: FnMut(&str) -> std::result::Result<(), E>,
-        E: From<Gpt2Error>,
-    {
-        let decode_text_start = Instant::now();
-        let token_text = self.tokenizer.decode(&[token_id])?;
-        profile.decoding += decode_text_start.elapsed();
-        if is_incremental_decode_safe(&token_text) {
-            on_text(&token_text)?;
-            decoded.push_str(&token_text);
-            return Ok(());
-        }
-
-        let decode_text_start = Instant::now();
-        let next_decoded = self.tokenizer.decode(output_ids)?;
-        profile.decoding += decode_text_start.elapsed();
-        if let Some(delta) = next_decoded.strip_prefix(decoded.as_str()) {
-            on_text(delta)?;
-        } else {
-            on_text(&token_text)?;
-        }
-        *decoded = next_decoded;
-        Ok(())
+        Ok((streamer.decoded().to_string(), stats))
     }
 }
 
-fn is_incremental_decode_safe(token_text: &str) -> bool {
-    !token_text.is_empty() && !token_text.contains(char::REPLACEMENT_CHARACTER)
+fn stream_decoded_token_profiled<F, E>(
+    tokenizer: &Gpt2Tokenizer,
+    output_ids: &[usize],
+    streamer: &mut IncrementalTextStreamer,
+    token_id: usize,
+    profile: &mut Gpt2OperationProfile,
+    on_text: &mut F,
+) -> std::result::Result<(), E>
+where
+    F: FnMut(&str) -> std::result::Result<(), E>,
+    E: From<Gpt2Error>,
+{
+    let decode_text_start = Instant::now();
+    let result = streamer.stream_token(tokenizer, output_ids, token_id, on_text);
+    profile.decoding += decode_text_start.elapsed();
+    result
 }
 
 #[derive(Debug)]
@@ -2193,14 +2158,6 @@ mod tests {
             stats.average_decode_token_time(),
             Some(Duration::from_millis(5))
         );
-    }
-
-    #[test]
-    fn incremental_decode_rejects_empty_and_replacement_text() {
-        assert!(is_incremental_decode_safe(" hello"));
-        assert!(!is_incremental_decode_safe(""));
-        assert!(!is_incremental_decode_safe("\u{fffd}"));
-        assert!(!is_incremental_decode_safe("a\u{fffd}"));
     }
 
     #[test]

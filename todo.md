@@ -3,7 +3,7 @@
 ## Shared Model Runtime Extractions
 
 - [x] Extract shared CLI generation arguments with `clap::Args`, including `max_new_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `repeat_penalty`, and `repeat_last_n`.
-- [ ] Add a generic token streaming module with a tokenizer/decoder trait and an incremental text streamer reusable by GPT-2, Qwen, Llama, and similar text models.
+- [x] Add a generic token streaming module with a tokenizer/decoder trait and an incremental text streamer reusable by GPT-2, Qwen, Llama, and similar text models.
 - [ ] Extract generic generation stats for prompt tokens, generated tokens, tokenization time, prefill time, decode time, time to first token, and token/sec helpers.
 - [ ] Keep model-specific operation profiles separate for now, but make them attachable to generic generation stats.
 - [ ] Expand shared Hugging Face asset utilities for required-file checks, model directory resolution, cache path conventions, and download orchestration.

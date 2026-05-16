@@ -4,3 +4,4 @@ pub mod autotune;
 pub mod generation;
 pub mod gpt2;
 pub mod safetensors;
+pub mod streaming;
