@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::models::autoregressive::{self, AutoregressiveDecoder};
+use crate::models::autoregressive::{self, AutoregressiveDecoder, KvCache};
 use crate::models::config::load_json_config;
 use crate::models::cpu::{
     add_in_place, dot, gelu_in_place, layer_norm_in_place, quantized_dot,
@@ -231,6 +231,20 @@ impl Gpt2KvCache {
             )));
         }
         Ok(())
+    }
+}
+
+impl KvCache for Gpt2KvCache {
+    fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn clear(&mut self) {
+        Gpt2KvCache::clear(self);
     }
 }
 
@@ -1835,6 +1849,19 @@ mod tests {
         let generic = autoregressive::generate(&model, &[0, 1], 3, |_| Ok::<(), Gpt2Error>(()))?;
 
         assert_eq!(generic, direct);
+        Ok(())
+    }
+
+    #[test]
+    fn gpt2_cache_exposes_generic_kv_cache_contract() -> Result<()> {
+        let cfg = tiny_config();
+        let mut cache = Gpt2KvCache::new(&cfg)?;
+        cache.seq_len = 2;
+
+        assert_eq!(KvCache::seq_len(&cache), 2);
+        assert_eq!(KvCache::max_seq_len(&cache), cfg.n_positions);
+        KvCache::clear(&mut cache);
+        assert_eq!(KvCache::seq_len(&cache), 0);
         Ok(())
     }
 

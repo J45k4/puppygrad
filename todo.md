@@ -10,7 +10,7 @@
 - [x] Add generic JSON config loading helpers for model config files.
 - [x] Improve safetensors helpers with a tensor store API for required tensors, optional tensors, dtype checks, and shape validation.
 - [x] Extract reusable CPU math kernels from GPT-2, including dot product, dense projection, transposed dense projection, row-wise quantized matvec, layernorm, GELU, softmax, and causal attention helpers where appropriate.
-- [ ] Introduce a minimal KV cache trait for shared cache concepts like `seq_len`, `max_seq_len`, and `clear`, without forcing a common memory layout yet.
+- [x] Introduce a minimal KV cache trait for shared cache concepts like `seq_len`, `max_seq_len`, and `clear`, without forcing a common memory layout yet.
 - [ ] Delay broader transformer block extraction until there is at least one second real model, so GPT-2 learned positions and Qwen/Llama RoPE do not get forced into the wrong abstraction.
 - [ ] Review whether `Gpt2RustConfig` can be split into generic CPU backend options and model/op-specific tuning options.
 - [ ] Move generic autoregressive generation examples and documentation out of GPT-2-specific docs.

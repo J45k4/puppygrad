@@ -1,5 +1,13 @@
+pub trait KvCache {
+    fn seq_len(&self) -> usize;
+
+    fn max_seq_len(&self) -> usize;
+
+    fn clear(&mut self);
+}
+
 pub trait AutoregressiveDecoder {
-    type Cache;
+    type Cache: KvCache;
     type Logits;
     type Error;
 
