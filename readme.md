@@ -2,13 +2,56 @@
 
 Rust-first deep learning sandbox with:
 - an in-house tinygrad-inspired computation engine, and
-- a planned native transformer runtime built directly on puppygrad primitives.
+- native model runtime experiments built directly in Rust.
 
 ## Build
 
 ```bash
 cargo build --release
 ```
+
+## Models
+
+Implemented:
+
+| Model | Status | Runtime | Notes |
+| --- | --- | --- | --- |
+| GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy decoding, token streaming, and a KV cache. |
+| Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
+
+Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
+
+### Run GPT-2 small
+
+First run downloads GPT-2 small assets into `models/gpt2`:
+
+```bash
+./target/release/puppygrad gpt2 \
+  --download \
+  --prompt "Hello, my name is" \
+  --max-new-tokens 20
+```
+
+After assets are downloaded, `--download` is optional:
+
+```bash
+./target/release/puppygrad gpt2 \
+  --prompt "The future of GPU compilers is" \
+  --max-new-tokens 20
+```
+
+Use a different GPT-2-family checkpoint by giving both a model id and local directory:
+
+```bash
+./target/release/puppygrad gpt2 \
+  --download \
+  --model-id gpt2-medium \
+  --model-dir models/gpt2-medium \
+  --prompt "Rust makes systems programming" \
+  --max-new-tokens 20
+```
+
+The GPT-2 runtime is intentionally simple: CPU `f32`, greedy token selection, no sampling yet, and no GPU kernels yet.
 
 ## Qwen Runtime Placeholder
 
@@ -57,4 +100,4 @@ Current limits:
 - CPU only.
 - No advanced broadcasting rules beyond scalar broadcast.
 - No kernel fusion or SIMD tuning yet.
-- No transformer runtime yet; this phase focuses on building our own core engine first.
+- The GPT-2 runtime is a reference implementation, not optimized tensor infrastructure.

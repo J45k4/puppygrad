@@ -8,6 +8,8 @@ use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
+use crate::models::autoregressive::{self, AutoregressiveDecoder};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2Config {
     pub vocab_size: usize,
@@ -698,22 +700,7 @@ impl Gpt2Model {
         F: FnMut(usize) -> std::result::Result<(), E>,
         E: From<Gpt2Error>,
     {
-        self.validate_input(input_ids)?;
-        let mut cache = self.new_kv_cache()?;
-        let mut logits = self.prefill(input_ids, &mut cache)?;
-        let mut tokens = input_ids.to_vec();
-
-        for _ in 0..max_new_tokens {
-            if tokens.len() >= self.config.n_positions {
-                break;
-            }
-            let next = argmax(&logits);
-            tokens.push(next);
-            on_token(next)?;
-            logits = self.forward_one(next, &mut cache)?;
-        }
-
-        Ok(tokens)
+        autoregressive::generate(self, input_ids, max_new_tokens, &mut on_token)
     }
 
     fn validate_input(&self, input_ids: &[usize]) -> Result<()> {
@@ -840,6 +827,32 @@ impl Gpt2Model {
 
         add_in_place(&mut residual, &mlp_proj);
         Ok(residual)
+    }
+}
+
+impl AutoregressiveDecoder for Gpt2Model {
+    type Cache = Gpt2KvCache;
+    type Logits = Vec<f32>;
+    type Error = Gpt2Error;
+
+    fn max_context_len(&self) -> usize {
+        self.config.n_positions
+    }
+
+    fn new_cache(&self) -> Result<Self::Cache> {
+        self.new_kv_cache()
+    }
+
+    fn prefill(&self, input_ids: &[usize], cache: &mut Self::Cache) -> Result<Self::Logits> {
+        Gpt2Model::prefill(self, input_ids, cache)
+    }
+
+    fn forward_one(&self, token_id: usize, cache: &mut Self::Cache) -> Result<Self::Logits> {
+        Gpt2Model::forward_one(self, token_id, cache)
+    }
+
+    fn select_next_token(&self, logits: &Self::Logits) -> Result<usize> {
+        Ok(argmax(logits))
     }
 }
 
@@ -1179,6 +1192,18 @@ mod tests {
 
         assert_eq!(&tokens[..2], &[0, 1]);
         assert_eq!(streamed, tokens[2..]);
+        Ok(())
+    }
+
+    #[test]
+    fn implements_generic_autoregressive_decoder() -> Result<()> {
+        let cfg = tiny_config();
+        let model = Gpt2Model::new(cfg.clone(), tiny_weights(&cfg))?;
+
+        let direct = model.generate_greedy_cached(&[0, 1], 3)?;
+        let generic = autoregressive::generate(&model, &[0, 1], 3, |_| Ok::<(), Gpt2Error>(()))?;
+
+        assert_eq!(generic, direct);
         Ok(())
     }
 
