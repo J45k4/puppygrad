@@ -7,7 +7,7 @@
 - [x] Extract generic generation stats for prompt tokens, generated tokens, tokenization time, prefill time, decode time, time to first token, and token/sec helpers.
 - [x] Keep model-specific operation profiles separate for now, but make them attachable to generic generation stats.
 - [x] Expand shared Hugging Face asset utilities for required-file checks, model directory resolution, cache path conventions, and download orchestration.
-- [ ] Add generic JSON config loading helpers for model config files.
+- [x] Add generic JSON config loading helpers for model config files.
 - [ ] Improve safetensors helpers with a tensor store API for required tensors, optional tensors, dtype checks, and shape validation.
 - [ ] Extract reusable CPU math kernels from GPT-2, including dot product, dense projection, transposed dense projection, row-wise quantized matvec, layernorm, GELU, softmax, and causal attention helpers where appropriate.
 - [ ] Introduce a minimal KV cache trait for shared cache concepts like `seq_len`, `max_seq_len`, and `clear`, without forcing a common memory layout yet.

@@ -1,4 +1,3 @@
-use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
@@ -9,6 +8,7 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::models::autoregressive::{self, AutoregressiveDecoder};
+use crate::models::config::load_json_config;
 use crate::models::generation::{
     argmax_logits as argmax, GenerationStats, LogitsSampler, ProfiledGenerationStats, SamplingError,
 };
@@ -583,12 +583,8 @@ struct HfGpt2Config {
 }
 
 fn load_config(path: &Path) -> Result<Gpt2Config> {
-    let data = fs::read_to_string(path).map_err(|err| {
-        Gpt2Error::Asset(format!("failed to read config {}: {err}", path.display()))
-    })?;
-    let hf: HfGpt2Config = serde_json::from_str(&data).map_err(|err| {
-        Gpt2Error::Asset(format!("failed to parse config {}: {err}", path.display()))
-    })?;
+    let hf: HfGpt2Config =
+        load_json_config(path).map_err(|err| Gpt2Error::Asset(err.to_string()))?;
     let n_positions = hf.n_positions.or(hf.n_ctx).ok_or_else(|| {
         Gpt2Error::InvalidConfig("config must contain n_positions or n_ctx".to_string())
     })?;
