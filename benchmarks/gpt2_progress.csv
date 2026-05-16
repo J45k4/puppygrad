@@ -1,0 +1,9 @@
+commit,label,total_tokens_per_second,decode_tokens_per_second,prefill_ms,decode_ms
+d97a323,baseline,24.713,26.996,310.627,296.344
+1d27dc4,cached-cpu,32.697,35.062,230.598,228.164
+a75e051,stream-decode,32.269,34.466,232.731,232.111
+6751b6e,simd,93.762,99.329,79.440,80.540
+0345041,experiment-reporting,95.658,100.091,76.881,79.927
+6a4274e,tuning-flags,93.447,91.484,73.071,87.447
+a341746,quantized-path,79.611,78.619,86.659,101.757
+1c6cd3a,chart-update,99.490,105.419,74.882,75.887

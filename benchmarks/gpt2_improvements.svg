@@ -1,87 +1,97 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640" role="img" aria-labelledby="title desc">
-  <title id="title">GPT-2 optimization progress over time</title>
-  <desc id="desc">Line chart tracking best total tokens per second after each optimization slice, plus cumulative best performance.</desc>
-  <rect width="1200" height="640" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="660" viewBox="0 0 1220 660" role="img" aria-labelledby="title desc">
+  <title id="title">GPT-2 optimization progress, comparable retrospective sweep</title>
+  <desc id="desc">Progress chart using the same prompt, model directory, four threads, eight generated tokens, two measured runs, and one warmup run for every optimization commit.</desc>
+  <rect width="1220" height="660" fill="#ffffff"/>
 
   <text x="48" y="42" font-family="Arial, sans-serif" font-size="25" font-weight="700" fill="#111827">GPT-2 optimization progress</text>
-  <text x="48" y="70" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">Best total tokens/sec from each recorded slice in benchmarks/gpt2_experiment_history.csv. Higher is better.</text>
+  <text x="48" y="70" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">Comparable retrospective sweep: same prompt, model dir, 4 threads, 8 new tokens, 2 measured runs, 1 warmup.</text>
 
-  <rect x="110" y="90" width="970" height="380" fill="#ffffff"/>
-  <line x1="110" y1="470" x2="1080" y2="470" stroke="#d1d5db" stroke-width="1"/>
-  <line x1="110" y1="90" x2="110" y2="470" stroke="#d1d5db" stroke-width="1"/>
+  <rect x="108" y="94" width="990" height="382" fill="#ffffff"/>
+  <line x1="108" y1="476" x2="1098" y2="476" stroke="#d1d5db" stroke-width="1"/>
+  <line x1="108" y1="94" x2="108" y2="476" stroke="#d1d5db" stroke-width="1"/>
 
   <g font-family="Arial, sans-serif" font-size="12" fill="#6b7280">
-    <text x="96" y="474" text-anchor="end">0</text>
-    <text x="96" y="390" text-anchor="end">20</text>
-    <text x="96" y="306" text-anchor="end">40</text>
-    <text x="96" y="221" text-anchor="end">60</text>
-    <text x="96" y="137" text-anchor="end">80</text>
+    <text x="94" y="480" text-anchor="end">0</text>
+    <text x="94" y="411" text-anchor="end">20</text>
+    <text x="94" y="342" text-anchor="end">40</text>
+    <text x="94" y="272" text-anchor="end">60</text>
+    <text x="94" y="203" text-anchor="end">80</text>
+    <text x="94" y="134" text-anchor="end">100</text>
   </g>
   <g stroke="#f3f4f6" stroke-width="1">
-    <line x1="110" y1="385.6" x2="1080" y2="385.6"/>
-    <line x1="110" y1="301.1" x2="1080" y2="301.1"/>
-    <line x1="110" y1="216.7" x2="1080" y2="216.7"/>
-    <line x1="110" y1="132.2" x2="1080" y2="132.2"/>
+    <line x1="108" y1="406.5" x2="1098" y2="406.5"/>
+    <line x1="108" y1="337.1" x2="1098" y2="337.1"/>
+    <line x1="108" y1="267.6" x2="1098" y2="267.6"/>
+    <line x1="108" y1="198.2" x2="1098" y2="198.2"/>
+    <line x1="108" y1="128.7" x2="1098" y2="128.7"/>
   </g>
 
-  <polyline points="120,405.7 273,407.8 427,127.4 580,236.8 733,186.6 887,227.9 1040,366.0" fill="none" stroke="#2563eb" stroke-width="3"/>
-  <polyline points="120,405.7 273,405.7 427,127.4 580,127.4 733,127.4 887,127.4 1040,127.4" fill="none" stroke="#16a34a" stroke-width="3" stroke-dasharray="8 6"/>
-
-  <g fill="#2563eb" stroke="#ffffff" stroke-width="2">
-    <circle cx="120" cy="405.7" r="5"/>
-    <circle cx="273" cy="407.8" r="5"/>
-    <circle cx="427" cy="127.4" r="5"/>
-    <circle cx="580" cy="236.8" r="5"/>
-    <circle cx="733" cy="186.6" r="5"/>
-    <circle cx="887" cy="227.9" r="5"/>
-    <circle cx="1040" cy="366.0" r="5"/>
+  <!-- Raw measured result for each commit. This may dip when a commit adds tooling,
+       experimental paths, or when benchmark noise moves in the wrong direction. -->
+  <polyline points="120,390.4 253,362.8 386,364.3 519,151.2 652,144.6 785,152.3 918,200.3 1050,131.1" fill="none" stroke="#94a3b8" stroke-width="2"/>
+  <g fill="#94a3b8" stroke="#ffffff" stroke-width="2">
+    <circle cx="120" cy="390.4" r="4"/>
+    <circle cx="253" cy="362.8" r="4"/>
+    <circle cx="386" cy="364.3" r="4"/>
+    <circle cx="519" cy="151.2" r="4"/>
+    <circle cx="652" cy="144.6" r="4"/>
+    <circle cx="785" cy="152.3" r="4"/>
+    <circle cx="918" cy="200.3" r="4"/>
+    <circle cx="1050" cy="131.1" r="4"/>
   </g>
+
+  <!-- Cumulative best is the actual progress signal. -->
+  <polyline points="120,390.4 253,362.8 386,362.8 519,151.2 652,144.6 785,144.6 918,144.6 1050,131.1" fill="none" stroke="#16a34a" stroke-width="4"/>
   <g fill="#16a34a" stroke="#ffffff" stroke-width="2">
-    <circle cx="120" cy="405.7" r="5"/>
-    <circle cx="273" cy="405.7" r="5"/>
-    <circle cx="427" cy="127.4" r="5"/>
-    <circle cx="580" cy="127.4" r="5"/>
-    <circle cx="733" cy="127.4" r="5"/>
-    <circle cx="887" cy="127.4" r="5"/>
-    <circle cx="1040" cy="127.4" r="5"/>
+    <circle cx="120" cy="390.4" r="5"/>
+    <circle cx="253" cy="362.8" r="5"/>
+    <circle cx="386" cy="362.8" r="5"/>
+    <circle cx="519" cy="151.2" r="5"/>
+    <circle cx="652" cy="144.6" r="5"/>
+    <circle cx="785" cy="144.6" r="5"/>
+    <circle cx="918" cy="144.6" r="5"/>
+    <circle cx="1050" cy="131.1" r="5"/>
   </g>
 
   <g font-family="Arial, sans-serif" font-size="12" fill="#111827">
-    <text x="120" y="394" text-anchor="middle">15.22</text>
-    <text x="273" y="428" text-anchor="middle">14.72</text>
-    <text x="427" y="116" text-anchor="middle">81.12</text>
-    <text x="580" y="225" text-anchor="middle">55.23</text>
-    <text x="733" y="175" text-anchor="middle">67.11</text>
-    <text x="887" y="216" text-anchor="middle">57.33</text>
-    <text x="1040" y="354" text-anchor="middle">24.62</text>
+    <text x="120" y="378" text-anchor="middle">24.71</text>
+    <text x="253" y="350" text-anchor="middle">32.70</text>
+    <text x="386" y="384" text-anchor="middle">32.27</text>
+    <text x="519" y="139" text-anchor="middle">93.76</text>
+    <text x="652" y="132" text-anchor="middle">95.66</text>
+    <text x="785" y="172" text-anchor="middle">93.45</text>
+    <text x="918" y="220" text-anchor="middle">79.61</text>
+    <text x="1050" y="119" text-anchor="middle">99.49</text>
   </g>
 
   <g font-family="Arial, sans-serif" font-size="12" fill="#374151">
-    <text x="120" y="504" text-anchor="middle">Borrowed</text>
-    <text x="120" y="520" text-anchor="middle">parallel</text>
-    <text x="273" y="504" text-anchor="middle">Stream</text>
-    <text x="273" y="520" text-anchor="middle">decode</text>
-    <text x="427" y="504" text-anchor="middle">SIMD</text>
-    <text x="427" y="520" text-anchor="middle">dot</text>
-    <text x="580" y="504" text-anchor="middle">Experiment</text>
-    <text x="580" y="520" text-anchor="middle">stats</text>
-    <text x="733" y="504" text-anchor="middle">Tuning</text>
-    <text x="733" y="520" text-anchor="middle">flags</text>
-    <text x="887" y="504" text-anchor="middle">Quant f32</text>
-    <text x="887" y="520" text-anchor="middle">baseline</text>
-    <text x="1040" y="504" text-anchor="middle">Quant</text>
-    <text x="1040" y="520" text-anchor="middle">int8</text>
+    <text x="120" y="511" text-anchor="middle">baseline</text>
+    <text x="120" y="527" text-anchor="middle">d97a323</text>
+    <text x="253" y="511" text-anchor="middle">cached</text>
+    <text x="253" y="527" text-anchor="middle">1d27dc4</text>
+    <text x="386" y="511" text-anchor="middle">stream</text>
+    <text x="386" y="527" text-anchor="middle">a75e051</text>
+    <text x="519" y="511" text-anchor="middle">SIMD</text>
+    <text x="519" y="527" text-anchor="middle">6751b6e</text>
+    <text x="652" y="511" text-anchor="middle">reporting</text>
+    <text x="652" y="527" text-anchor="middle">0345041</text>
+    <text x="785" y="511" text-anchor="middle">tuning</text>
+    <text x="785" y="527" text-anchor="middle">6a4274e</text>
+    <text x="918" y="511" text-anchor="middle">quant path</text>
+    <text x="918" y="527" text-anchor="middle">a341746</text>
+    <text x="1050" y="511" text-anchor="middle">current</text>
+    <text x="1050" y="527" text-anchor="middle">1c6cd3a</text>
   </g>
 
   <g font-family="Arial, sans-serif" font-size="13" fill="#111827">
-    <line x1="824" y1="48" x2="868" y2="48" stroke="#2563eb" stroke-width="3"/>
-    <circle cx="846" cy="48" r="5" fill="#2563eb" stroke="#ffffff" stroke-width="2"/>
-    <text x="878" y="53">Best for slice</text>
-    <line x1="824" y1="72" x2="868" y2="72" stroke="#16a34a" stroke-width="3" stroke-dasharray="8 6"/>
-    <circle cx="846" cy="72" r="5" fill="#16a34a" stroke="#ffffff" stroke-width="2"/>
-    <text x="878" y="77">Cumulative best</text>
+    <line x1="800" y1="44" x2="850" y2="44" stroke="#16a34a" stroke-width="4"/>
+    <circle cx="825" cy="44" r="5" fill="#16a34a" stroke="#ffffff" stroke-width="2"/>
+    <text x="862" y="49">Cumulative best, progress signal</text>
+    <line x1="800" y1="70" x2="850" y2="70" stroke="#94a3b8" stroke-width="2"/>
+    <circle cx="825" cy="70" r="4" fill="#94a3b8" stroke="#ffffff" stroke-width="2"/>
+    <text x="862" y="75">Measured result at that commit</text>
   </g>
 
-  <text x="110" y="586" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Note: quantized int8 is tracked as an experimental storage path and is currently slower than the f32 reference on this sweep.</text>
-  <text x="110" y="606" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Source: benchmarks/gpt2_experiment_history.csv, using best total_tokens_per_second per optimization slice.</text>
+  <text x="108" y="592" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Why raw points can dip: some commits add tooling or experimental paths, and short local timing runs have scheduler noise. The green line shows retained progress.</text>
+  <text x="108" y="612" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Source: benchmarks/gpt2_progress.csv, generated from the same benchmark command across historical git worktrees.</text>
 </svg>
