@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -114,8 +115,9 @@ pub struct Gpt2BlockWeights {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2Model {
     pub config: Gpt2Config,
-    pub weights: Gpt2Weights,
+    pub weights: Arc<Gpt2Weights>,
     pub rust_config: Gpt2RustConfig,
+    thread_pool: ThreadPool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -572,21 +574,24 @@ impl Gpt2Model {
 
     pub fn new_with_rust_config(
         config: Gpt2Config,
-        weights: Gpt2Weights,
+        mut weights: Gpt2Weights,
         rust_config: Gpt2RustConfig,
     ) -> Result<Self> {
         config.validate()?;
         rust_config.validate()?;
         validate_weights(&config, &weights)?;
+        transpose_dense_weights(&config, &mut weights);
+        let thread_pool = ThreadPool::new(rust_config.threads);
         Ok(Self {
             config,
-            weights,
+            weights: Arc::new(weights),
             rust_config,
+            thread_pool,
         })
     }
 
-    fn thread_pool(&self) -> ThreadPool {
-        ThreadPool::new(self.rust_config.threads)
+    fn thread_pool(&self) -> &ThreadPool {
+        &self.thread_pool
     }
 
     pub fn forward(&self, input_ids: &[usize]) -> Result<Gpt2Output> {
@@ -606,8 +611,8 @@ impl Gpt2Model {
             }
         }
 
-        for block in &self.weights.blocks {
-            x = self.block_forward(&x, t, block);
+        for layer in 0..self.weights.blocks.len() {
+            x = self.block_forward(&x, t, layer);
         }
 
         layer_norm_in_place(
@@ -626,10 +631,10 @@ impl Gpt2Model {
             let out = row_mut(&mut logits, pos, cfg.vocab_size);
             out.copy_from_slice(&logits_from_hidden(
                 hidden,
-                &self.weights.wte,
                 cfg.vocab_size,
                 c,
-                &pool,
+                Arc::clone(&self.weights),
+                pool,
             ));
         }
 
@@ -700,8 +705,8 @@ impl Gpt2Model {
             x[i] = tok[i] + pos_emb[i];
         }
 
-        for (layer, block) in self.weights.blocks.iter().enumerate() {
-            x = self.block_forward_one(&x, layer, block, cache)?;
+        for layer in 0..self.weights.blocks.len() {
+            x = self.block_forward_one(&x, layer, cache)?;
         }
 
         layer_norm_in_place(
@@ -715,10 +720,10 @@ impl Gpt2Model {
         cache.seq_len += 1;
         Ok(logits_from_hidden(
             &x,
-            &self.weights.wte,
             cfg.vocab_size,
             c,
-            &self.thread_pool(),
+            Arc::clone(&self.weights),
+            self.thread_pool(),
         ))
     }
 
@@ -767,9 +772,11 @@ impl Gpt2Model {
         Ok(())
     }
 
-    fn block_forward(&self, x: &[f32], t: usize, block: &Gpt2BlockWeights) -> Vec<f32> {
+    fn block_forward(&self, x: &[f32], t: usize, layer: usize) -> Vec<f32> {
         let cfg = &self.config;
         let c = cfg.n_embd;
+        let weights = Arc::clone(&self.weights);
+        let block = &weights.blocks[layer];
         let mut norm = x.to_vec();
         layer_norm_in_place(
             &mut norm,
@@ -780,9 +787,23 @@ impl Gpt2Model {
             cfg.layer_norm_epsilon,
         );
 
-        let qkv = linear(&norm, t, c, &block.c_attn_w, &block.c_attn_b, 3 * c);
+        let qkv = linear_block(
+            &norm,
+            LinearShape::new(t, c, 3 * c),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::CAttn,
+            self.thread_pool(),
+        );
         let attn = causal_self_attention(&qkv, t, cfg.n_head, cfg.head_dim());
-        let attn_proj = linear(&attn, t, c, &block.c_proj_w, &block.c_proj_b, c);
+        let attn_proj = linear_block(
+            &attn,
+            LinearShape::new(t, c, c),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::AttnProj,
+            self.thread_pool(),
+        );
 
         let mut residual = x.to_vec();
         add_in_place(&mut residual, &attn_proj);
@@ -797,15 +818,22 @@ impl Gpt2Model {
             cfg.layer_norm_epsilon,
         );
 
-        let mut mlp = linear(&norm, t, c, &block.c_fc_w, &block.c_fc_b, cfg.n_inner);
+        let mut mlp = linear_block(
+            &norm,
+            LinearShape::new(t, c, cfg.n_inner),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::MlpFc,
+            self.thread_pool(),
+        );
         gelu_in_place(&mut mlp);
-        let mlp_proj = linear(
+        let mlp_proj = linear_block(
             &mlp,
-            t,
-            cfg.n_inner,
-            &block.c_proj_mlp_w,
-            &block.c_proj_mlp_b,
-            c,
+            LinearShape::new(t, cfg.n_inner, c),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::MlpProj,
+            self.thread_pool(),
         );
 
         add_in_place(&mut residual, &mlp_proj);
@@ -816,11 +844,12 @@ impl Gpt2Model {
         &self,
         x: &[f32],
         layer: usize,
-        block: &Gpt2BlockWeights,
         cache: &mut Gpt2KvCache,
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let c = cfg.n_embd;
+        let weights = Arc::clone(&self.weights);
+        let block = &weights.blocks[layer];
         let mut norm = x.to_vec();
         layer_norm_in_place(
             &mut norm,
@@ -831,7 +860,14 @@ impl Gpt2Model {
             cfg.layer_norm_epsilon,
         );
 
-        let qkv = linear(&norm, 1, c, &block.c_attn_w, &block.c_attn_b, 3 * c);
+        let qkv = linear_block(
+            &norm,
+            LinearShape::new(1, c, 3 * c),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::CAttn,
+            self.thread_pool(),
+        );
         let attn = cached_self_attention(
             &qkv,
             cache.seq_len,
@@ -839,7 +875,14 @@ impl Gpt2Model {
             cfg.n_head,
             cfg.head_dim(),
         );
-        let attn_proj = linear(&attn, 1, c, &block.c_proj_w, &block.c_proj_b, c);
+        let attn_proj = linear_block(
+            &attn,
+            LinearShape::new(1, c, c),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::AttnProj,
+            self.thread_pool(),
+        );
 
         let mut residual = x.to_vec();
         add_in_place(&mut residual, &attn_proj);
@@ -854,15 +897,22 @@ impl Gpt2Model {
             cfg.layer_norm_epsilon,
         );
 
-        let mut mlp = linear(&norm, 1, c, &block.c_fc_w, &block.c_fc_b, cfg.n_inner);
+        let mut mlp = linear_block(
+            &norm,
+            LinearShape::new(1, c, cfg.n_inner),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::MlpFc,
+            self.thread_pool(),
+        );
         gelu_in_place(&mut mlp);
-        let mlp_proj = linear(
+        let mlp_proj = linear_block(
             &mlp,
-            1,
-            cfg.n_inner,
-            &block.c_proj_mlp_w,
-            &block.c_proj_mlp_b,
-            c,
+            LinearShape::new(1, cfg.n_inner, c),
+            Arc::clone(&weights),
+            layer,
+            BlockLinear::MlpProj,
+            self.thread_pool(),
         );
 
         add_in_place(&mut residual, &mlp_proj);
@@ -962,6 +1012,119 @@ fn expect_len(name: &str, values: &[f32], expected: usize) -> Result<()> {
     Ok(())
 }
 
+fn transpose_dense_weights(cfg: &Gpt2Config, weights: &mut Gpt2Weights) {
+    for block in &mut weights.blocks {
+        block.c_attn_w = transpose_in_out(&block.c_attn_w, cfg.n_embd, 3 * cfg.n_embd);
+        block.c_proj_w = transpose_in_out(&block.c_proj_w, cfg.n_embd, cfg.n_embd);
+        block.c_fc_w = transpose_in_out(&block.c_fc_w, cfg.n_embd, cfg.n_inner);
+        block.c_proj_mlp_w = transpose_in_out(&block.c_proj_mlp_w, cfg.n_inner, cfg.n_embd);
+    }
+}
+
+fn transpose_in_out(weight: &[f32], in_features: usize, out_features: usize) -> Vec<f32> {
+    let mut transposed = vec![0.0f32; weight.len()];
+    for i in 0..in_features {
+        for o in 0..out_features {
+            transposed[o * in_features + i] = weight[i * out_features + o];
+        }
+    }
+    transposed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockLinear {
+    CAttn,
+    AttnProj,
+    MlpFc,
+    MlpProj,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinearShape {
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl LinearShape {
+    fn new(rows: usize, in_features: usize, out_features: usize) -> Self {
+        Self {
+            rows,
+            in_features,
+            out_features,
+        }
+    }
+
+    fn out_len(self) -> usize {
+        self.rows * self.out_features
+    }
+
+    fn work_items(self) -> usize {
+        self.rows * self.in_features * self.out_features
+    }
+}
+
+fn block_linear_slices(
+    weights: &Gpt2Weights,
+    layer: usize,
+    which: BlockLinear,
+) -> (&[f32], &[f32]) {
+    // Dense projection matrices are transposed during model construction:
+    // weight layout is [out_features, in_features].
+    let block = &weights.blocks[layer];
+    match which {
+        BlockLinear::CAttn => (&block.c_attn_w, &block.c_attn_b),
+        BlockLinear::AttnProj => (&block.c_proj_w, &block.c_proj_b),
+        BlockLinear::MlpFc => (&block.c_fc_w, &block.c_fc_b),
+        BlockLinear::MlpProj => (&block.c_proj_mlp_w, &block.c_proj_mlp_b),
+    }
+}
+
+fn linear_block(
+    x: &[f32],
+    shape: LinearShape,
+    weights: Arc<Gpt2Weights>,
+    layer: usize,
+    which: BlockLinear,
+    pool: &ThreadPool,
+) -> Vec<f32> {
+    let (weight, bias) = block_linear_slices(&weights, layer, which);
+    if pool.threads() == 1 || shape.work_items() < 262_144 {
+        return linear(
+            x,
+            shape.rows,
+            shape.in_features,
+            weight,
+            bias,
+            shape.out_features,
+        );
+    }
+
+    let x = Arc::<[f32]>::from(x.to_vec());
+    let chunks = pool.parallel_chunks(shape.out_len(), 64, move |start, end| {
+        let mut values = Vec::with_capacity(end - start);
+        let (weight, bias) = block_linear_slices(&weights, layer, which);
+        for index in start..end {
+            let r = index / shape.out_features;
+            let o = index % shape.out_features;
+            let src = row(&x, r, shape.in_features);
+            let mut sum = bias[o];
+            let weight_row = row(weight, o, shape.in_features);
+            for i in 0..shape.in_features {
+                sum += src[i] * weight_row[i];
+            }
+            values.push(sum);
+        }
+        values
+    });
+
+    let mut out = Vec::with_capacity(shape.out_len());
+    for mut chunk in chunks {
+        out.append(&mut chunk);
+    }
+    out
+}
+
 fn linear(
     x: &[f32],
     rows: usize,
@@ -976,8 +1139,9 @@ fn linear(
         let dst = row_mut(&mut out, r, out_features);
         for o in 0..out_features {
             let mut sum = bias[o];
+            let weight_row = row(weight, o, in_features);
             for i in 0..in_features {
-                sum += src[i] * weight[i * out_features + o];
+                sum += src[i] * weight_row[i];
             }
             dst[o] = sum;
         }
@@ -1060,23 +1224,24 @@ fn cached_self_attention(
 
 fn logits_from_hidden(
     hidden: &[f32],
-    token_embeddings: &[f32],
     vocab_size: usize,
     n_embd: usize,
+    weights: Arc<Gpt2Weights>,
     pool: &ThreadPool,
 ) -> Vec<f32> {
     if pool.threads() == 1 {
         let mut logits = vec![0.0f32; vocab_size];
         for (token, logit) in logits.iter_mut().enumerate() {
-            *logit = dot(hidden, row(token_embeddings, token, n_embd));
+            *logit = dot(hidden, row(&weights.wte, token, n_embd));
         }
         return logits;
     }
 
-    let chunks = pool.parallel_chunks(vocab_size, 256, |start, end| {
+    let hidden = Arc::<[f32]>::from(hidden.to_vec());
+    let chunks = pool.parallel_chunks(vocab_size, 256, move |start, end| {
         let mut values = Vec::with_capacity(end - start);
         for token in start..end {
-            values.push(dot(hidden, row(token_embeddings, token, n_embd)));
+            values.push(dot(&hidden, row(&weights.wte, token, n_embd)));
         }
         values
     });

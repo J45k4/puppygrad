@@ -390,7 +390,7 @@ fn print_gpt2_speed(stats: &Gpt2GenerationStats) {
 }
 
 fn print_gpt2_stats(load_time: Duration, stats: &Gpt2GenerationStats) {
-    eprintln!("stats:");
+    eprintln!("\nstats:");
     eprintln!("  load: {}", format_duration(load_time));
     eprintln!("  tokenize: {}", format_duration(stats.tokenize_time));
     eprintln!(
