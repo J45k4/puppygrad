@@ -1,6 +1,7 @@
 use clap::Args;
 use std::error;
 use std::fmt;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Args, PartialEq)]
 pub struct TextGenerationArgs {
@@ -116,6 +117,52 @@ impl fmt::Display for GenerationConfigError {
 }
 
 impl error::Error for GenerationConfigError {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenerationStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub tokenize_time: Duration,
+    pub prefill_time: Duration,
+    pub decode_time: Duration,
+    pub total_generation_time: Duration,
+    pub first_token_time: Option<Duration>,
+}
+
+impl GenerationStats {
+    pub fn total_model_tokens(&self) -> usize {
+        self.prompt_tokens + self.generated_tokens
+    }
+
+    pub fn prefill_tokens_per_second(&self) -> f64 {
+        rate(self.prompt_tokens, self.prefill_time)
+    }
+
+    pub fn decode_tokens_per_second(&self) -> f64 {
+        rate(self.generated_tokens, self.decode_time)
+    }
+
+    pub fn total_tokens_per_second(&self) -> f64 {
+        rate(self.total_model_tokens(), self.total_generation_time)
+    }
+
+    pub fn average_decode_token_time(&self) -> Option<Duration> {
+        if self.generated_tokens == 0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            self.decode_time.as_secs_f64() / self.generated_tokens as f64,
+        ))
+    }
+}
+
+fn rate(tokens: usize, duration: Duration) -> f64 {
+    let seconds = duration.as_secs_f64();
+    if seconds == 0.0 {
+        return 0.0;
+    }
+    tokens as f64 / seconds
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SamplingError(String);

@@ -1,4 +1,5 @@
 use std::fs;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +9,9 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::models::autoregressive::{self, AutoregressiveDecoder};
-use crate::models::generation::{argmax_logits as argmax, LogitsSampler, SamplingError};
+use crate::models::generation::{
+    argmax_logits as argmax, GenerationStats, LogitsSampler, SamplingError,
+};
 use crate::models::safetensors::{
     parse_safetensors, read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError,
 };
@@ -303,13 +306,7 @@ pub struct Gpt2Runtime {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2GenerationStats {
-    pub prompt_tokens: usize,
-    pub generated_tokens: usize,
-    pub tokenize_time: Duration,
-    pub prefill_time: Duration,
-    pub decode_time: Duration,
-    pub total_generation_time: Duration,
-    pub first_token_time: Option<Duration>,
+    pub common: GenerationStats,
     pub operation_profile: Gpt2OperationProfile,
 }
 
@@ -327,41 +324,25 @@ pub struct Gpt2OperationProfile {
 }
 
 impl Gpt2GenerationStats {
-    pub fn total_model_tokens(&self) -> usize {
-        self.prompt_tokens + self.generated_tokens
-    }
-
-    pub fn prefill_tokens_per_second(&self) -> f64 {
-        let seconds = self.prefill_time.as_secs_f64();
-        if seconds == 0.0 {
-            return 0.0;
+    pub fn new(common: GenerationStats, operation_profile: Gpt2OperationProfile) -> Self {
+        Self {
+            common,
+            operation_profile,
         }
-        self.prompt_tokens as f64 / seconds
     }
+}
 
-    pub fn decode_tokens_per_second(&self) -> f64 {
-        let seconds = self.decode_time.as_secs_f64();
-        if seconds == 0.0 {
-            return 0.0;
-        }
-        self.generated_tokens as f64 / seconds
+impl Deref for Gpt2GenerationStats {
+    type Target = GenerationStats;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
     }
+}
 
-    pub fn total_tokens_per_second(&self) -> f64 {
-        let seconds = self.total_generation_time.as_secs_f64();
-        if seconds == 0.0 {
-            return 0.0;
-        }
-        self.total_model_tokens() as f64 / seconds
-    }
-
-    pub fn average_decode_token_time(&self) -> Option<Duration> {
-        if self.generated_tokens == 0 {
-            return None;
-        }
-        Some(Duration::from_secs_f64(
-            self.decode_time.as_secs_f64() / self.generated_tokens as f64,
-        ))
+impl DerefMut for Gpt2GenerationStats {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.common
     }
 }
 
@@ -520,16 +501,18 @@ impl Gpt2Runtime {
         }
 
         let decode_time = decode_start.elapsed();
-        let stats = Gpt2GenerationStats {
-            prompt_tokens: input_ids.len(),
-            generated_tokens,
-            tokenize_time,
-            prefill_time,
-            decode_time,
-            total_generation_time: prefill_time + decode_time,
-            first_token_time,
+        let stats = Gpt2GenerationStats::new(
+            GenerationStats {
+                prompt_tokens: input_ids.len(),
+                generated_tokens,
+                tokenize_time,
+                prefill_time,
+                decode_time,
+                total_generation_time: prefill_time + decode_time,
+                first_token_time,
+            },
             operation_profile,
-        };
+        );
 
         Ok((streamer.decoded().to_string(), stats))
     }
@@ -2139,7 +2122,32 @@ mod tests {
 
     #[test]
     fn generation_stats_report_token_rates() {
-        let stats = Gpt2GenerationStats {
+        let stats = Gpt2GenerationStats::new(
+            GenerationStats {
+                prompt_tokens: 4,
+                generated_tokens: 6,
+                tokenize_time: Duration::from_millis(5),
+                prefill_time: Duration::from_millis(20),
+                decode_time: Duration::from_millis(30),
+                total_generation_time: Duration::from_millis(50),
+                first_token_time: Some(Duration::from_millis(22)),
+            },
+            Gpt2OperationProfile::default(),
+        );
+
+        assert_eq!(stats.total_model_tokens(), 10);
+        assert_eq!(stats.prefill_tokens_per_second(), 200.0);
+        assert_eq!(stats.decode_tokens_per_second(), 200.0);
+        assert_eq!(stats.total_tokens_per_second(), 200.0);
+        assert_eq!(
+            stats.average_decode_token_time(),
+            Some(Duration::from_millis(5))
+        );
+    }
+
+    #[test]
+    fn generic_generation_stats_report_token_rates() {
+        let stats = GenerationStats {
             prompt_tokens: 4,
             generated_tokens: 6,
             tokenize_time: Duration::from_millis(5),
@@ -2147,7 +2155,6 @@ mod tests {
             decode_time: Duration::from_millis(30),
             total_generation_time: Duration::from_millis(50),
             first_token_time: Some(Duration::from_millis(22)),
-            operation_profile: Gpt2OperationProfile::default(),
         };
 
         assert_eq!(stats.total_model_tokens(), 10);
