@@ -1,7 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use super::{Gpt2Error, Result};
-use crate::models::assets::download_huggingface_file;
+use crate::models::assets::{default_model_dir, download_huggingface_files, HuggingFaceAsset};
+
+const GPT2_ASSETS: [HuggingFaceAsset; 3] = [
+    HuggingFaceAsset::required("config.json"),
+    HuggingFaceAsset::required("tokenizer.json"),
+    HuggingFaceAsset::required("model.safetensors"),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gpt2AssetPaths {
@@ -24,7 +30,7 @@ impl Gpt2AssetPaths {
 }
 
 pub fn default_gpt2_small_dir() -> PathBuf {
-    PathBuf::from("models/gpt2")
+    default_model_dir("gpt2")
 }
 
 pub fn download_gpt2_small_assets(model_dir: impl AsRef<Path>) -> Result<Gpt2AssetPaths> {
@@ -37,11 +43,7 @@ pub fn download_huggingface_gpt2_assets(
     model_dir: impl AsRef<Path>,
 ) -> Result<Gpt2AssetPaths> {
     let paths = Gpt2AssetPaths::new(model_dir.as_ref());
-    download_huggingface_file(model_id, revision, "config.json", &paths.config)
-        .map_err(|err| Gpt2Error::Asset(err.to_string()))?;
-    download_huggingface_file(model_id, revision, "tokenizer.json", &paths.tokenizer)
-        .map_err(|err| Gpt2Error::Asset(err.to_string()))?;
-    download_huggingface_file(model_id, revision, "model.safetensors", &paths.weights)
+    download_huggingface_files(model_id, revision, &paths.model_dir, &GPT2_ASSETS)
         .map_err(|err| Gpt2Error::Asset(err.to_string()))?;
 
     Ok(paths)

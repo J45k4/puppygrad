@@ -2,7 +2,7 @@ use std::error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub enum AssetError {
@@ -28,6 +28,10 @@ pub enum AssetError {
         to: String,
         source: io::Error,
     },
+    MissingRequiredFiles {
+        model_dir: String,
+        files: Vec<String>,
+    },
 }
 
 impl fmt::Display for AssetError {
@@ -47,6 +51,13 @@ impl fmt::Display for AssetError {
             AssetError::RenameDownload { from, to, source } => {
                 write!(f, "failed to move {from} to {to}: {source}")
             }
+            AssetError::MissingRequiredFiles { model_dir, files } => {
+                write!(
+                    f,
+                    "model directory {model_dir} is missing required files: {}",
+                    files.join(", ")
+                )
+            }
         }
     }
 }
@@ -54,6 +65,91 @@ impl fmt::Display for AssetError {
 impl error::Error for AssetError {}
 
 pub type Result<T> = std::result::Result<T, AssetError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HuggingFaceAsset {
+    pub filename: &'static str,
+}
+
+impl HuggingFaceAsset {
+    pub const fn required(filename: &'static str) -> Self {
+        Self { filename }
+    }
+}
+
+pub fn default_model_dir(short_name: &str) -> PathBuf {
+    PathBuf::from("models").join(short_name)
+}
+
+pub fn huggingface_cache_model_dir(
+    cache_root: impl AsRef<Path>,
+    model_id: &str,
+    revision: &str,
+) -> PathBuf {
+    cache_root
+        .as_ref()
+        .join("huggingface")
+        .join(sanitize_cache_component(model_id))
+        .join(sanitize_cache_component(revision))
+}
+
+pub fn resolve_model_dir(explicit: Option<PathBuf>, default: impl FnOnce() -> PathBuf) -> PathBuf {
+    explicit.unwrap_or_else(default)
+}
+
+pub fn check_required_files(model_dir: &Path, filenames: &[&str]) -> Result<()> {
+    let missing = missing_required_files(model_dir, filenames);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AssetError::MissingRequiredFiles {
+        model_dir: model_dir.display().to_string(),
+        files: missing,
+    })
+}
+
+pub fn missing_required_files(model_dir: &Path, filenames: &[&str]) -> Vec<String> {
+    filenames
+        .iter()
+        .copied()
+        .filter(|filename| !model_dir.join(filename).is_file())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn download_huggingface_files(
+    model_id: &str,
+    revision: &str,
+    model_dir: &Path,
+    assets: &[HuggingFaceAsset],
+) -> Result<()> {
+    for asset in assets {
+        download_huggingface_file(
+            model_id,
+            revision,
+            asset.filename,
+            &model_dir.join(asset.filename),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn prepare_huggingface_model_dir(
+    model_id: &str,
+    revision: &str,
+    model_dir: &Path,
+    assets: &[HuggingFaceAsset],
+    download: bool,
+) -> Result<()> {
+    if download {
+        download_huggingface_files(model_id, revision, model_dir, assets)?;
+    }
+    let filenames = assets
+        .iter()
+        .map(|asset| asset.filename)
+        .collect::<Vec<_>>();
+    check_required_files(model_dir, &filenames)
+}
 
 pub fn download_huggingface_file(
     model_id: &str,
@@ -100,4 +196,46 @@ pub fn download_huggingface_file(
         source,
     })?;
     Ok(())
+}
+
+fn sanitize_cache_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '-' | '_' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reports_missing_required_files() {
+        let tmp =
+            std::env::temp_dir().join(format!("puppygrad-assets-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("config.json"), "{}").unwrap();
+
+        let missing = missing_required_files(&tmp, &["config.json", "model.safetensors"]);
+
+        assert_eq!(missing, ["model.safetensors"]);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn builds_huggingface_cache_path() {
+        let path = huggingface_cache_model_dir("models", "Qwen/Qwen2.5-0.5B-Instruct", "main");
+
+        assert_eq!(
+            path,
+            PathBuf::from("models")
+                .join("huggingface")
+                .join("Qwen-Qwen2.5-0.5B-Instruct")
+                .join("main")
+        );
+    }
 }
