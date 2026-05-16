@@ -10,7 +10,7 @@ use tokenizers::Tokenizer;
 
 use crate::models::autoregressive::{self, AutoregressiveDecoder};
 use crate::models::generation::{
-    argmax_logits as argmax, GenerationStats, LogitsSampler, SamplingError,
+    argmax_logits as argmax, GenerationStats, LogitsSampler, ProfiledGenerationStats, SamplingError,
 };
 use crate::models::safetensors::{
     parse_safetensors, read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError,
@@ -325,10 +325,15 @@ pub struct Gpt2OperationProfile {
 
 impl Gpt2GenerationStats {
     pub fn new(common: GenerationStats, operation_profile: Gpt2OperationProfile) -> Self {
+        let (common, operation_profile) = common.with_profile(operation_profile).split();
         Self {
             common,
             operation_profile,
         }
+    }
+
+    pub fn as_profiled(&self) -> ProfiledGenerationStats<&Gpt2OperationProfile> {
+        self.common.clone().with_profile(&self.operation_profile)
     }
 }
 
@@ -2165,6 +2170,26 @@ mod tests {
             stats.average_decode_token_time(),
             Some(Duration::from_millis(5))
         );
+    }
+
+    #[test]
+    fn gpt2_operation_profile_attaches_to_generic_stats() {
+        let stats = Gpt2GenerationStats::new(
+            GenerationStats {
+                prompt_tokens: 2,
+                generated_tokens: 3,
+                ..GenerationStats::default()
+            },
+            Gpt2OperationProfile {
+                qkv_projection: Duration::from_millis(7),
+                ..Gpt2OperationProfile::default()
+            },
+        );
+
+        let profiled = stats.as_profiled();
+
+        assert_eq!(profiled.common.total_model_tokens(), 5);
+        assert_eq!(profiled.profile.qkv_projection, Duration::from_millis(7));
     }
 
     #[test]

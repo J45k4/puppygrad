@@ -130,6 +130,13 @@ pub struct GenerationStats {
 }
 
 impl GenerationStats {
+    pub fn with_profile<P>(self, profile: P) -> ProfiledGenerationStats<P> {
+        ProfiledGenerationStats {
+            common: self,
+            profile,
+        }
+    }
+
     pub fn total_model_tokens(&self) -> usize {
         self.prompt_tokens + self.generated_tokens
     }
@@ -162,6 +169,22 @@ fn rate(tokens: usize, duration: Duration) -> f64 {
         return 0.0;
     }
     tokens as f64 / seconds
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProfiledGenerationStats<P> {
+    pub common: GenerationStats,
+    pub profile: P,
+}
+
+impl<P> ProfiledGenerationStats<P> {
+    pub fn new(common: GenerationStats, profile: P) -> Self {
+        Self { common, profile }
+    }
+
+    pub fn split(self) -> (GenerationStats, P) {
+        (self.common, self.profile)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
