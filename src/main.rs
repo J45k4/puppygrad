@@ -5,6 +5,7 @@ use puppygrad::models::gpt2::{
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime,
 };
 use serde::Serialize;
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -163,9 +164,13 @@ enum ExperimentCommand {
         #[arg(long)]
         download: bool,
 
-        /// Prompt text.
+        /// Prompt text. Ignored when --prompt-file is set.
         #[arg(long)]
-        prompt: String,
+        prompt: Option<String>,
+
+        /// Text file with one benchmark prompt per non-empty line.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
 
         /// Comma-separated worker-thread counts, for example 1,2,4,8.
         #[arg(long, default_value = "1")]
@@ -251,6 +256,7 @@ fn main() -> Result<()> {
                 revision,
                 download,
                 prompt,
+                prompt_file,
                 threads,
                 max_new_tokens,
                 runs,
@@ -262,6 +268,7 @@ fn main() -> Result<()> {
                 revision,
                 download,
                 prompt,
+                prompt_file,
                 threads,
                 max_new_tokens,
                 runs,
@@ -307,7 +314,8 @@ struct RunGpt2ExperimentArgs {
     model_id: String,
     revision: String,
     download: bool,
-    prompt: String,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
     threads: String,
     max_new_tokens: String,
     runs: usize,
@@ -423,6 +431,43 @@ fn print_gpt2_stats(load_time: Duration, stats: &Gpt2GenerationStats) {
         stats.total_model_tokens(),
         stats.total_tokens_per_second()
     );
+    eprintln!("  profile:");
+    eprintln!(
+        "    layernorm: {}",
+        format_duration(stats.operation_profile.layer_norm)
+    );
+    eprintln!(
+        "    qkv projection: {}",
+        format_duration(stats.operation_profile.qkv_projection)
+    );
+    eprintln!(
+        "    attention: {}",
+        format_duration(stats.operation_profile.attention)
+    );
+    eprintln!(
+        "    attention projection: {}",
+        format_duration(stats.operation_profile.attention_projection)
+    );
+    eprintln!(
+        "    mlp fc projection: {}",
+        format_duration(stats.operation_profile.mlp_fc_projection)
+    );
+    eprintln!(
+        "    mlp projection: {}",
+        format_duration(stats.operation_profile.mlp_projection)
+    );
+    eprintln!(
+        "    final logits: {}",
+        format_duration(stats.operation_profile.final_logits)
+    );
+    eprintln!(
+        "    tokenization: {}",
+        format_duration(stats.operation_profile.tokenization)
+    );
+    eprintln!(
+        "    decoding: {}",
+        format_duration(stats.operation_profile.decoding)
+    );
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -441,6 +486,8 @@ fn format_duration(duration: Duration) -> String {
 #[derive(Clone, Debug, Serialize)]
 struct Gpt2ExperimentRow {
     backend: String,
+    prompt_index: Option<usize>,
+    prompt: String,
     threads: usize,
     max_new_tokens: usize,
     runs: usize,
@@ -452,9 +499,37 @@ struct Gpt2ExperimentRow {
     time_to_first_token_ms: Option<f64>,
     decode_ms: f64,
     total_generation_ms: f64,
+    decode_ms_min: f64,
+    decode_ms_median: f64,
+    decode_ms_p95: f64,
+    decode_ms_max: f64,
+    decode_ms_stddev: f64,
+    total_generation_ms_min: f64,
+    total_generation_ms_median: f64,
+    total_generation_ms_p95: f64,
+    total_generation_ms_max: f64,
+    total_generation_ms_stddev: f64,
     prefill_tokens_per_second: f64,
     decode_tokens_per_second: f64,
     total_tokens_per_second: f64,
+    profile_tokenization_ms: f64,
+    profile_layer_norm_ms: f64,
+    profile_qkv_projection_ms: f64,
+    profile_attention_ms: f64,
+    profile_attention_projection_ms: f64,
+    profile_mlp_fc_projection_ms: f64,
+    profile_mlp_projection_ms: f64,
+    profile_final_logits_ms: f64,
+    profile_decoding_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DistributionSummary {
+    min: f64,
+    median: f64,
+    p95: f64,
+    max: f64,
+    stddev: f64,
 }
 
 fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
@@ -463,6 +538,7 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
     }
     let thread_counts = parse_usize_list("threads", &args.threads)?;
     let token_counts = parse_usize_list("max-new-tokens", &args.max_new_tokens)?;
+    let prompts = load_experiment_prompts(args.prompt.as_deref(), args.prompt_file.as_ref())?;
     let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
 
     if args.download {
@@ -493,32 +569,51 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
             let generation = Gpt2GenerationConfig::new(max_new_tokens);
             generation.validate()?;
 
-            for _ in 0..args.warmup_runs {
-                let _ = runtime.stream_greedy_text_with_stats(
-                    &args.prompt,
-                    generation.max_new_tokens,
-                    |_| Ok::<(), Box<dyn std::error::Error>>(()),
-                )?;
+            let mut aggregate_stats = Vec::with_capacity(args.runs * prompts.len());
+            for (prompt_index, prompt) in prompts.iter().enumerate() {
+                for _ in 0..args.warmup_runs {
+                    let _ = runtime.stream_greedy_text_with_stats(
+                        prompt,
+                        generation.max_new_tokens,
+                        |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                    )?;
+                }
+
+                let mut stats = Vec::with_capacity(args.runs);
+                for _ in 0..args.runs {
+                    let (_, run_stats) = runtime.stream_greedy_text_with_stats(
+                        prompt,
+                        generation.max_new_tokens,
+                        |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                    )?;
+                    aggregate_stats.push(run_stats.clone());
+                    stats.push(run_stats);
+                }
+
+                rows.push(average_gpt2_experiment_row(
+                    "rust",
+                    Some(prompt_index),
+                    prompt,
+                    threads,
+                    max_new_tokens,
+                    args.runs,
+                    load_time,
+                    &stats,
+                ));
             }
 
-            let mut stats = Vec::with_capacity(args.runs);
-            for _ in 0..args.runs {
-                let (_, run_stats) = runtime.stream_greedy_text_with_stats(
-                    &args.prompt,
-                    generation.max_new_tokens,
-                    |_| Ok::<(), Box<dyn std::error::Error>>(()),
-                )?;
-                stats.push(run_stats);
+            if prompts.len() > 1 {
+                rows.push(average_gpt2_experiment_row(
+                    "rust",
+                    None,
+                    "<aggregate>",
+                    threads,
+                    max_new_tokens,
+                    aggregate_stats.len(),
+                    load_time,
+                    &aggregate_stats,
+                ));
             }
-
-            rows.push(average_gpt2_experiment_row(
-                "rust",
-                threads,
-                max_new_tokens,
-                args.runs,
-                load_time,
-                &stats,
-            ));
         }
     }
 
@@ -533,6 +628,8 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
 
 fn average_gpt2_experiment_row(
     backend: &str,
+    prompt_index: Option<usize>,
+    prompt: &str,
     threads: usize,
     max_new_tokens: usize,
     runs: usize,
@@ -551,6 +648,9 @@ fn average_gpt2_experiment_row(
     let decode_time = average_duration(stats.iter().map(|stats| stats.decode_time));
     let total_generation_time =
         average_duration(stats.iter().map(|stats| stats.total_generation_time));
+    let decode_summary = duration_distribution(stats.iter().map(|stats| stats.decode_time));
+    let total_summary =
+        duration_distribution(stats.iter().map(|stats| stats.total_generation_time));
     let first_token_times: Vec<Duration> = stats
         .iter()
         .filter_map(|stats| stats.first_token_time)
@@ -563,6 +663,8 @@ fn average_gpt2_experiment_row(
 
     Gpt2ExperimentRow {
         backend: backend.to_string(),
+        prompt_index,
+        prompt: prompt.to_string(),
         threads,
         max_new_tokens,
         runs,
@@ -574,19 +676,69 @@ fn average_gpt2_experiment_row(
         time_to_first_token_ms: first_token_time.map(duration_ms),
         decode_ms: duration_ms(decode_time),
         total_generation_ms: duration_ms(total_generation_time),
+        decode_ms_min: decode_summary.min,
+        decode_ms_median: decode_summary.median,
+        decode_ms_p95: decode_summary.p95,
+        decode_ms_max: decode_summary.max,
+        decode_ms_stddev: decode_summary.stddev,
+        total_generation_ms_min: total_summary.min,
+        total_generation_ms_median: total_summary.median,
+        total_generation_ms_p95: total_summary.p95,
+        total_generation_ms_max: total_summary.max,
+        total_generation_ms_stddev: total_summary.stddev,
         prefill_tokens_per_second: rate(prompt_tokens as f64, prefill_time),
         decode_tokens_per_second: rate(generated_tokens, decode_time),
         total_tokens_per_second: rate(
             prompt_tokens as f64 + generated_tokens,
             total_generation_time,
         ),
+        profile_tokenization_ms: duration_ms(average_duration(
+            stats
+                .iter()
+                .map(|stats| stats.operation_profile.tokenization),
+        )),
+        profile_layer_norm_ms: duration_ms(average_duration(
+            stats.iter().map(|stats| stats.operation_profile.layer_norm),
+        )),
+        profile_qkv_projection_ms: duration_ms(average_duration(
+            stats
+                .iter()
+                .map(|stats| stats.operation_profile.qkv_projection),
+        )),
+        profile_attention_ms: duration_ms(average_duration(
+            stats.iter().map(|stats| stats.operation_profile.attention),
+        )),
+        profile_attention_projection_ms: duration_ms(average_duration(
+            stats
+                .iter()
+                .map(|stats| stats.operation_profile.attention_projection),
+        )),
+        profile_mlp_fc_projection_ms: duration_ms(average_duration(
+            stats
+                .iter()
+                .map(|stats| stats.operation_profile.mlp_fc_projection),
+        )),
+        profile_mlp_projection_ms: duration_ms(average_duration(
+            stats
+                .iter()
+                .map(|stats| stats.operation_profile.mlp_projection),
+        )),
+        profile_final_logits_ms: duration_ms(average_duration(
+            stats
+                .iter()
+                .map(|stats| stats.operation_profile.final_logits),
+        )),
+        profile_decoding_ms: duration_ms(average_duration(
+            stats.iter().map(|stats| stats.operation_profile.decoding),
+        )),
     }
 }
 
 fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
     println!(
-        "{:<7} {:>7} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "{:<7} {:>6} {:>7} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
         "backend",
+        "prompt",
         "threads",
         "new_tok",
         "runs",
@@ -594,14 +746,21 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
         "gen",
         "load_ms",
         "prefill",
-        "decode",
+        "dec_avg",
+        "dec_p95",
+        "dec_sd",
         "tok/s",
         "total/s"
     );
     for row in rows {
+        let prompt_index = row
+            .prompt_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "all".to_string());
         println!(
-            "{:<7} {:>7} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
+            "{:<7} {:>6} {:>7} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
             row.backend,
+            prompt_index,
             row.threads,
             row.max_new_tokens,
             row.runs,
@@ -610,6 +769,8 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
             row.load_ms,
             row.prefill_ms,
             row.decode_ms,
+            row.decode_ms_p95,
+            row.decode_ms_stddev,
             row.decode_tokens_per_second,
             row.total_tokens_per_second
         );
@@ -618,16 +779,22 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
 
 fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
     println!(
-        "backend,threads,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second"
+        "backend,prompt_index,prompt,threads,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,decode_ms_min,decode_ms_median,decode_ms_p95,decode_ms_max,decode_ms_stddev,total_generation_ms_min,total_generation_ms_median,total_generation_ms_p95,total_generation_ms_max,total_generation_ms_stddev,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second,profile_tokenization_ms,profile_layer_norm_ms,profile_qkv_projection_ms,profile_attention_ms,profile_attention_projection_ms,profile_mlp_fc_projection_ms,profile_mlp_projection_ms,profile_final_logits_ms,profile_decoding_ms"
     );
     for row in rows {
         let first_token = row
             .time_to_first_token_ms
             .map(|time| format!("{time:.3}"))
             .unwrap_or_default();
+        let prompt_index = row
+            .prompt_index
+            .map(|index| index.to_string())
+            .unwrap_or_default();
         println!(
-            "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            "{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
             row.backend,
+            prompt_index,
+            csv_escape(&row.prompt),
             row.threads,
             row.max_new_tokens,
             row.runs,
@@ -639,10 +806,60 @@ fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
             first_token,
             row.decode_ms,
             row.total_generation_ms,
+            row.decode_ms_min,
+            row.decode_ms_median,
+            row.decode_ms_p95,
+            row.decode_ms_max,
+            row.decode_ms_stddev,
+            row.total_generation_ms_min,
+            row.total_generation_ms_median,
+            row.total_generation_ms_p95,
+            row.total_generation_ms_max,
+            row.total_generation_ms_stddev,
             row.prefill_tokens_per_second,
             row.decode_tokens_per_second,
-            row.total_tokens_per_second
+            row.total_tokens_per_second,
+            row.profile_tokenization_ms,
+            row.profile_layer_norm_ms,
+            row.profile_qkv_projection_ms,
+            row.profile_attention_ms,
+            row.profile_attention_projection_ms,
+            row.profile_mlp_fc_projection_ms,
+            row.profile_mlp_projection_ms,
+            row.profile_final_logits_ms,
+            row.profile_decoding_ms
         );
+    }
+}
+
+fn load_experiment_prompts(
+    prompt: Option<&str>,
+    prompt_file: Option<&PathBuf>,
+) -> Result<Vec<String>> {
+    if let Some(path) = prompt_file {
+        let text = fs::read_to_string(path)
+            .map_err(|err| format!("failed to read --prompt-file {}: {err}", path.display()))?;
+        let prompts: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        if prompts.is_empty() {
+            return Err(format!("--prompt-file {} contains no prompts", path.display()).into());
+        }
+        return Ok(prompts);
+    }
+
+    let prompt = prompt.ok_or("experiment gpt2 requires --prompt or --prompt-file")?;
+    Ok(vec![prompt.to_string()])
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
@@ -661,6 +878,53 @@ fn parse_usize_list(name: &str, values: &str) -> Result<Vec<usize>> {
         return Err(format!("--{name} values must be > 0").into());
     }
     Ok(parsed)
+}
+
+fn duration_distribution<I>(durations: I) -> DistributionSummary
+where
+    I: IntoIterator<Item = Duration>,
+{
+    let mut values: Vec<f64> = durations.into_iter().map(duration_ms).collect();
+    if values.is_empty() {
+        return DistributionSummary {
+            min: 0.0,
+            median: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            stddev: 0.0,
+        };
+    }
+    values.sort_by(f64::total_cmp);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    DistributionSummary {
+        min: values[0],
+        median: percentile(&values, 0.5),
+        p95: percentile(&values, 0.95),
+        max: values[values.len() - 1],
+        stddev: variance.sqrt(),
+    }
+}
+
+fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
+    if sorted_values.is_empty() {
+        return 0.0;
+    }
+    let rank = percentile.clamp(0.0, 1.0) * (sorted_values.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted_values[lower];
+    }
+    let weight = rank - lower as f64;
+    sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
 }
 
 fn average_duration<I>(durations: I) -> Duration

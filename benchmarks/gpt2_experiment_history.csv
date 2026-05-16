@@ -17,3 +17,5 @@ simd-dot-kernels,2026-05-16,"The future of small language models is",rust,2,4,2,
 simd-dot-kernels,2026-05-16,"The future of small language models is",rust,2,8,2,7,8.000,611.246,0.060,157.804,157.906,167.708,325.512,44.359,47.702,46.081
 simd-dot-kernels,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,578.204,0.041,91.460,91.558,44.146,135.606,76.537,90.608,81.117
 simd-dot-kernels,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,578.204,0.034,102.413,102.485,97.780,200.193,68.351,81.816,74.928
+experiment-stats-prompt-file-profile,2026-05-16,"<aggregate prompt-file>",rust,1,4,6,7,4.000,1360.400,0.065,192.452,192.556,124.690,317.142,36.373,32.079,34.685
+experiment-stats-prompt-file-profile,2026-05-16,"<aggregate prompt-file>",rust,2,4,6,7,4.000,641.359,0.050,135.058,135.167,64.127,199.185,51.830,62.376,55.225
