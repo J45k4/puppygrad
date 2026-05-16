@@ -29,8 +29,14 @@ impl Gpt2BackendConfig {
     pub fn describe(&self) -> String {
         match self {
             Gpt2BackendConfig::Rust(config) => format!(
-                "rust (threads={}, dense_threshold={})",
-                config.threads, config.dense_parallel_threshold
+                "rust (threads={}, dense_threshold={}, weights={})",
+                config.threads,
+                config.dense_parallel_threshold,
+                if config.quantized_weights {
+                    "int8"
+                } else {
+                    "f32"
+                }
             ),
         }
     }
@@ -46,6 +52,7 @@ pub struct Gpt2RustConfig {
     pub mlp_projection_chunk_size: usize,
     pub logits_chunk_size: usize,
     pub attention_head_parallel_threshold: usize,
+    pub quantized_weights: bool,
 }
 
 impl Default for Gpt2RustConfig {
@@ -59,6 +66,7 @@ impl Default for Gpt2RustConfig {
             mlp_projection_chunk_size: 64,
             logits_chunk_size: 256,
             attention_head_parallel_threshold: 4_096,
+            quantized_weights: false,
         }
     }
 }

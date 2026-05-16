@@ -113,10 +113,33 @@ pub struct Gpt2BlockWeights {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct Gpt2QuantizedWeights {
+    wte: QuantizedRows,
+    blocks: Vec<Gpt2QuantizedBlockWeights>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Gpt2QuantizedBlockWeights {
+    c_attn_w: QuantizedRows,
+    c_proj_w: QuantizedRows,
+    c_fc_w: QuantizedRows,
+    c_proj_mlp_w: QuantizedRows,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct QuantizedRows {
+    values: Vec<i8>,
+    scales: Vec<f32>,
+    rows: usize,
+    cols: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2Model {
     pub config: Gpt2Config,
     pub weights: Arc<Gpt2Weights>,
     pub rust_config: Gpt2RustConfig,
+    quantized_weights: Option<Arc<Gpt2QuantizedWeights>>,
     thread_pool: ThreadPool,
 }
 
@@ -695,11 +718,17 @@ impl Gpt2Model {
         rust_config.validate()?;
         validate_weights(&config, &weights)?;
         transpose_dense_weights(&config, &mut weights);
+        let quantized_weights = if rust_config.quantized_weights {
+            Some(Arc::new(quantize_weights(&config, &weights)))
+        } else {
+            None
+        };
         let thread_pool = ThreadPool::new(rust_config.threads);
         Ok(Self {
             config,
             weights: Arc::new(weights),
             rust_config,
+            quantized_weights,
             thread_pool,
         })
     }
@@ -748,6 +777,7 @@ impl Gpt2Model {
                 cfg.vocab_size,
                 c,
                 &self.weights,
+                self.quantized_weights.as_deref(),
                 pool,
                 &self.rust_config,
             ));
@@ -874,6 +904,7 @@ impl Gpt2Model {
             cfg.vocab_size,
             c,
             &self.weights,
+            self.quantized_weights.as_deref(),
             self.thread_pool(),
             &self.rust_config,
             &mut scratch.logits,
@@ -947,6 +978,7 @@ impl Gpt2Model {
             &norm,
             LinearShape::new(t, c, 3 * c),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::CAttn,
             self.thread_pool(),
@@ -964,6 +996,7 @@ impl Gpt2Model {
             &attn,
             LinearShape::new(t, c, c),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::AttnProj,
             self.thread_pool(),
@@ -987,6 +1020,7 @@ impl Gpt2Model {
             &norm,
             LinearShape::new(t, c, cfg.n_inner),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::MlpFc,
             self.thread_pool(),
@@ -997,6 +1031,7 @@ impl Gpt2Model {
             &mlp,
             LinearShape::new(t, cfg.n_inner, c),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::MlpProj,
             self.thread_pool(),
@@ -1037,6 +1072,7 @@ impl Gpt2Model {
             &scratch.norm,
             LinearShape::new(1, c, 3 * c),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::CAttn,
             self.thread_pool(),
@@ -1063,6 +1099,7 @@ impl Gpt2Model {
             &scratch.attn,
             LinearShape::new(1, c, c),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::AttnProj,
             self.thread_pool(),
@@ -1093,6 +1130,7 @@ impl Gpt2Model {
             &scratch.norm,
             LinearShape::new(1, c, cfg.n_inner),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::MlpFc,
             self.thread_pool(),
@@ -1107,6 +1145,7 @@ impl Gpt2Model {
             &scratch.mlp,
             LinearShape::new(1, cfg.n_inner, c),
             weights,
+            self.quantized_weights.as_deref(),
             layer,
             BlockLinear::MlpProj,
             self.thread_pool(),
@@ -1231,6 +1270,54 @@ fn transpose_in_out(weight: &[f32], in_features: usize, out_features: usize) -> 
     transposed
 }
 
+fn quantize_weights(config: &Gpt2Config, weights: &Gpt2Weights) -> Gpt2QuantizedWeights {
+    Gpt2QuantizedWeights {
+        wte: QuantizedRows::from_f32(&weights.wte, config.vocab_size, config.n_embd),
+        blocks: weights
+            .blocks
+            .iter()
+            .map(|block| Gpt2QuantizedBlockWeights {
+                c_attn_w: QuantizedRows::from_f32(
+                    &block.c_attn_w,
+                    3 * config.n_embd,
+                    config.n_embd,
+                ),
+                c_proj_w: QuantizedRows::from_f32(&block.c_proj_w, config.n_embd, config.n_embd),
+                c_fc_w: QuantizedRows::from_f32(&block.c_fc_w, config.n_inner, config.n_embd),
+                c_proj_mlp_w: QuantizedRows::from_f32(
+                    &block.c_proj_mlp_w,
+                    config.n_embd,
+                    config.n_inner,
+                ),
+            })
+            .collect(),
+    }
+}
+
+impl QuantizedRows {
+    fn from_f32(values: &[f32], rows: usize, cols: usize) -> Self {
+        debug_assert_eq!(values.len(), rows * cols);
+        let mut quantized = Vec::with_capacity(values.len());
+        let mut scales = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let src = row(values, r, cols);
+            let max_abs = src.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+            scales.push(scale);
+            for value in src {
+                let q = (value / scale).round().clamp(-127.0, 127.0) as i8;
+                quantized.push(q);
+            }
+        }
+        Self {
+            values: quantized,
+            scales,
+            rows,
+            cols,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockLinear {
     CAttn,
@@ -1291,17 +1378,44 @@ fn block_linear_slices(
     }
 }
 
+fn quantized_block_linear_slices<'a>(
+    quantized_weights: &'a Gpt2QuantizedWeights,
+    weights: &'a Gpt2Weights,
+    layer: usize,
+    which: BlockLinear,
+) -> (&'a QuantizedRows, &'a [f32]) {
+    let block = &quantized_weights.blocks[layer];
+    let f32_block = &weights.blocks[layer];
+    match which {
+        BlockLinear::CAttn => (&block.c_attn_w, &f32_block.c_attn_b),
+        BlockLinear::AttnProj => (&block.c_proj_w, &f32_block.c_proj_b),
+        BlockLinear::MlpFc => (&block.c_fc_w, &f32_block.c_fc_b),
+        BlockLinear::MlpProj => (&block.c_proj_mlp_w, &f32_block.c_proj_mlp_b),
+    }
+}
+
 fn linear_block(
     x: &[f32],
     shape: LinearShape,
     weights: &Gpt2Weights,
+    quantized_weights: Option<&Gpt2QuantizedWeights>,
     layer: usize,
     which: BlockLinear,
     pool: &ThreadPool,
     rust_config: &Gpt2RustConfig,
 ) -> Vec<f32> {
     let mut out = Vec::new();
-    linear_block_into(x, shape, weights, layer, which, pool, rust_config, &mut out);
+    linear_block_into(
+        x,
+        shape,
+        weights,
+        quantized_weights,
+        layer,
+        which,
+        pool,
+        rust_config,
+        &mut out,
+    );
     out
 }
 
@@ -1309,12 +1423,20 @@ fn linear_block_into(
     x: &[f32],
     shape: LinearShape,
     weights: &Gpt2Weights,
+    quantized_weights: Option<&Gpt2QuantizedWeights>,
     layer: usize,
     which: BlockLinear,
     pool: &ThreadPool,
     rust_config: &Gpt2RustConfig,
     out: &mut Vec<f32>,
 ) {
+    if let Some(quantized_weights) = quantized_weights {
+        let (weight, bias) =
+            quantized_block_linear_slices(quantized_weights, weights, layer, which);
+        quantized_linear_into(x, shape, weight, bias, pool, rust_config, which, out);
+        return;
+    }
+
     let (weight, bias) = block_linear_slices(weights, layer, which);
     if pool.threads() == 1 || shape.work_items() < rust_config.dense_parallel_threshold {
         linear_into(
@@ -1370,6 +1492,53 @@ fn linear_into(
             let weight_row = row(weight, o, in_features);
             dst[o] = bias[o] + dot(src, weight_row);
         }
+    }
+}
+
+fn quantized_linear_into(
+    x: &[f32],
+    shape: LinearShape,
+    weight: &QuantizedRows,
+    bias: &[f32],
+    pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
+    which: BlockLinear,
+    out: &mut Vec<f32>,
+) {
+    debug_assert_eq!(weight.rows, shape.out_features);
+    debug_assert_eq!(weight.cols, shape.in_features);
+    if pool.threads() == 1 || shape.work_items() < rust_config.dense_parallel_threshold {
+        out.clear();
+        out.resize(shape.out_len(), 0.0);
+        for r in 0..shape.rows {
+            let src = row(x, r, shape.in_features);
+            let dst = row_mut(out, r, shape.out_features);
+            for o in 0..shape.out_features {
+                dst[o] = bias[o] + quantized_dot(src, weight, o);
+            }
+        }
+        return;
+    }
+
+    let chunks = pool.scoped_parallel_chunks(
+        shape.out_len(),
+        which.chunk_size(rust_config),
+        |start, end| {
+            let mut values = Vec::with_capacity(end - start);
+            for index in start..end {
+                let r = index / shape.out_features;
+                let o = index % shape.out_features;
+                let src = row(&x, r, shape.in_features);
+                values.push(bias[o] + quantized_dot(src, weight, o));
+            }
+            values
+        },
+    );
+
+    out.clear();
+    out.reserve(shape.out_len());
+    for mut chunk in chunks {
+        out.append(&mut chunk);
     }
 }
 
@@ -1540,6 +1709,7 @@ fn logits_from_hidden(
     vocab_size: usize,
     n_embd: usize,
     weights: &Gpt2Weights,
+    quantized_weights: Option<&Gpt2QuantizedWeights>,
     pool: &ThreadPool,
     rust_config: &Gpt2RustConfig,
 ) -> Vec<f32> {
@@ -1549,6 +1719,7 @@ fn logits_from_hidden(
         vocab_size,
         n_embd,
         weights,
+        quantized_weights,
         pool,
         rust_config,
         &mut logits,
@@ -1561,10 +1732,24 @@ fn logits_from_hidden_into(
     vocab_size: usize,
     n_embd: usize,
     weights: &Gpt2Weights,
+    quantized_weights: Option<&Gpt2QuantizedWeights>,
     pool: &ThreadPool,
     rust_config: &Gpt2RustConfig,
     logits: &mut Vec<f32>,
 ) {
+    if let Some(quantized_weights) = quantized_weights {
+        quantized_logits_from_hidden_into(
+            hidden,
+            vocab_size,
+            n_embd,
+            &quantized_weights.wte,
+            pool,
+            rust_config,
+            logits,
+        );
+        return;
+    }
+
     if pool.threads() == 1 {
         logits.clear();
         logits.resize(vocab_size, 0.0);
@@ -1579,6 +1764,42 @@ fn logits_from_hidden_into(
             let mut values = Vec::with_capacity(end - start);
             for token in start..end {
                 values.push(dot(&hidden, row(&weights.wte, token, n_embd)));
+            }
+            values
+        });
+
+    logits.clear();
+    logits.reserve(vocab_size);
+    for mut chunk in chunks {
+        logits.append(&mut chunk);
+    }
+}
+
+fn quantized_logits_from_hidden_into(
+    hidden: &[f32],
+    vocab_size: usize,
+    n_embd: usize,
+    weight: &QuantizedRows,
+    pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
+    logits: &mut Vec<f32>,
+) {
+    debug_assert_eq!(weight.rows, vocab_size);
+    debug_assert_eq!(weight.cols, n_embd);
+    if pool.threads() == 1 {
+        logits.clear();
+        logits.resize(vocab_size, 0.0);
+        for (token, logit) in logits.iter_mut().enumerate() {
+            *logit = quantized_dot(hidden, weight, token);
+        }
+        return;
+    }
+
+    let chunks =
+        pool.scoped_parallel_chunks(vocab_size, rust_config.logits_chunk_size, |start, end| {
+            let mut values = Vec::with_capacity(end - start);
+            for token in start..end {
+                values.push(quantized_dot(hidden, weight, token));
             }
             values
         });
@@ -1648,6 +1869,19 @@ fn add_in_place(dst: &mut [f32], src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d += s;
     }
+}
+
+fn quantized_dot(a: &[f32], rows: &QuantizedRows, row_index: usize) -> f32 {
+    debug_assert_eq!(a.len(), rows.cols);
+    debug_assert!(row_index < rows.rows);
+    let start = row_index * rows.cols;
+    let values = &rows.values[start..start + rows.cols];
+    let scale = rows.scales[row_index];
+    let mut sum = 0.0f32;
+    for (x, q) in a.iter().zip(values.iter()) {
+        sum += *x * (*q as f32 * scale);
+    }
+    sum
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -1884,6 +2118,25 @@ mod tests {
         let threaded_tokens = threaded.generate_greedy_cached(&[0, 1], 3)?;
 
         assert_eq!(threaded_tokens, single_tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn quantized_rust_forward_returns_finite_logits() -> Result<()> {
+        let cfg = tiny_config();
+        let model = Gpt2Model::new_with_rust_config(
+            cfg.clone(),
+            tiny_weights(&cfg),
+            Gpt2RustConfig {
+                quantized_weights: true,
+                ..Gpt2RustConfig::default()
+            },
+        )?;
+
+        let out = model.forward(&[1, 2, 3])?;
+
+        assert_eq!(out.logits.len(), 3 * cfg.vocab_size);
+        assert!(out.logits.iter().all(|value| value.is_finite()));
         Ok(())
     }
 

@@ -23,3 +23,5 @@ tunable-thresholds-chunks,2026-05-16,"The future of small language models is den
 tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=262144",rust,2,4,2,7,4.000,707.637,0.039,143.148,143.237,59.098,202.246,48.900,67.684,54.389
 tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=65536",rust,4,4,2,7,4.000,671.245,0.040,114.376,114.448,54.516,168.892,61.202,73.372,65.130
 tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=262144",rust,4,4,2,7,4.000,670.639,0.154,117.807,117.878,46.105,163.912,59.419,86.758,67.109
+quantized-int8-experiment-f32,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,1150.976,0.042,124.864,124.982,67.013,191.877,56.061,59.690,57.328
+quantized-int8-experiment-int8,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,873.084,0.043,308.665,308.759,138.166,446.831,22.678,28.951,24.618

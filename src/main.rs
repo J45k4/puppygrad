@@ -83,6 +83,10 @@ enum Command {
         #[arg(long)]
         attention_head_parallel_threshold: Option<usize>,
 
+        /// Use experimental row-wise int8 dense/logit weights.
+        #[arg(long)]
+        quantized_weights: bool,
+
         /// Print generation timing and token throughput to stderr.
         #[arg(long)]
         stats: bool,
@@ -232,6 +236,10 @@ enum ExperimentCommand {
         #[arg(long)]
         attention_head_parallel_threshold: Option<usize>,
 
+        /// Use experimental row-wise int8 dense/logit weights.
+        #[arg(long)]
+        quantized_weights: bool,
+
         /// Comma-separated max-new-token counts, for example 8,16,32.
         #[arg(long, default_value = "32")]
         max_new_tokens: String,
@@ -269,6 +277,7 @@ fn main() -> Result<()> {
             mlp_projection_chunk_size,
             logits_chunk_size,
             attention_head_parallel_threshold,
+            quantized_weights,
             stats,
         } => run_gpt2(RunGpt2Args {
             model_dir,
@@ -287,6 +296,7 @@ fn main() -> Result<()> {
                 mlp_projection_chunk_size,
                 logits_chunk_size,
                 attention_head_parallel_threshold,
+                quantized_weights,
             },
             stats,
         }),
@@ -337,6 +347,7 @@ fn main() -> Result<()> {
                 mlp_projection_chunk_size,
                 logits_chunk_size,
                 attention_head_parallel_threshold,
+                quantized_weights,
                 max_new_tokens,
                 runs,
                 warmup_runs,
@@ -358,6 +369,7 @@ fn main() -> Result<()> {
                     mlp_projection_chunk_size,
                     logits_chunk_size,
                     attention_head_parallel_threshold,
+                    quantized_weights,
                 },
                 max_new_tokens,
                 runs,
@@ -408,6 +420,7 @@ struct RustTuning {
     mlp_projection_chunk_size: Option<usize>,
     logits_chunk_size: Option<usize>,
     attention_head_parallel_threshold: Option<usize>,
+    quantized_weights: bool,
 }
 
 struct RunGpt2ExperimentArgs {
@@ -518,6 +531,7 @@ fn rust_config(
         attention_head_parallel_threshold: tuning
             .attention_head_parallel_threshold
             .unwrap_or(defaults.attention_head_parallel_threshold),
+        quantized_weights: tuning.quantized_weights,
     };
     config.validate()?;
     Ok(config)
@@ -630,6 +644,7 @@ struct Gpt2ExperimentRow {
     mlp_projection_chunk_size: usize,
     logits_chunk_size: usize,
     attention_head_parallel_threshold: usize,
+    quantized_weights: bool,
     max_new_tokens: usize,
     runs: usize,
     prompt_tokens: usize,
@@ -824,6 +839,7 @@ fn average_gpt2_experiment_row(
         mlp_projection_chunk_size: rust_config.mlp_projection_chunk_size,
         logits_chunk_size: rust_config.logits_chunk_size,
         attention_head_parallel_threshold: rust_config.attention_head_parallel_threshold,
+        quantized_weights: rust_config.quantized_weights,
         max_new_tokens,
         runs,
         prompt_tokens,
@@ -894,11 +910,12 @@ fn average_gpt2_experiment_row(
 
 fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
     println!(
-        "{:<7} {:>6} {:>7} {:>9} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "{:<7} {:>6} {:>7} {:>9} {:>7} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
         "backend",
         "prompt",
         "threads",
         "dense_th",
+        "weights",
         "new_tok",
         "runs",
         "prompt",
@@ -917,11 +934,12 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
             .map(|index| index.to_string())
             .unwrap_or_else(|| "all".to_string());
         println!(
-            "{:<7} {:>6} {:>7} {:>9} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
+            "{:<7} {:>6} {:>7} {:>9} {:>7} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
             row.backend,
             prompt_index,
             row.threads,
             row.dense_parallel_threshold,
+            if row.quantized_weights { "int8" } else { "f32" },
             row.max_new_tokens,
             row.runs,
             row.prompt_tokens,
@@ -939,7 +957,7 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
 
 fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
     println!(
-        "backend,prompt_index,prompt,threads,dense_parallel_threshold,qkv_chunk_size,attention_projection_chunk_size,mlp_fc_chunk_size,mlp_projection_chunk_size,logits_chunk_size,attention_head_parallel_threshold,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,decode_ms_min,decode_ms_median,decode_ms_p95,decode_ms_max,decode_ms_stddev,total_generation_ms_min,total_generation_ms_median,total_generation_ms_p95,total_generation_ms_max,total_generation_ms_stddev,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second,profile_tokenization_ms,profile_layer_norm_ms,profile_qkv_projection_ms,profile_attention_ms,profile_attention_projection_ms,profile_mlp_fc_projection_ms,profile_mlp_projection_ms,profile_final_logits_ms,profile_decoding_ms"
+        "backend,prompt_index,prompt,threads,dense_parallel_threshold,qkv_chunk_size,attention_projection_chunk_size,mlp_fc_chunk_size,mlp_projection_chunk_size,logits_chunk_size,attention_head_parallel_threshold,quantized_weights,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,decode_ms_min,decode_ms_median,decode_ms_p95,decode_ms_max,decode_ms_stddev,total_generation_ms_min,total_generation_ms_median,total_generation_ms_p95,total_generation_ms_max,total_generation_ms_stddev,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second,profile_tokenization_ms,profile_layer_norm_ms,profile_qkv_projection_ms,profile_attention_ms,profile_attention_projection_ms,profile_mlp_fc_projection_ms,profile_mlp_projection_ms,profile_final_logits_ms,profile_decoding_ms"
     );
     for row in rows {
         let first_token = row
@@ -951,7 +969,7 @@ fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
             .map(|index| index.to_string())
             .unwrap_or_default();
         println!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
             row.backend,
             prompt_index,
             csv_escape(&row.prompt),
@@ -963,6 +981,7 @@ fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
             row.mlp_projection_chunk_size,
             row.logits_chunk_size,
             row.attention_head_parallel_threshold,
+            row.quantized_weights,
             row.max_new_tokens,
             row.runs,
             row.prompt_tokens,
