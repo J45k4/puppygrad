@@ -61,6 +61,8 @@ Use a different GPT-2-family checkpoint by giving both a model id and local dire
 
 The GPT-2 runtime is intentionally simple: CPU `f32`, greedy token selection, no sampling yet, and no GPU kernels yet. The only backend today is `rust`; `--threads` controls puppygrad's own thread pool, currently used by the final vocab logits projection. GPT-2 runs print generated-token throughput to stderr after generation.
 
+When `models/gpt2/puppygrad-tune.json` exists, the `gpt2` command loads it automatically. Explicit CLI flags override the saved config. Use `--no-tuning` to ignore the saved file, or `--tuning-file path/to/tune.json` to load a different file.
+
 Pass `--stats` to print the full performance breakdown to stderr while streamed text stays on stdout. The current GPT-2 stats include model load time, tokenization time, prefill time, time to first token, decode time, average decode-token latency, and token/sec rates for prefill, decode, and total model tokens.
 
 ### Run GPT-2 experiments
@@ -77,6 +79,24 @@ Sweep backend settings and print averaged performance rows:
 ```
 
 Use `--format csv` or `--format json` when you want to plot results or compare runs outside the terminal.
+
+### Autotune GPT-2 settings
+
+Search candidate backend settings and print the fastest measured config:
+
+```bash
+./target/release/puppygrad autotune gpt2 \
+  --threads 1,2,4,8,12,16,24,32 \
+  --max-new-tokens 16 \
+  --runs 2 \
+  --warmup-runs 1 \
+  --max-trials 48 \
+  --prompt "The future of GPU compilers is"
+```
+
+The autotuner is generic internally: a target provides candidate configs, a trial runner, and a score. GPT-2 currently scores candidates by generated-token decode throughput.
+
+By default, GPT-2 autotune saves the best config to `models/gpt2/puppygrad-tune.json`. Pass `--save-tuning path/to/file.json` to choose another location.
 
 ## Qwen Runtime Placeholder
 

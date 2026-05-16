@@ -1394,6 +1394,7 @@ fn quantized_block_linear_slices<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn linear_block(
     x: &[f32],
     shape: LinearShape,
@@ -1419,6 +1420,7 @@ fn linear_block(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn linear_block_into(
     x: &[f32],
     shape: LinearShape,
@@ -1459,7 +1461,7 @@ fn linear_block_into(
             for index in start..end {
                 let r = index / shape.out_features;
                 let o = index % shape.out_features;
-                let src = row(&x, r, shape.in_features);
+                let src = row(x, r, shape.in_features);
                 let weight_row = row(weight, o, shape.in_features);
                 values.push(bias[o] + dot(src, weight_row));
             }
@@ -1495,6 +1497,7 @@ fn linear_into(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn quantized_linear_into(
     x: &[f32],
     shape: LinearShape,
@@ -1528,7 +1531,7 @@ fn quantized_linear_into(
             for index in start..end {
                 let r = index / shape.out_features;
                 let o = index % shape.out_features;
-                let src = row(&x, r, shape.in_features);
+                let src = row(x, r, shape.in_features);
                 values.push(bias[o] + quantized_dot(src, weight, o));
             }
             values
@@ -1623,6 +1626,7 @@ fn causal_self_attention(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cached_self_attention_into(
     qkv: &[f32],
     pos: usize,
@@ -1665,9 +1669,9 @@ fn cached_self_attention_into(
                 softmax_in_place(&mut scores);
 
                 for (k_pos, prob) in scores.iter().copied().enumerate() {
-                    for d in 0..head_dim {
+                    for (d, head_value) in head_out.iter_mut().enumerate().take(head_dim) {
                         let v = cache.values[kv_index(k_pos, h, d, cache.max_seq_len, head_dim)];
-                        head_out[d] += prob * v;
+                        *head_value += prob * v;
                     }
                 }
                 head_outputs.push((h, head_out));
@@ -1727,6 +1731,7 @@ fn logits_from_hidden(
     logits
 }
 
+#[allow(clippy::too_many_arguments)]
 fn logits_from_hidden_into(
     hidden: &[f32],
     vocab_size: usize,
@@ -1763,7 +1768,7 @@ fn logits_from_hidden_into(
         pool.scoped_parallel_chunks(vocab_size, rust_config.logits_chunk_size, |start, end| {
             let mut values = Vec::with_capacity(end - start);
             for token in start..end {
-                values.push(dot(&hidden, row(&weights.wte, token, n_embd)));
+                values.push(dot(hidden, row(&weights.wte, token, n_embd)));
             }
             values
         });
@@ -1929,7 +1934,7 @@ unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(all(target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::{
         _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
@@ -1954,7 +1959,7 @@ unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(all(target_arch = "x86"))]
+#[cfg(target_arch = "x86")]
 unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86::{
         _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,

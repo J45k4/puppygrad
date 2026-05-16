@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use super::{Gpt2Error, Result};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +44,7 @@ impl Gpt2BackendConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gpt2RustConfig {
     pub threads: usize,
     pub dense_parallel_threshold: usize,

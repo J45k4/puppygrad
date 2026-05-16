@@ -1,10 +1,11 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use puppygrad::engine::Tensor;
+use puppygrad::models::autotune::{autotune, AutoTuneOptions, AutoTuneTarget};
 use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -52,8 +53,16 @@ enum Command {
         backend: Gpt2BackendArg,
 
         /// Number of worker threads for CPU-style backends.
-        #[arg(long, default_value_t = 1)]
-        threads: usize,
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// Load tuning config from this JSON file.
+        #[arg(long)]
+        tuning_file: Option<PathBuf>,
+
+        /// Do not auto-load model-dir/puppygrad-tune.json.
+        #[arg(long)]
+        no_tuning: bool,
 
         /// Minimum dense multiply-add work items before parallel execution.
         #[arg(long)]
@@ -157,6 +166,12 @@ enum Command {
         cmd: ExperimentCommand,
     },
 
+    /// Search runtime settings and report the fastest candidate.
+    Autotune {
+        #[command(subcommand)]
+        cmd: AutoTuneCommand,
+    },
+
     /// Train y = 2x + 3 with scalar parameters using the in-house autograd engine.
     DemoLinear {
         /// Number of SGD steps.
@@ -258,6 +273,96 @@ enum ExperimentCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AutoTuneCommand {
+    /// Autotune GPT-2 Rust backend settings.
+    Gpt2 {
+        /// Local directory containing config.json, tokenizer.json, and model.safetensors.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long, default_value = "gpt2")]
+        model_id: String,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Prompt text. Ignored when --prompt-file is set.
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Text file with one tuning prompt per non-empty line.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+
+        /// Comma-separated worker-thread candidates.
+        #[arg(long, default_value = "1,2,4,8,12,16,24,32")]
+        threads: String,
+
+        /// Comma-separated dense parallel threshold candidates.
+        #[arg(long, default_value = "65536,131072,262144,524288")]
+        dense_parallel_thresholds: String,
+
+        /// Comma-separated QKV chunk-size candidates.
+        #[arg(long, default_value = "32,48,64")]
+        qkv_chunk_sizes: String,
+
+        /// Comma-separated attention projection chunk-size candidates.
+        #[arg(long, default_value = "48,64,96")]
+        attention_projection_chunk_sizes: String,
+
+        /// Comma-separated MLP expansion chunk-size candidates.
+        #[arg(long, default_value = "64,128,192")]
+        mlp_fc_chunk_sizes: String,
+
+        /// Comma-separated MLP projection chunk-size candidates.
+        #[arg(long, default_value = "48,64,96")]
+        mlp_projection_chunk_sizes: String,
+
+        /// Comma-separated final logits chunk-size candidates.
+        #[arg(long, default_value = "128,256,512")]
+        logits_chunk_sizes: String,
+
+        /// Comma-separated attention head parallel threshold candidates.
+        #[arg(long, default_value = "1024,4096,16384")]
+        attention_head_parallel_thresholds: String,
+
+        /// Also try experimental row-wise int8 weights.
+        #[arg(long)]
+        include_quantized: bool,
+
+        /// New tokens per tuning trial.
+        #[arg(long, default_value_t = 16)]
+        max_new_tokens: usize,
+
+        /// Measured runs per candidate.
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+
+        /// Warmup runs per candidate.
+        #[arg(long, default_value_t = 2)]
+        warmup_runs: usize,
+
+        /// Extra measured runs for the selected best config before saving.
+        #[arg(long, default_value_t = 7)]
+        validation_runs: usize,
+
+        /// Stop after this many candidate configs.
+        #[arg(long, default_value_t = 48)]
+        max_trials: usize,
+
+        /// Save the best tuning config to this JSON path.
+        #[arg(long)]
+        save_tuning: Option<PathBuf>,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -270,6 +375,8 @@ fn main() -> Result<()> {
             max_new_tokens,
             backend,
             threads,
+            tuning_file,
+            no_tuning,
             dense_parallel_threshold,
             qkv_chunk_size,
             attention_projection_chunk_size,
@@ -288,6 +395,8 @@ fn main() -> Result<()> {
             max_new_tokens,
             backend,
             threads,
+            tuning_file,
+            no_tuning,
             tuning: RustTuning {
                 dense_parallel_threshold,
                 qkv_chunk_size,
@@ -296,7 +405,7 @@ fn main() -> Result<()> {
                 mlp_projection_chunk_size,
                 logits_chunk_size,
                 attention_head_parallel_threshold,
-                quantized_weights,
+                quantized_weights: quantized_weights.then_some(true),
             },
             stats,
         }),
@@ -369,12 +478,59 @@ fn main() -> Result<()> {
                     mlp_projection_chunk_size,
                     logits_chunk_size,
                     attention_head_parallel_threshold,
-                    quantized_weights,
+                    quantized_weights: Some(quantized_weights),
                 },
                 max_new_tokens,
                 runs,
                 warmup_runs,
                 format,
+            }),
+        },
+        Command::Autotune { cmd } => match cmd {
+            AutoTuneCommand::Gpt2 {
+                model_dir,
+                model_id,
+                revision,
+                download,
+                prompt,
+                prompt_file,
+                threads,
+                dense_parallel_thresholds,
+                qkv_chunk_sizes,
+                attention_projection_chunk_sizes,
+                mlp_fc_chunk_sizes,
+                mlp_projection_chunk_sizes,
+                logits_chunk_sizes,
+                attention_head_parallel_thresholds,
+                include_quantized,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                validation_runs,
+                max_trials,
+                save_tuning,
+            } => run_gpt2_autotune(RunGpt2AutoTuneArgs {
+                model_dir,
+                model_id,
+                revision,
+                download,
+                prompt,
+                prompt_file,
+                threads,
+                dense_parallel_thresholds,
+                qkv_chunk_sizes,
+                attention_projection_chunk_sizes,
+                mlp_fc_chunk_sizes,
+                mlp_projection_chunk_sizes,
+                logits_chunk_sizes,
+                attention_head_parallel_thresholds,
+                include_quantized,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                validation_runs,
+                max_trials,
+                save_tuning,
             }),
         },
         Command::DemoLinear {
@@ -406,7 +562,9 @@ struct RunGpt2Args {
     prompt: String,
     max_new_tokens: usize,
     backend: Gpt2BackendArg,
-    threads: usize,
+    threads: Option<usize>,
+    tuning_file: Option<PathBuf>,
+    no_tuning: bool,
     tuning: RustTuning,
     stats: bool,
 }
@@ -420,7 +578,7 @@ struct RustTuning {
     mlp_projection_chunk_size: Option<usize>,
     logits_chunk_size: Option<usize>,
     attention_head_parallel_threshold: Option<usize>,
-    quantized_weights: bool,
+    quantized_weights: Option<bool>,
 }
 
 struct RunGpt2ExperimentArgs {
@@ -437,6 +595,30 @@ struct RunGpt2ExperimentArgs {
     runs: usize,
     warmup_runs: usize,
     format: ExperimentFormatArg,
+}
+
+struct RunGpt2AutoTuneArgs {
+    model_dir: Option<PathBuf>,
+    model_id: String,
+    revision: String,
+    download: bool,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    threads: String,
+    dense_parallel_thresholds: String,
+    qkv_chunk_sizes: String,
+    attention_projection_chunk_sizes: String,
+    mlp_fc_chunk_sizes: String,
+    mlp_projection_chunk_sizes: String,
+    logits_chunk_sizes: String,
+    attention_head_parallel_thresholds: String,
+    include_quantized: bool,
+    max_new_tokens: usize,
+    runs: usize,
+    warmup_runs: usize,
+    validation_runs: usize,
+    max_trials: usize,
+    save_tuning: Option<PathBuf>,
 }
 
 struct RunQwenArgs {
@@ -459,10 +641,6 @@ struct RunQwenArgs {
 fn run_gpt2(args: RunGpt2Args) -> Result<()> {
     let generation = Gpt2GenerationConfig::new(args.max_new_tokens);
     generation.validate()?;
-    let backend = match args.backend {
-        Gpt2BackendArg::Rust => Gpt2BackendConfig::Rust(rust_config(args.threads, args.tuning)?),
-    };
-
     let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
     if args.download {
         let download_start = Instant::now();
@@ -482,6 +660,17 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
             );
         }
     }
+
+    let tuning_base = if args.no_tuning {
+        Gpt2RustConfig::default()
+    } else {
+        load_gpt2_tuning(args.tuning_file.as_ref(), &model_dir)?.unwrap_or_default()
+    };
+    let backend = match args.backend {
+        Gpt2BackendArg::Rust => {
+            Gpt2BackendConfig::Rust(rust_config_from(tuning_base, args.threads, args.tuning)?)
+        }
+    };
 
     eprintln!("backend: {}", backend.describe());
     eprintln!("loading GPT-2 from {}", model_dir.display());
@@ -509,32 +698,458 @@ fn rust_config(
     threads: usize,
     tuning: RustTuning,
 ) -> puppygrad::models::gpt2::Result<Gpt2RustConfig> {
-    let defaults = Gpt2RustConfig::default();
+    rust_config_from(Gpt2RustConfig::default(), Some(threads), tuning)
+}
+
+fn rust_config_from(
+    base: Gpt2RustConfig,
+    threads: Option<usize>,
+    tuning: RustTuning,
+) -> puppygrad::models::gpt2::Result<Gpt2RustConfig> {
     let config = Gpt2RustConfig {
-        threads,
+        threads: threads.unwrap_or(base.threads),
         dense_parallel_threshold: tuning
             .dense_parallel_threshold
-            .unwrap_or(defaults.dense_parallel_threshold),
-        qkv_chunk_size: tuning.qkv_chunk_size.unwrap_or(defaults.qkv_chunk_size),
+            .unwrap_or(base.dense_parallel_threshold),
+        qkv_chunk_size: tuning.qkv_chunk_size.unwrap_or(base.qkv_chunk_size),
         attention_projection_chunk_size: tuning
             .attention_projection_chunk_size
-            .unwrap_or(defaults.attention_projection_chunk_size),
-        mlp_fc_chunk_size: tuning
-            .mlp_fc_chunk_size
-            .unwrap_or(defaults.mlp_fc_chunk_size),
+            .unwrap_or(base.attention_projection_chunk_size),
+        mlp_fc_chunk_size: tuning.mlp_fc_chunk_size.unwrap_or(base.mlp_fc_chunk_size),
         mlp_projection_chunk_size: tuning
             .mlp_projection_chunk_size
-            .unwrap_or(defaults.mlp_projection_chunk_size),
-        logits_chunk_size: tuning
-            .logits_chunk_size
-            .unwrap_or(defaults.logits_chunk_size),
+            .unwrap_or(base.mlp_projection_chunk_size),
+        logits_chunk_size: tuning.logits_chunk_size.unwrap_or(base.logits_chunk_size),
         attention_head_parallel_threshold: tuning
             .attention_head_parallel_threshold
-            .unwrap_or(defaults.attention_head_parallel_threshold),
-        quantized_weights: tuning.quantized_weights,
+            .unwrap_or(base.attention_head_parallel_threshold),
+        quantized_weights: tuning.quantized_weights.unwrap_or(base.quantized_weights),
     };
     config.validate()?;
     Ok(config)
+}
+
+fn load_gpt2_tuning(
+    tuning_file: Option<&PathBuf>,
+    model_dir: &std::path::Path,
+) -> Result<Option<Gpt2RustConfig>> {
+    let path = tuning_file
+        .cloned()
+        .unwrap_or_else(|| model_dir.join("puppygrad-tune.json"));
+    if !path.exists() {
+        if tuning_file.is_some() {
+            return Err(format!("tuning file {} does not exist", path.display()).into());
+        }
+        return Ok(None);
+    }
+
+    let text = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read tuning file {}: {err}", path.display()))?;
+    let tuning: SavedGpt2Tuning = serde_json::from_str(&text)
+        .map_err(|err| format!("failed to parse tuning file {}: {err}", path.display()))?;
+    tuning.rust.validate()?;
+    eprintln!("loaded tuning config from {}", path.display());
+    Ok(Some(tuning.rust))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Gpt2AutoTuneConfig {
+    rust: Gpt2RustConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Gpt2AutoTuneMeasurement {
+    load_ms: f64,
+    prompt_count: usize,
+    runs_per_prompt: usize,
+    generated_tokens: usize,
+    decode_tokens_per_second: f64,
+    decode_tokens_per_second_p25: f64,
+    decode_tokens_per_second_median: f64,
+    decode_tokens_per_second_p95: f64,
+    decode_tokens_per_second_stddev: f64,
+    total_tokens_per_second: f64,
+    total_tokens_per_second_median: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    total_generation_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedGpt2Tuning {
+    model: String,
+    backend: String,
+    score_name: String,
+    score: f64,
+    search_score: f64,
+    max_new_tokens: usize,
+    warmup_runs: usize,
+    measured_runs: usize,
+    prompt_count: usize,
+    rust: Gpt2RustConfig,
+    measurement: Gpt2AutoTuneMeasurement,
+}
+
+struct Gpt2AutoTuneTarget {
+    model_dir: PathBuf,
+    prompts: Vec<String>,
+    max_new_tokens: usize,
+    candidates: Vec<Gpt2AutoTuneConfig>,
+}
+
+impl AutoTuneTarget for Gpt2AutoTuneTarget {
+    type Config = Gpt2AutoTuneConfig;
+    type Measurement = Gpt2AutoTuneMeasurement;
+    type Error = Box<dyn std::error::Error>;
+
+    fn candidate_configs(&self) -> Vec<Self::Config> {
+        self.candidates.clone()
+    }
+
+    fn evaluate_config(
+        &mut self,
+        config: &Self::Config,
+        options: &AutoTuneOptions,
+    ) -> std::result::Result<Self::Measurement, Self::Error> {
+        eprintln!(
+            "autotune trial: threads={} dense_threshold={} chunks=({},{},{},{},{}) attn_threshold={} weights={}",
+            config.rust.threads,
+            config.rust.dense_parallel_threshold,
+            config.rust.qkv_chunk_size,
+            config.rust.attention_projection_chunk_size,
+            config.rust.mlp_fc_chunk_size,
+            config.rust.mlp_projection_chunk_size,
+            config.rust.logits_chunk_size,
+            config.rust.attention_head_parallel_threshold,
+            if config.rust.quantized_weights { "int8" } else { "f32" }
+        );
+        let backend = Gpt2BackendConfig::Rust(config.rust.clone());
+        let load_start = Instant::now();
+        let runtime = Gpt2Runtime::from_dir_with_backend(&self.model_dir, backend)?;
+        let load_time = load_start.elapsed();
+
+        let generation = Gpt2GenerationConfig::new(self.max_new_tokens);
+        generation.validate()?;
+
+        let mut stats = Vec::with_capacity(options.measured_runs * self.prompts.len());
+        for prompt in &self.prompts {
+            for _ in 0..options.warmup_runs {
+                let _ = runtime.stream_greedy_text_with_stats(
+                    prompt,
+                    generation.max_new_tokens,
+                    |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                )?;
+            }
+            for _ in 0..options.measured_runs {
+                let (_, run_stats) = runtime.stream_greedy_text_with_stats(
+                    prompt,
+                    generation.max_new_tokens,
+                    |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                )?;
+                stats.push(run_stats);
+            }
+        }
+
+        let generated_tokens = stats
+            .iter()
+            .map(|stats| stats.generated_tokens)
+            .sum::<usize>();
+        let prompt_tokens = stats.iter().map(|stats| stats.prompt_tokens).sum::<usize>();
+        let prefill_time = sum_duration(stats.iter().map(|stats| stats.prefill_time));
+        let decode_time = sum_duration(stats.iter().map(|stats| stats.decode_time));
+        let total_generation_time =
+            sum_duration(stats.iter().map(|stats| stats.total_generation_time));
+        let decode_tps_summary = value_distribution(
+            stats
+                .iter()
+                .map(|stats| rate(stats.generated_tokens as f64, stats.decode_time)),
+        );
+        let total_tps_summary = value_distribution(stats.iter().map(|stats| {
+            rate(
+                (stats.prompt_tokens + stats.generated_tokens) as f64,
+                stats.total_generation_time,
+            )
+        }));
+
+        Ok(Gpt2AutoTuneMeasurement {
+            load_ms: duration_ms(load_time),
+            prompt_count: self.prompts.len(),
+            runs_per_prompt: options.measured_runs,
+            generated_tokens,
+            decode_tokens_per_second: rate(generated_tokens as f64, decode_time),
+            decode_tokens_per_second_p25: decode_tps_summary.p25,
+            decode_tokens_per_second_median: decode_tps_summary.median,
+            decode_tokens_per_second_p95: decode_tps_summary.p95,
+            decode_tokens_per_second_stddev: decode_tps_summary.stddev,
+            total_tokens_per_second: rate(
+                (prompt_tokens + generated_tokens) as f64,
+                total_generation_time,
+            ),
+            total_tokens_per_second_median: total_tps_summary.median,
+            prefill_ms: duration_ms(prefill_time) / stats.len().max(1) as f64,
+            decode_ms: duration_ms(decode_time) / stats.len().max(1) as f64,
+            total_generation_ms: duration_ms(total_generation_time) / stats.len().max(1) as f64,
+        })
+    }
+
+    fn score(&self, measurement: &Self::Measurement) -> f64 {
+        measurement.decode_tokens_per_second_median
+    }
+}
+
+fn run_gpt2_autotune(args: RunGpt2AutoTuneArgs) -> Result<()> {
+    if args.runs == 0 {
+        return Err("autotune gpt2 --runs must be > 0".into());
+    }
+    if args.max_trials == 0 {
+        return Err("autotune gpt2 --max-trials must be > 0".into());
+    }
+
+    let candidates = gpt2_autotune_candidates(&args)?;
+    let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
+    if args.download {
+        eprintln!(
+            "downloading missing GPT-2 assets into {}",
+            model_dir.display()
+        );
+        if args.model_id == "gpt2" && args.revision == "main" {
+            download_gpt2_small_assets(&model_dir)?;
+        } else {
+            download_huggingface_gpt2_assets(&args.model_id, &args.revision, &model_dir)?;
+        }
+    }
+
+    let prompts = load_experiment_prompts(args.prompt.as_deref(), args.prompt_file.as_ref())?;
+    eprintln!(
+        "autotune: {} candidates, evaluating up to {}",
+        candidates.len(),
+        args.max_trials
+    );
+
+    let mut target = Gpt2AutoTuneTarget {
+        model_dir,
+        prompts,
+        max_new_tokens: args.max_new_tokens,
+        candidates,
+    };
+    let options = AutoTuneOptions {
+        warmup_runs: args.warmup_runs,
+        measured_runs: args.runs,
+        max_trials: Some(args.max_trials),
+    };
+    let result = autotune(&mut target, &options)?;
+
+    print_gpt2_autotune_result(&result);
+    let validation_options = AutoTuneOptions {
+        warmup_runs: args.warmup_runs,
+        measured_runs: args.validation_runs,
+        max_trials: None,
+    };
+    eprintln!(
+        "validating best config with {} measured runs",
+        args.validation_runs
+    );
+    let validation_measurement =
+        target.evaluate_config(&result.best_config, &validation_options)?;
+    let validation_score = target.score(&validation_measurement);
+    println!();
+    println!(
+        "validated best: {:.2} tok/s median ({:.2} tok/s mean)",
+        validation_score, validation_measurement.decode_tokens_per_second
+    );
+
+    let save_path = args
+        .save_tuning
+        .unwrap_or_else(|| target.model_dir.join("puppygrad-tune.json"));
+    save_gpt2_tuning(
+        &save_path,
+        &result.best_config,
+        result.best_score,
+        validation_score,
+        validation_measurement,
+        args.max_new_tokens,
+        &validation_options,
+    )?;
+    eprintln!("saved tuning config to {}", save_path.display());
+    Ok(())
+}
+
+fn gpt2_autotune_candidates(args: &RunGpt2AutoTuneArgs) -> Result<Vec<Gpt2AutoTuneConfig>> {
+    let threads = parse_usize_list("threads", &args.threads)?;
+    let dense_thresholds =
+        parse_usize_list("dense-parallel-thresholds", &args.dense_parallel_thresholds)?;
+    let qkv_chunks = parse_usize_list("qkv-chunk-sizes", &args.qkv_chunk_sizes)?;
+    let attention_projection_chunks = parse_usize_list(
+        "attention-projection-chunk-sizes",
+        &args.attention_projection_chunk_sizes,
+    )?;
+    let mlp_fc_chunks = parse_usize_list("mlp-fc-chunk-sizes", &args.mlp_fc_chunk_sizes)?;
+    let mlp_projection_chunks = parse_usize_list(
+        "mlp-projection-chunk-sizes",
+        &args.mlp_projection_chunk_sizes,
+    )?;
+    let logits_chunks = parse_usize_list("logits-chunk-sizes", &args.logits_chunk_sizes)?;
+    let attention_thresholds = parse_usize_list(
+        "attention-head-parallel-thresholds",
+        &args.attention_head_parallel_thresholds,
+    )?;
+    let quantized_options = if args.include_quantized {
+        [false, true].as_slice()
+    } else {
+        [false].as_slice()
+    };
+
+    let mut candidates = Vec::new();
+    for quantized_weights in quantized_options {
+        for dense_parallel_threshold in &dense_thresholds {
+            for qkv_chunk_size in &qkv_chunks {
+                for attention_projection_chunk_size in &attention_projection_chunks {
+                    for mlp_fc_chunk_size in &mlp_fc_chunks {
+                        for mlp_projection_chunk_size in &mlp_projection_chunks {
+                            for logits_chunk_size in &logits_chunks {
+                                for attention_head_parallel_threshold in &attention_thresholds {
+                                    for threads in &threads {
+                                        let rust = Gpt2RustConfig {
+                                            threads: *threads,
+                                            dense_parallel_threshold: *dense_parallel_threshold,
+                                            qkv_chunk_size: *qkv_chunk_size,
+                                            attention_projection_chunk_size:
+                                                *attention_projection_chunk_size,
+                                            mlp_fc_chunk_size: *mlp_fc_chunk_size,
+                                            mlp_projection_chunk_size: *mlp_projection_chunk_size,
+                                            logits_chunk_size: *logits_chunk_size,
+                                            attention_head_parallel_threshold:
+                                                *attention_head_parallel_threshold,
+                                            quantized_weights: *quantized_weights,
+                                        };
+                                        rust.validate()?;
+                                        candidates.push(Gpt2AutoTuneConfig { rust });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("autotune gpt2 generated no candidates".into());
+    }
+    Ok(candidates)
+}
+
+fn print_gpt2_autotune_result(
+    result: &puppygrad::models::autotune::AutoTuneResult<
+        Gpt2AutoTuneConfig,
+        Gpt2AutoTuneMeasurement,
+    >,
+) {
+    println!("best:");
+    print_gpt2_autotune_config(&result.best_config);
+    println!("  median score: {:.2} tok/s", result.best_score);
+    println!();
+    println!(
+        "{:>5} {:>7} {:>9} {:>5} {:>5} {:>5} {:>5} {:>6} {:>9} {:>7} {:>10} {:>10} {:>10}",
+        "trial",
+        "threads",
+        "dense_th",
+        "qkv",
+        "attn",
+        "fc",
+        "proj",
+        "logits",
+        "attn_th",
+        "weights",
+        "med tok/s",
+        "mean tok/s",
+        "total/s"
+    );
+    for (index, trial) in result.trials.iter().enumerate() {
+        let config = &trial.config.rust;
+        let measurement = &trial.measurement;
+        println!(
+            "{:>5} {:>7} {:>9} {:>5} {:>5} {:>5} {:>5} {:>6} {:>9} {:>7} {:>10.2} {:>10.2} {:>10.2}",
+            index + 1,
+            config.threads,
+            config.dense_parallel_threshold,
+            config.qkv_chunk_size,
+            config.attention_projection_chunk_size,
+            config.mlp_fc_chunk_size,
+            config.mlp_projection_chunk_size,
+            config.logits_chunk_size,
+            config.attention_head_parallel_threshold,
+            if config.quantized_weights {
+                "int8"
+            } else {
+                "f32"
+            },
+            measurement.decode_tokens_per_second_median,
+            measurement.decode_tokens_per_second,
+            measurement.total_tokens_per_second
+        );
+    }
+}
+
+fn save_gpt2_tuning(
+    path: &PathBuf,
+    best_config: &Gpt2AutoTuneConfig,
+    search_score: f64,
+    validation_score: f64,
+    validation_measurement: Gpt2AutoTuneMeasurement,
+    max_new_tokens: usize,
+    options: &AutoTuneOptions,
+) -> Result<()> {
+    let saved = SavedGpt2Tuning {
+        model: "gpt2".to_string(),
+        backend: "rust".to_string(),
+        score_name: "median_decode_tokens_per_second".to_string(),
+        score: validation_score,
+        search_score,
+        max_new_tokens,
+        warmup_runs: options.warmup_runs,
+        measured_runs: options.measured_runs,
+        prompt_count: validation_measurement.prompt_count,
+        rust: best_config.rust.clone(),
+        measurement: validation_measurement,
+    };
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create tuning dir {}: {err}", parent.display()))?;
+    }
+    let json = serde_json::to_string_pretty(&saved)?;
+    fs::write(path, format!("{json}\n"))
+        .map_err(|err| format!("failed to write tuning file {}: {err}", path.display()))?;
+    Ok(())
+}
+
+fn print_gpt2_autotune_config(config: &Gpt2AutoTuneConfig) {
+    let config = &config.rust;
+    println!("  --threads {}", config.threads);
+    println!(
+        "  --dense-parallel-threshold {}",
+        config.dense_parallel_threshold
+    );
+    println!("  --qkv-chunk-size {}", config.qkv_chunk_size);
+    println!(
+        "  --attention-projection-chunk-size {}",
+        config.attention_projection_chunk_size
+    );
+    println!("  --mlp-fc-chunk-size {}", config.mlp_fc_chunk_size);
+    println!(
+        "  --mlp-projection-chunk-size {}",
+        config.mlp_projection_chunk_size
+    );
+    println!("  --logits-chunk-size {}", config.logits_chunk_size);
+    println!(
+        "  --attention-head-parallel-threshold {}",
+        config.attention_head_parallel_threshold
+    );
+    if config.quantized_weights {
+        println!("  --quantized-weights");
+    }
 }
 
 fn print_gpt2_speed(stats: &Gpt2GenerationStats) {
@@ -682,6 +1297,7 @@ struct Gpt2ExperimentRow {
 #[derive(Clone, Copy, Debug)]
 struct DistributionSummary {
     min: f64,
+    p25: f64,
     median: f64,
     p95: f64,
     max: f64,
@@ -791,6 +1407,7 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn average_gpt2_experiment_row(
     backend: &str,
     rust_config: &Gpt2RustConfig,
@@ -1070,10 +1687,18 @@ fn duration_distribution<I>(durations: I) -> DistributionSummary
 where
     I: IntoIterator<Item = Duration>,
 {
-    let mut values: Vec<f64> = durations.into_iter().map(duration_ms).collect();
+    value_distribution(durations.into_iter().map(duration_ms))
+}
+
+fn value_distribution<I>(values: I) -> DistributionSummary
+where
+    I: IntoIterator<Item = f64>,
+{
+    let mut values: Vec<f64> = values.into_iter().collect();
     if values.is_empty() {
         return DistributionSummary {
             min: 0.0,
+            p25: 0.0,
             median: 0.0,
             p95: 0.0,
             max: 0.0,
@@ -1092,6 +1717,7 @@ where
         / values.len() as f64;
     DistributionSummary {
         min: values[0],
+        p25: percentile(&values, 0.25),
         median: percentile(&values, 0.5),
         p95: percentile(&values, 0.95),
         max: values[values.len() - 1],
@@ -1111,6 +1737,18 @@ fn percentile(sorted_values: &[f64], percentile: f64) -> f64 {
     }
     let weight = rank - lower as f64;
     sorted_values[lower] * (1.0 - weight) + sorted_values[upper] * weight
+}
+
+fn sum_duration<I>(durations: I) -> Duration
+where
+    I: IntoIterator<Item = Duration>,
+{
+    Duration::from_secs_f64(
+        durations
+            .into_iter()
+            .map(|duration| duration.as_secs_f64())
+            .sum(),
+    )
 }
 
 fn average_duration<I>(durations: I) -> Duration
