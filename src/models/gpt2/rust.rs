@@ -9,6 +9,11 @@ use tokenizers::Tokenizer;
 
 use crate::models::autoregressive::{self, AutoregressiveDecoder};
 use crate::models::config::load_json_config;
+use crate::models::cpu::{
+    add_in_place, dot, gelu_in_place, layer_norm_in_place, quantized_dot,
+    quantized_transposed_dense_projection_into, row, row_mut, softmax_in_place, transpose_in_out,
+    DenseShape, QuantizedRows,
+};
 use crate::models::generation::{
     argmax_logits as argmax, GenerationStats, LogitsSampler, ProfiledGenerationStats, SamplingError,
 };
@@ -131,14 +136,6 @@ struct Gpt2QuantizedBlockWeights {
     c_proj_w: QuantizedRows,
     c_fc_w: QuantizedRows,
     c_proj_mlp_w: QuantizedRows,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct QuantizedRows {
-    values: Vec<i8>,
-    scales: Vec<f32>,
-    rows: usize,
-    cols: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1240,16 +1237,6 @@ fn transpose_dense_weights(cfg: &Gpt2Config, weights: &mut Gpt2Weights) {
     }
 }
 
-fn transpose_in_out(weight: &[f32], in_features: usize, out_features: usize) -> Vec<f32> {
-    let mut transposed = vec![0.0f32; weight.len()];
-    for i in 0..in_features {
-        for o in 0..out_features {
-            transposed[o * in_features + i] = weight[i * out_features + o];
-        }
-    }
-    transposed
-}
-
 fn quantize_weights(config: &Gpt2Config, weights: &Gpt2Weights) -> Gpt2QuantizedWeights {
     Gpt2QuantizedWeights {
         wte: QuantizedRows::from_f32(&weights.wte, config.vocab_size, config.n_embd),
@@ -1271,30 +1258,6 @@ fn quantize_weights(config: &Gpt2Config, weights: &Gpt2Weights) -> Gpt2Quantized
                 ),
             })
             .collect(),
-    }
-}
-
-impl QuantizedRows {
-    fn from_f32(values: &[f32], rows: usize, cols: usize) -> Self {
-        debug_assert_eq!(values.len(), rows * cols);
-        let mut quantized = Vec::with_capacity(values.len());
-        let mut scales = Vec::with_capacity(rows);
-        for r in 0..rows {
-            let src = row(values, r, cols);
-            let max_abs = src.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
-            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
-            scales.push(scale);
-            for value in src {
-                let q = (value / scale).round().clamp(-127.0, 127.0) as i8;
-                quantized.push(q);
-            }
-        }
-        Self {
-            values: quantized,
-            scales,
-            rows,
-            cols,
-        }
     }
 }
 
@@ -1421,13 +1384,11 @@ fn linear_block_into(
 
     let (weight, bias) = block_linear_slices(weights, layer, which);
     if pool.threads() == 1 || shape.work_items() < rust_config.dense_parallel_threshold {
-        linear_into(
+        crate::models::cpu::transposed_dense_projection_into(
             x,
-            shape.rows,
-            shape.in_features,
+            DenseShape::new(shape.rows, shape.in_features, shape.out_features),
             weight,
             bias,
-            shape.out_features,
             out,
         );
         return;
@@ -1456,27 +1417,6 @@ fn linear_block_into(
     }
 }
 
-fn linear_into(
-    x: &[f32],
-    rows: usize,
-    in_features: usize,
-    weight: &[f32],
-    bias: &[f32],
-    out_features: usize,
-    out: &mut Vec<f32>,
-) {
-    out.clear();
-    out.resize(rows * out_features, 0.0);
-    for r in 0..rows {
-        let src = row(x, r, in_features);
-        let dst = row_mut(out, r, out_features);
-        for o in 0..out_features {
-            let weight_row = row(weight, o, in_features);
-            dst[o] = bias[o] + dot(src, weight_row);
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn quantized_linear_into(
     x: &[f32],
@@ -1491,15 +1431,13 @@ fn quantized_linear_into(
     debug_assert_eq!(weight.rows, shape.out_features);
     debug_assert_eq!(weight.cols, shape.in_features);
     if pool.threads() == 1 || shape.work_items() < rust_config.dense_parallel_threshold {
-        out.clear();
-        out.resize(shape.out_len(), 0.0);
-        for r in 0..shape.rows {
-            let src = row(x, r, shape.in_features);
-            let dst = row_mut(out, r, shape.out_features);
-            for o in 0..shape.out_features {
-                dst[o] = bias[o] + quantized_dot(src, weight, o);
-            }
-        }
+        quantized_transposed_dense_projection_into(
+            x,
+            DenseShape::new(shape.rows, shape.in_features, shape.out_features),
+            weight,
+            bias,
+            out,
+        );
         return;
     }
 
@@ -1802,176 +1740,6 @@ fn kv_index(pos: usize, head: usize, dim: usize, max_seq_len: usize, head_dim: u
     (head * max_seq_len + pos) * head_dim + dim
 }
 
-fn layer_norm_in_place(
-    x: &mut [f32],
-    rows: usize,
-    cols: usize,
-    gamma: &[f32],
-    beta: &[f32],
-    eps: f32,
-) {
-    for r in 0..rows {
-        let row = row_mut(x, r, cols);
-        let mean = row.iter().sum::<f32>() / cols as f32;
-        let variance = row
-            .iter()
-            .map(|v| {
-                let delta = *v - mean;
-                delta * delta
-            })
-            .sum::<f32>()
-            / cols as f32;
-        let inv_std = 1.0 / (variance + eps).sqrt();
-        for c in 0..cols {
-            row[c] = (row[c] - mean) * inv_std * gamma[c] + beta[c];
-        }
-    }
-}
-
-fn gelu_in_place(values: &mut [f32]) {
-    for value in values {
-        let x = *value;
-        *value = 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh());
-    }
-}
-
-fn softmax_in_place(values: &mut [f32]) {
-    let max = values
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, |acc, v| acc.max(v));
-    let mut sum = 0.0f32;
-    for value in values.iter_mut() {
-        *value = (*value - max).exp();
-        sum += *value;
-    }
-    for value in values {
-        *value /= sum;
-    }
-}
-
-fn add_in_place(dst: &mut [f32], src: &[f32]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d += s;
-    }
-}
-
-fn quantized_dot(a: &[f32], rows: &QuantizedRows, row_index: usize) -> f32 {
-    debug_assert_eq!(a.len(), rows.cols);
-    debug_assert!(row_index < rows.rows);
-    let start = row_index * rows.cols;
-    let values = &rows.values[start..start + rows.cols];
-    let scale = rows.scales[row_index];
-    let mut sum = 0.0f32;
-    for (x, q) in a.iter().zip(values.iter()) {
-        sum += *x * (*q as f32 * scale);
-    }
-    sum
-}
-
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { dot_neon(a, b) }
-    }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::is_x86_feature_detected!("avx") {
-            return unsafe { dot_avx(a, b) };
-        }
-        dot_scalar(a, b)
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
-    {
-        dot_scalar(a, b)
-    }
-}
-
-#[allow(dead_code)]
-fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vld1q_f32, vmlaq_f32};
-
-    let mut i = 0;
-    let mut acc = vdupq_n_f32(0.0);
-    while i + 4 <= a.len() {
-        let av = vld1q_f32(a.as_ptr().add(i));
-        let bv = vld1q_f32(b.as_ptr().add(i));
-        acc = vmlaq_f32(acc, av, bv);
-        i += 4;
-    }
-
-    let mut sum = vaddvq_f32(acc);
-    while i < a.len() {
-        sum += a[i] * b[i];
-        i += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86_64::{
-        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-    };
-
-    let mut i = 0;
-    let mut acc = _mm256_setzero_ps();
-    while i + 8 <= a.len() {
-        let av = _mm256_loadu_ps(a.as_ptr().add(i));
-        let bv = _mm256_loadu_ps(b.as_ptr().add(i));
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(av, bv));
-        i += 8;
-    }
-
-    let mut lanes = [0.0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut sum = lanes.iter().sum::<f32>();
-    while i < a.len() {
-        sum += a[i] * b[i];
-        i += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "x86")]
-unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
-    use std::arch::x86::{
-        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-    };
-
-    let mut i = 0;
-    let mut acc = _mm256_setzero_ps();
-    while i + 8 <= a.len() {
-        let av = _mm256_loadu_ps(a.as_ptr().add(i));
-        let bv = _mm256_loadu_ps(b.as_ptr().add(i));
-        acc = _mm256_add_ps(acc, _mm256_mul_ps(av, bv));
-        i += 8;
-    }
-
-    let mut lanes = [0.0f32; 8];
-    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
-    let mut sum = lanes.iter().sum::<f32>();
-    while i < a.len() {
-        sum += a[i] * b[i];
-        i += 1;
-    }
-    sum
-}
-
-fn row(values: &[f32], row: usize, cols: usize) -> &[f32] {
-    &values[row * cols..(row + 1) * cols]
-}
-
-fn row_mut(values: &mut [f32], row: usize, cols: usize) -> &mut [f32] {
-    &mut values[row * cols..(row + 1) * cols]
-}
-
 fn gpt2_sampling_error(err: SamplingError) -> Gpt2Error {
     Gpt2Error::InvalidInput(format!("token sampling failed: {err}"))
 }
@@ -2182,14 +1950,6 @@ mod tests {
 
         assert_eq!(profiled.common.total_model_tokens(), 5);
         assert_eq!(profiled.profile.qkv_projection, Duration::from_millis(7));
-    }
-
-    #[test]
-    fn dot_matches_scalar_reference() {
-        let a = patterned(37, 0.013);
-        let b = patterned(37, -0.021);
-
-        assert!((dot(&a, &b) - dot_scalar(&a, &b)).abs() <= 1e-6);
     }
 
     fn tiny_config() -> Gpt2Config {
