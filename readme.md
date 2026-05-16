@@ -21,6 +21,8 @@ Implemented:
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
 
+Shared model runtime code is intentionally limited to pieces that already have clear cross-model shape: generation CLI args and sampling config, token streaming, generation stats, asset/config loading, safetensors access, CPU math kernels, and minimal autoregressive/KV-cache traits. Full transformer block extraction is deferred until a second native model exists, so GPT-2 learned-position blocks and future RoPE-based Qwen/Llama blocks do not get forced through the wrong abstraction.
+
 ### Run GPT-2 small
 
 First run downloads GPT-2 small assets into `models/gpt2`:
