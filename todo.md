@@ -13,4 +13,4 @@
 - [x] Introduce a minimal KV cache trait for shared cache concepts like `seq_len`, `max_seq_len`, and `clear`, without forcing a common memory layout yet.
 - [x] Delay broader transformer block extraction until there is at least one second real model, so GPT-2 learned positions and Qwen/Llama RoPE do not get forced into the wrong abstraction.
 - [x] Review whether `Gpt2RustConfig` can be split into generic CPU backend options and model/op-specific tuning options.
-- [ ] Move generic autoregressive generation examples and documentation out of GPT-2-specific docs.
+- [x] Move generic autoregressive generation examples and documentation out of GPT-2-specific docs.
