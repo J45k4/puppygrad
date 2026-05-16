@@ -11,3 +11,9 @@ incremental-stream-decode,2026-05-16,"The future of small language models is",ru
 incremental-stream-decode,2026-05-16,"The future of small language models is",rust,2,8,2,7,8.000,1130.309,0.055,552.363,552.507,636.973,1189.336,12.673,12.559,12.612
 incremental-stream-decode,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,2525.421,0.093,866.915,866.999,464.784,1331.699,8.075,8.606,8.260
 incremental-stream-decode,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,2525.421,0.140,507.010,507.121,512.358,1019.367,13.806,15.614,14.715
+simd-dot-kernels,2026-05-16,"The future of small language models is",rust,1,4,2,7,4.000,1101.983,0.125,198.674,198.805,105.610,304.285,35.234,37.875,36.150
+simd-dot-kernels,2026-05-16,"The future of small language models is",rust,1,8,2,7,8.000,1101.983,0.044,220.275,220.349,208.000,428.275,31.778,38.461,35.024
+simd-dot-kernels,2026-05-16,"The future of small language models is",rust,2,4,2,7,4.000,611.246,0.095,157.451,157.537,71.786,229.238,44.458,55.721,47.985
+simd-dot-kernels,2026-05-16,"The future of small language models is",rust,2,8,2,7,8.000,611.246,0.060,157.804,157.906,167.708,325.512,44.359,47.702,46.081
+simd-dot-kernels,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,578.204,0.041,91.460,91.558,44.146,135.606,76.537,90.608,81.117
+simd-dot-kernels,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,578.204,0.034,102.413,102.485,97.780,200.193,68.351,81.816,74.928

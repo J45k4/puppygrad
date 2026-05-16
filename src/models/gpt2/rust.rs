@@ -1651,7 +1651,98 @@ fn add_in_place(dst: &mut [f32], src: &[f32]) {
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_neon(a, b) }
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx") {
+            return unsafe { dot_avx(a, b) };
+        }
+        dot_scalar(a, b)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+    {
+        dot_scalar(a, b)
+    }
+}
+
+#[allow(dead_code)]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn dot_neon(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vld1q_f32, vmlaq_f32};
+
+    let mut i = 0;
+    let mut acc = vdupq_n_f32(0.0);
+    while i + 4 <= a.len() {
+        let av = vld1q_f32(a.as_ptr().add(i));
+        let bv = vld1q_f32(b.as_ptr().add(i));
+        acc = vmlaq_f32(acc, av, bv);
+        i += 4;
+    }
+
+    let mut sum = vaddvq_f32(acc);
+    while i < a.len() {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(all(target_arch = "x86_64"))]
+unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    let mut i = 0;
+    let mut acc = _mm256_setzero_ps();
+    while i + 8 <= a.len() {
+        let av = _mm256_loadu_ps(a.as_ptr().add(i));
+        let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(av, bv));
+        i += 8;
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(all(target_arch = "x86"))]
+unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    let mut i = 0;
+    let mut acc = _mm256_setzero_ps();
+    while i + 8 <= a.len() {
+        let av = _mm256_loadu_ps(a.as_ptr().add(i));
+        let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(av, bv));
+        i += 8;
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    while i < a.len() {
+        sum += a[i] * b[i];
+        i += 1;
+    }
+    sum
 }
 
 fn row(values: &[f32], row: usize, cols: usize) -> &[f32] {
@@ -1825,6 +1916,14 @@ mod tests {
         assert!(!is_incremental_decode_safe(""));
         assert!(!is_incremental_decode_safe("\u{fffd}"));
         assert!(!is_incremental_decode_safe("a\u{fffd}"));
+    }
+
+    #[test]
+    fn dot_matches_scalar_reference() {
+        let a = patterned(37, 0.013);
+        let b = patterned(37, -0.021);
+
+        assert!((dot(&a, &b) - dot_scalar(&a, &b)).abs() <= 1e-6);
     }
 
     fn tiny_config() -> Gpt2Config {
