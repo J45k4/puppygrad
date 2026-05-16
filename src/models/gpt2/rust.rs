@@ -13,7 +13,7 @@ use crate::models::generation::{
     argmax_logits as argmax, GenerationStats, LogitsSampler, ProfiledGenerationStats, SamplingError,
 };
 use crate::models::safetensors::{
-    parse_safetensors, read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError,
+    read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError, TensorStore,
 };
 use crate::models::streaming::{IncrementalTextStreamer, TokenDecoder};
 use crate::runtime::thread_pool::ThreadPool;
@@ -602,7 +602,7 @@ fn load_config(path: &Path) -> Result<Gpt2Config> {
 fn load_weights(path: &Path, cfg: &Gpt2Config) -> Result<Gpt2Weights> {
     let bytes = read_safetensors_file(path).map_err(|err| Gpt2Error::Asset(err.to_string()))?;
     let tensors =
-        parse_safetensors(path, &bytes).map_err(|err| Gpt2Error::Asset(err.to_string()))?;
+        TensorStore::from_bytes(path, &bytes).map_err(|err| Gpt2Error::Asset(err.to_string()))?;
 
     let mut blocks = Vec::with_capacity(cfg.n_layer);
     for layer in 0..cfg.n_layer {
@@ -660,11 +660,7 @@ fn load_weights(path: &Path, cfg: &Gpt2Config) -> Result<Gpt2Weights> {
     })
 }
 
-fn tensor_f32(
-    tensors: &safetensors::SafeTensors<'_>,
-    name: &str,
-    expected_shape: &[usize],
-) -> Result<Vec<f32>> {
+fn tensor_f32(tensors: &TensorStore<'_>, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
     let prefixed_name = format!("transformer.{name}");
     match safetensor_f32(tensors, name, expected_shape) {
         Ok(values) => Ok(values),
