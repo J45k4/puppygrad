@@ -1,4 +1,5 @@
 use std::fmt;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -101,6 +102,86 @@ impl ThreadPool {
         let mut results: Vec<_> = rx.into_iter().flatten().collect();
         results.sort_by_key(|(chunk, _)| *chunk);
         results.into_iter().map(|(_, value)| value).collect()
+    }
+
+    pub fn scoped_parallel_chunks<'scope, T, F>(
+        &'scope self,
+        len: usize,
+        chunk_size: usize,
+        f: F,
+    ) -> Vec<T>
+    where
+        T: Send + 'scope,
+        F: Fn(usize, usize) -> T + Send + Sync + 'scope,
+    {
+        if len == 0 {
+            return Vec::new();
+        }
+
+        let chunk_size = chunk_size.max(1);
+        let chunks = len.div_ceil(chunk_size);
+        if self.threads() == 1 || chunks == 1 {
+            return (0..chunks)
+                .map(|chunk| {
+                    let start = chunk * chunk_size;
+                    let end = (start + chunk_size).min(len);
+                    f(start, end)
+                })
+                .collect();
+        }
+
+        let workers = self.threads().min(chunks);
+        let (tx, rx) = mpsc::channel();
+        let f = &f;
+        for worker in 0..workers {
+            let tx = tx.clone();
+            let job = move || {
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let mut worker_results = Vec::new();
+                    let mut chunk = worker;
+                    while chunk < chunks {
+                        let start = chunk * chunk_size;
+                        let end = (start + chunk_size).min(len);
+                        worker_results.push((chunk, f(start, end)));
+                        chunk += workers;
+                    }
+                    worker_results
+                }));
+                tx.send(result).expect("parallel chunk receiver dropped");
+            };
+            self.send_scoped(job);
+        }
+        drop(tx);
+
+        let mut panic_payload = None;
+        let mut results = Vec::new();
+        for result in rx {
+            match result {
+                Ok(worker_results) => results.extend(worker_results),
+                Err(payload) => panic_payload = Some(payload),
+            }
+        }
+        if let Some(payload) = panic_payload {
+            panic::resume_unwind(payload);
+        }
+
+        results.sort_by_key(|(chunk, _)| *chunk);
+        results.into_iter().map(|(_, value)| value).collect()
+    }
+
+    fn send_scoped<'scope, F>(&self, job: F)
+    where
+        F: FnOnce() + Send + 'scope,
+    {
+        let boxed: Box<dyn FnOnce() + Send + 'scope> = Box::new(job);
+        // SAFETY: scoped_parallel_chunks waits for every sent job to report completion
+        // before returning, and each worker catches panics inside the erased job. This
+        // ensures borrowed data captured by the job cannot outlive this call.
+        let boxed: Job = unsafe { std::mem::transmute(boxed) };
+        self.inner
+            .sender
+            .send(Message::Run(boxed))
+            .expect("thread pool worker channel closed");
     }
 }
 

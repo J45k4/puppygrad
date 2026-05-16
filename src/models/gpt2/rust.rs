@@ -211,6 +211,7 @@ impl Gpt2KvCache {
 pub struct Gpt2LayerKvCache {
     pub keys: Vec<f32>,
     pub values: Vec<f32>,
+    pub max_seq_len: usize,
 }
 
 impl Gpt2LayerKvCache {
@@ -219,6 +220,7 @@ impl Gpt2LayerKvCache {
         Self {
             keys: vec![0.0; len],
             values: vec![0.0; len],
+            max_seq_len,
         }
     }
 }
@@ -273,6 +275,20 @@ pub struct Gpt2GenerationStats {
     pub decode_time: Duration,
     pub total_generation_time: Duration,
     pub first_token_time: Option<Duration>,
+    pub operation_profile: Gpt2OperationProfile,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Gpt2OperationProfile {
+    pub tokenization: Duration,
+    pub layer_norm: Duration,
+    pub qkv_projection: Duration,
+    pub attention: Duration,
+    pub attention_projection: Duration,
+    pub mlp_fc_projection: Duration,
+    pub mlp_projection: Duration,
+    pub final_logits: Duration,
+    pub decoding: Duration,
 }
 
 impl Gpt2GenerationStats {
@@ -386,18 +402,25 @@ impl Gpt2Runtime {
         F: FnMut(&str) -> std::result::Result<(), E>,
         E: From<Gpt2Error>,
     {
+        let mut operation_profile = Gpt2OperationProfile::default();
+
         let tokenize_start = Instant::now();
         let input_ids = self.tokenizer.encode(prompt)?;
         let tokenize_time = tokenize_start.elapsed();
+        operation_profile.tokenization += tokenize_time;
 
         let mut output_ids = input_ids.clone();
+        let decode_text_start = Instant::now();
         let mut decoded = self.tokenizer.decode(&output_ids)?;
+        operation_profile.decoding += decode_text_start.elapsed();
         on_text(&decoded)?;
 
         let mut cache = self.model.new_kv_cache()?;
         let first_token_start = Instant::now();
         let prefill_start = Instant::now();
-        let mut logits = self.model.prefill(&input_ids, &mut cache)?;
+        let mut logits =
+            self.model
+                .prefill_profiled(&input_ids, &mut cache, &mut operation_profile)?;
         let prefill_time = prefill_start.elapsed();
 
         let decode_start = Instant::now();
@@ -411,11 +434,15 @@ impl Gpt2Runtime {
 
             let token_id = argmax(&logits);
             output_ids.push(token_id);
+            let decode_text_start = Instant::now();
             let next_decoded = self.tokenizer.decode(&output_ids)?;
+            operation_profile.decoding += decode_text_start.elapsed();
             if let Some(delta) = next_decoded.strip_prefix(&decoded) {
                 on_text(delta)?;
             } else {
+                let decode_text_start = Instant::now();
                 let token_text = self.tokenizer.decode(&[token_id])?;
+                operation_profile.decoding += decode_text_start.elapsed();
                 on_text(&token_text)?;
             }
             decoded = next_decoded;
@@ -426,7 +453,11 @@ impl Gpt2Runtime {
             let needs_next_logits = generated_tokens < max_new_tokens
                 && output_ids.len() < self.model.config.n_positions;
             if needs_next_logits {
-                logits = self.model.forward_one(token_id, &mut cache)?;
+                logits = self.model.forward_one_profiled(
+                    token_id,
+                    &mut cache,
+                    &mut operation_profile,
+                )?;
             }
         }
 
@@ -439,9 +470,39 @@ impl Gpt2Runtime {
             decode_time,
             total_generation_time: prefill_time + decode_time,
             first_token_time,
+            operation_profile,
         };
 
         Ok((decoded, stats))
+    }
+}
+
+#[derive(Debug)]
+struct Gpt2Scratch {
+    x: Vec<f32>,
+    norm: Vec<f32>,
+    qkv: Vec<f32>,
+    attn: Vec<f32>,
+    attn_proj: Vec<f32>,
+    residual: Vec<f32>,
+    mlp: Vec<f32>,
+    mlp_proj: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl Gpt2Scratch {
+    fn new(config: &Gpt2Config) -> Self {
+        Self {
+            x: Vec::with_capacity(config.n_embd),
+            norm: Vec::with_capacity(config.n_embd),
+            qkv: Vec::with_capacity(3 * config.n_embd),
+            attn: Vec::with_capacity(config.n_embd),
+            attn_proj: Vec::with_capacity(config.n_embd),
+            residual: Vec::with_capacity(config.n_embd),
+            mlp: Vec::with_capacity(config.n_inner),
+            mlp_proj: Vec::with_capacity(config.n_embd),
+            logits: Vec::with_capacity(config.vocab_size),
+        }
     }
 }
 
@@ -633,8 +694,9 @@ impl Gpt2Model {
                 hidden,
                 cfg.vocab_size,
                 c,
-                Arc::clone(&self.weights),
+                &self.weights,
                 pool,
+                &self.rust_config,
             ));
         }
 
@@ -668,18 +730,49 @@ impl Gpt2Model {
     }
 
     pub fn prefill(&self, input_ids: &[usize], cache: &mut Gpt2KvCache) -> Result<Vec<f32>> {
+        self.prefill_profiled(input_ids, cache, &mut Gpt2OperationProfile::default())
+    }
+
+    fn prefill_profiled(
+        &self,
+        input_ids: &[usize],
+        cache: &mut Gpt2KvCache,
+        profile: &mut Gpt2OperationProfile,
+    ) -> Result<Vec<f32>> {
         self.validate_input(input_ids)?;
         cache.check_compatible(&self.config)?;
         cache.clear();
 
         let mut logits = Vec::new();
+        let mut scratch = Gpt2Scratch::new(&self.config);
         for token_id in input_ids {
-            logits = self.forward_one(*token_id, cache)?;
+            logits =
+                self.forward_one_profiled_with_scratch(*token_id, cache, profile, &mut scratch)?;
         }
         Ok(logits)
     }
 
     pub fn forward_one(&self, token_id: usize, cache: &mut Gpt2KvCache) -> Result<Vec<f32>> {
+        self.forward_one_profiled(token_id, cache, &mut Gpt2OperationProfile::default())
+    }
+
+    fn forward_one_profiled(
+        &self,
+        token_id: usize,
+        cache: &mut Gpt2KvCache,
+        profile: &mut Gpt2OperationProfile,
+    ) -> Result<Vec<f32>> {
+        let mut scratch = Gpt2Scratch::new(&self.config);
+        self.forward_one_profiled_with_scratch(token_id, cache, profile, &mut scratch)
+    }
+
+    fn forward_one_profiled_with_scratch(
+        &self,
+        token_id: usize,
+        cache: &mut Gpt2KvCache,
+        profile: &mut Gpt2OperationProfile,
+        scratch: &mut Gpt2Scratch,
+    ) -> Result<Vec<f32>> {
         cache.check_compatible(&self.config)?;
         if token_id >= self.config.vocab_size {
             return Err(Gpt2Error::InvalidInput(format!(
@@ -697,34 +790,44 @@ impl Gpt2Model {
         let cfg = &self.config;
         let c = cfg.n_embd;
         let pos = cache.seq_len;
-        let mut x = vec![0.0f32; c];
+        scratch.x.clear();
+        scratch.x.resize(c, 0.0);
 
         let tok = row(&self.weights.wte, token_id, c);
         let pos_emb = row(&self.weights.wpe, pos, c);
         for i in 0..c {
-            x[i] = tok[i] + pos_emb[i];
+            scratch.x[i] = tok[i] + pos_emb[i];
         }
 
         for layer in 0..self.weights.blocks.len() {
-            x = self.block_forward_one(&x, layer, cache)?;
+            self.block_forward_one_profiled(layer, cache, profile, scratch)?;
+            std::mem::swap(&mut scratch.x, &mut scratch.residual);
         }
 
+        let start = Instant::now();
         layer_norm_in_place(
-            &mut x,
+            &mut scratch.x,
             1,
             c,
             &self.weights.ln_f_g,
             &self.weights.ln_f_b,
             cfg.layer_norm_epsilon,
         );
-        cache.seq_len += 1;
-        Ok(logits_from_hidden(
-            &x,
+        profile.layer_norm += start.elapsed();
+
+        let start = Instant::now();
+        logits_from_hidden_into(
+            &scratch.x,
             cfg.vocab_size,
             c,
-            Arc::clone(&self.weights),
+            &self.weights,
             self.thread_pool(),
-        ))
+            &self.rust_config,
+            &mut scratch.logits,
+        );
+        profile.final_logits += start.elapsed();
+        cache.seq_len += 1;
+        Ok(scratch.logits.clone())
     }
 
     pub fn generate_greedy_cached(
@@ -775,7 +878,7 @@ impl Gpt2Model {
     fn block_forward(&self, x: &[f32], t: usize, layer: usize) -> Vec<f32> {
         let cfg = &self.config;
         let c = cfg.n_embd;
-        let weights = Arc::clone(&self.weights);
+        let weights = &self.weights;
         let block = &weights.blocks[layer];
         let mut norm = x.to_vec();
         layer_norm_in_place(
@@ -790,19 +893,28 @@ impl Gpt2Model {
         let qkv = linear_block(
             &norm,
             LinearShape::new(t, c, 3 * c),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::CAttn,
             self.thread_pool(),
+            &self.rust_config,
         );
-        let attn = causal_self_attention(&qkv, t, cfg.n_head, cfg.head_dim());
+        let attn = causal_self_attention(
+            &qkv,
+            t,
+            cfg.n_head,
+            cfg.head_dim(),
+            self.thread_pool(),
+            &self.rust_config,
+        );
         let attn_proj = linear_block(
             &attn,
             LinearShape::new(t, c, c),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::AttnProj,
             self.thread_pool(),
+            &self.rust_config,
         );
 
         let mut residual = x.to_vec();
@@ -821,102 +933,137 @@ impl Gpt2Model {
         let mut mlp = linear_block(
             &norm,
             LinearShape::new(t, c, cfg.n_inner),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::MlpFc,
             self.thread_pool(),
+            &self.rust_config,
         );
         gelu_in_place(&mut mlp);
         let mlp_proj = linear_block(
             &mlp,
             LinearShape::new(t, cfg.n_inner, c),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::MlpProj,
             self.thread_pool(),
+            &self.rust_config,
         );
 
         add_in_place(&mut residual, &mlp_proj);
         residual
     }
 
-    fn block_forward_one(
+    fn block_forward_one_profiled(
         &self,
-        x: &[f32],
         layer: usize,
         cache: &mut Gpt2KvCache,
-    ) -> Result<Vec<f32>> {
+        profile: &mut Gpt2OperationProfile,
+        scratch: &mut Gpt2Scratch,
+    ) -> Result<()> {
         let cfg = &self.config;
         let c = cfg.n_embd;
-        let weights = Arc::clone(&self.weights);
+        let weights = &self.weights;
         let block = &weights.blocks[layer];
-        let mut norm = x.to_vec();
+
+        scratch.norm.clear();
+        scratch.norm.extend_from_slice(&scratch.x);
+        let start = Instant::now();
         layer_norm_in_place(
-            &mut norm,
+            &mut scratch.norm,
             1,
             c,
             &block.ln_1_g,
             &block.ln_1_b,
             cfg.layer_norm_epsilon,
         );
+        profile.layer_norm += start.elapsed();
 
-        let qkv = linear_block(
-            &norm,
+        let start = Instant::now();
+        linear_block_into(
+            &scratch.norm,
             LinearShape::new(1, c, 3 * c),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::CAttn,
             self.thread_pool(),
+            &self.rust_config,
+            &mut scratch.qkv,
         );
-        let attn = cached_self_attention(
-            &qkv,
+        profile.qkv_projection += start.elapsed();
+
+        let start = Instant::now();
+        cached_self_attention_into(
+            &scratch.qkv,
             cache.seq_len,
             &mut cache.layers[layer],
             cfg.n_head,
             cfg.head_dim(),
+            self.thread_pool(),
+            &self.rust_config,
+            &mut scratch.attn,
         );
-        let attn_proj = linear_block(
-            &attn,
+        profile.attention += start.elapsed();
+
+        let start = Instant::now();
+        linear_block_into(
+            &scratch.attn,
             LinearShape::new(1, c, c),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::AttnProj,
             self.thread_pool(),
+            &self.rust_config,
+            &mut scratch.attn_proj,
         );
+        profile.attention_projection += start.elapsed();
 
-        let mut residual = x.to_vec();
-        add_in_place(&mut residual, &attn_proj);
+        scratch.residual.clear();
+        scratch.residual.extend_from_slice(&scratch.x);
+        add_in_place(&mut scratch.residual, &scratch.attn_proj);
 
-        let mut norm = residual.clone();
+        scratch.norm.clear();
+        scratch.norm.extend_from_slice(&scratch.residual);
+        let start = Instant::now();
         layer_norm_in_place(
-            &mut norm,
+            &mut scratch.norm,
             1,
             c,
             &block.ln_2_g,
             &block.ln_2_b,
             cfg.layer_norm_epsilon,
         );
+        profile.layer_norm += start.elapsed();
 
-        let mut mlp = linear_block(
-            &norm,
+        let start = Instant::now();
+        linear_block_into(
+            &scratch.norm,
             LinearShape::new(1, c, cfg.n_inner),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::MlpFc,
             self.thread_pool(),
+            &self.rust_config,
+            &mut scratch.mlp,
         );
-        gelu_in_place(&mut mlp);
-        let mlp_proj = linear_block(
-            &mlp,
+        profile.mlp_fc_projection += start.elapsed();
+        gelu_in_place(&mut scratch.mlp);
+
+        let start = Instant::now();
+        linear_block_into(
+            &scratch.mlp,
             LinearShape::new(1, cfg.n_inner, c),
-            Arc::clone(&weights),
+            weights,
             layer,
             BlockLinear::MlpProj,
             self.thread_pool(),
+            &self.rust_config,
+            &mut scratch.mlp_proj,
         );
+        profile.mlp_projection += start.elapsed();
 
-        add_in_place(&mut residual, &mlp_proj);
-        Ok(residual)
+        add_in_place(&mut scratch.residual, &scratch.mlp_proj);
+        Ok(())
     }
 }
 
@@ -1039,6 +1186,17 @@ enum BlockLinear {
     MlpProj,
 }
 
+impl BlockLinear {
+    fn chunk_size(self, config: &Gpt2RustConfig) -> usize {
+        match self {
+            BlockLinear::CAttn => config.qkv_chunk_size,
+            BlockLinear::AttnProj => config.attention_projection_chunk_size,
+            BlockLinear::MlpFc => config.mlp_fc_chunk_size,
+            BlockLinear::MlpProj => config.mlp_projection_chunk_size,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinearShape {
     rows: usize,
@@ -1083,76 +1241,138 @@ fn block_linear_slices(
 fn linear_block(
     x: &[f32],
     shape: LinearShape,
-    weights: Arc<Gpt2Weights>,
+    weights: &Gpt2Weights,
     layer: usize,
     which: BlockLinear,
     pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
 ) -> Vec<f32> {
-    let (weight, bias) = block_linear_slices(&weights, layer, which);
-    if pool.threads() == 1 || shape.work_items() < 262_144 {
-        return linear(
+    let mut out = Vec::new();
+    linear_block_into(x, shape, weights, layer, which, pool, rust_config, &mut out);
+    out
+}
+
+fn linear_block_into(
+    x: &[f32],
+    shape: LinearShape,
+    weights: &Gpt2Weights,
+    layer: usize,
+    which: BlockLinear,
+    pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
+    out: &mut Vec<f32>,
+) {
+    let (weight, bias) = block_linear_slices(weights, layer, which);
+    if pool.threads() == 1 || shape.work_items() < rust_config.dense_parallel_threshold {
+        linear_into(
             x,
             shape.rows,
             shape.in_features,
             weight,
             bias,
             shape.out_features,
+            out,
         );
+        return;
     }
 
-    let x = Arc::<[f32]>::from(x.to_vec());
-    let chunks = pool.parallel_chunks(shape.out_len(), 64, move |start, end| {
-        let mut values = Vec::with_capacity(end - start);
-        let (weight, bias) = block_linear_slices(&weights, layer, which);
-        for index in start..end {
-            let r = index / shape.out_features;
-            let o = index % shape.out_features;
-            let src = row(&x, r, shape.in_features);
-            let mut sum = bias[o];
-            let weight_row = row(weight, o, shape.in_features);
-            for i in 0..shape.in_features {
-                sum += src[i] * weight_row[i];
+    let chunks = pool.scoped_parallel_chunks(
+        shape.out_len(),
+        which.chunk_size(rust_config),
+        |start, end| {
+            let mut values = Vec::with_capacity(end - start);
+            for index in start..end {
+                let r = index / shape.out_features;
+                let o = index % shape.out_features;
+                let src = row(&x, r, shape.in_features);
+                let weight_row = row(weight, o, shape.in_features);
+                values.push(bias[o] + dot(src, weight_row));
             }
-            values.push(sum);
-        }
-        values
-    });
+            values
+        },
+    );
 
-    let mut out = Vec::with_capacity(shape.out_len());
+    out.clear();
+    out.reserve(shape.out_len());
     for mut chunk in chunks {
         out.append(&mut chunk);
     }
-    out
 }
 
-fn linear(
+fn linear_into(
     x: &[f32],
     rows: usize,
     in_features: usize,
     weight: &[f32],
     bias: &[f32],
     out_features: usize,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows * out_features];
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.resize(rows * out_features, 0.0);
     for r in 0..rows {
         let src = row(x, r, in_features);
-        let dst = row_mut(&mut out, r, out_features);
+        let dst = row_mut(out, r, out_features);
         for o in 0..out_features {
-            let mut sum = bias[o];
             let weight_row = row(weight, o, in_features);
-            for i in 0..in_features {
-                sum += src[i] * weight_row[i];
-            }
-            dst[o] = sum;
+            dst[o] = bias[o] + dot(src, weight_row);
         }
     }
-    out
 }
 
-fn causal_self_attention(qkv: &[f32], seq_len: usize, n_head: usize, head_dim: usize) -> Vec<f32> {
+fn causal_self_attention(
+    qkv: &[f32],
+    seq_len: usize,
+    n_head: usize,
+    head_dim: usize,
+    pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
+) -> Vec<f32> {
     let n_embd = n_head * head_dim;
     let mut out = vec![0.0f32; seq_len * n_embd];
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let work_items = seq_len * seq_len * n_head * head_dim;
+
+    if pool.threads() > 1 && work_items >= rust_config.attention_head_parallel_threshold {
+        let heads = pool.scoped_parallel_chunks(n_head, 1, |start, end| {
+            let mut head_outputs = Vec::with_capacity(end - start);
+            for h in start..end {
+                let mut head_out = vec![0.0f32; seq_len * head_dim];
+                for q_pos in 0..seq_len {
+                    let mut scores = vec![0.0f32; q_pos + 1];
+                    for k_pos in 0..=q_pos {
+                        let mut score = 0.0f32;
+                        for d in 0..head_dim {
+                            let q = qkv[q_pos * 3 * n_embd + h * head_dim + d];
+                            let k = qkv[k_pos * 3 * n_embd + n_embd + h * head_dim + d];
+                            score += q * k;
+                        }
+                        scores[k_pos] = score * scale;
+                    }
+                    softmax_in_place(&mut scores);
+
+                    for k_pos in 0..=q_pos {
+                        let prob = scores[k_pos];
+                        for d in 0..head_dim {
+                            let v = qkv[k_pos * 3 * n_embd + 2 * n_embd + h * head_dim + d];
+                            head_out[q_pos * head_dim + d] += prob * v;
+                        }
+                    }
+                }
+                head_outputs.push((h, head_out));
+            }
+            head_outputs
+        });
+
+        for (h, head_out) in heads.into_iter().flatten() {
+            for q_pos in 0..seq_len {
+                let src = row(&head_out, q_pos, head_dim);
+                let dst_start = q_pos * n_embd + h * head_dim;
+                out[dst_start..dst_start + head_dim].copy_from_slice(src);
+            }
+        }
+        return out;
+    }
 
     for h in 0..n_head {
         for q_pos in 0..seq_len {
@@ -1181,30 +1401,72 @@ fn causal_self_attention(qkv: &[f32], seq_len: usize, n_head: usize, head_dim: u
     out
 }
 
-fn cached_self_attention(
+fn cached_self_attention_into(
     qkv: &[f32],
     pos: usize,
     cache: &mut Gpt2LayerKvCache,
     n_head: usize,
     head_dim: usize,
-) -> Vec<f32> {
+    pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
+    out: &mut Vec<f32>,
+) {
     let n_embd = n_head * head_dim;
-    let mut out = vec![0.0f32; n_embd];
+    out.clear();
+    out.resize(n_embd, 0.0);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     for h in 0..n_head {
         for d in 0..head_dim {
-            let idx = kv_index(pos, h, d, n_head, head_dim);
+            let idx = kv_index(pos, h, d, cache.max_seq_len, head_dim);
             cache.keys[idx] = qkv[n_embd + h * head_dim + d];
             cache.values[idx] = qkv[2 * n_embd + h * head_dim + d];
         }
+    }
 
+    let work_items = (pos + 1) * n_head * head_dim;
+    if pool.threads() > 1 && work_items >= rust_config.attention_head_parallel_threshold {
+        let heads = pool.scoped_parallel_chunks(n_head, 1, |start, end| {
+            let mut head_outputs = Vec::with_capacity(end - start);
+            for h in start..end {
+                let mut head_out = vec![0.0f32; head_dim];
+                let mut scores = vec![0.0f32; pos + 1];
+                for (k_pos, score) in scores.iter_mut().enumerate() {
+                    let mut sum = 0.0f32;
+                    for d in 0..head_dim {
+                        let q = qkv[h * head_dim + d];
+                        let k = cache.keys[kv_index(k_pos, h, d, cache.max_seq_len, head_dim)];
+                        sum += q * k;
+                    }
+                    *score = sum * scale;
+                }
+                softmax_in_place(&mut scores);
+
+                for (k_pos, prob) in scores.iter().copied().enumerate() {
+                    for d in 0..head_dim {
+                        let v = cache.values[kv_index(k_pos, h, d, cache.max_seq_len, head_dim)];
+                        head_out[d] += prob * v;
+                    }
+                }
+                head_outputs.push((h, head_out));
+            }
+            head_outputs
+        });
+
+        for (h, head_out) in heads.into_iter().flatten() {
+            let dst_start = h * head_dim;
+            out[dst_start..dst_start + head_dim].copy_from_slice(&head_out);
+        }
+        return;
+    }
+
+    for h in 0..n_head {
         let mut scores = vec![0.0f32; pos + 1];
         for (k_pos, score) in scores.iter_mut().enumerate() {
             let mut sum = 0.0f32;
             for d in 0..head_dim {
                 let q = qkv[h * head_dim + d];
-                let k = cache.keys[kv_index(k_pos, h, d, n_head, head_dim)];
+                let k = cache.keys[kv_index(k_pos, h, d, cache.max_seq_len, head_dim)];
                 sum += q * k;
             }
             *score = sum * scale;
@@ -1213,48 +1475,72 @@ fn cached_self_attention(
 
         for (k_pos, prob) in scores.iter().copied().enumerate() {
             for d in 0..head_dim {
-                let v = cache.values[kv_index(k_pos, h, d, n_head, head_dim)];
+                let v = cache.values[kv_index(k_pos, h, d, cache.max_seq_len, head_dim)];
                 out[h * head_dim + d] += prob * v;
             }
         }
     }
-
-    out
 }
 
 fn logits_from_hidden(
     hidden: &[f32],
     vocab_size: usize,
     n_embd: usize,
-    weights: Arc<Gpt2Weights>,
+    weights: &Gpt2Weights,
     pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
 ) -> Vec<f32> {
-    if pool.threads() == 1 {
-        let mut logits = vec![0.0f32; vocab_size];
-        for (token, logit) in logits.iter_mut().enumerate() {
-            *logit = dot(hidden, row(&weights.wte, token, n_embd));
-        }
-        return logits;
-    }
-
-    let hidden = Arc::<[f32]>::from(hidden.to_vec());
-    let chunks = pool.parallel_chunks(vocab_size, 256, move |start, end| {
-        let mut values = Vec::with_capacity(end - start);
-        for token in start..end {
-            values.push(dot(&hidden, row(&weights.wte, token, n_embd)));
-        }
-        values
-    });
-
-    let mut logits = Vec::with_capacity(vocab_size);
-    for mut chunk in chunks {
-        logits.append(&mut chunk);
-    }
+    let mut logits = Vec::new();
+    logits_from_hidden_into(
+        hidden,
+        vocab_size,
+        n_embd,
+        weights,
+        pool,
+        rust_config,
+        &mut logits,
+    );
     logits
 }
 
-fn kv_index(pos: usize, head: usize, dim: usize, n_head: usize, head_dim: usize) -> usize {
-    (pos * n_head + head) * head_dim + dim
+fn logits_from_hidden_into(
+    hidden: &[f32],
+    vocab_size: usize,
+    n_embd: usize,
+    weights: &Gpt2Weights,
+    pool: &ThreadPool,
+    rust_config: &Gpt2RustConfig,
+    logits: &mut Vec<f32>,
+) {
+    if pool.threads() == 1 {
+        logits.clear();
+        logits.resize(vocab_size, 0.0);
+        for (token, logit) in logits.iter_mut().enumerate() {
+            *logit = dot(hidden, row(&weights.wte, token, n_embd));
+        }
+        return;
+    }
+
+    let chunks =
+        pool.scoped_parallel_chunks(vocab_size, rust_config.logits_chunk_size, |start, end| {
+            let mut values = Vec::with_capacity(end - start);
+            for token in start..end {
+                values.push(dot(&hidden, row(&weights.wte, token, n_embd)));
+            }
+            values
+        });
+
+    logits.clear();
+    logits.reserve(vocab_size);
+    for mut chunk in chunks {
+        logits.append(&mut chunk);
+    }
+}
+
+fn kv_index(pos: usize, head: usize, dim: usize, max_seq_len: usize, head_dim: usize) -> usize {
+    // Per-head contiguous blocks make cached attention scan sequential key/value rows
+    // for one head at a time: [head][position][head_dim].
+    (head * max_seq_len + pos) * head_dim + dim
 }
 
 fn layer_norm_in_place(
@@ -1436,10 +1722,19 @@ mod tests {
         let single = Gpt2Model::new_with_rust_config(
             cfg.clone(),
             weights.clone(),
-            Gpt2RustConfig { threads: 1 },
+            Gpt2RustConfig {
+                threads: 1,
+                ..Gpt2RustConfig::default()
+            },
         )?;
-        let threaded =
-            Gpt2Model::new_with_rust_config(cfg, weights, Gpt2RustConfig { threads: 3 })?;
+        let threaded = Gpt2Model::new_with_rust_config(
+            cfg,
+            weights,
+            Gpt2RustConfig {
+                threads: 3,
+                ..Gpt2RustConfig::default()
+            },
+        )?;
 
         let single_tokens = single.generate_greedy_cached(&[0, 1], 3)?;
         let threaded_tokens = threaded.generate_greedy_cached(&[0, 1], 3)?;
@@ -1458,6 +1753,7 @@ mod tests {
             decode_time: Duration::from_millis(30),
             total_generation_time: Duration::from_millis(50),
             first_token_time: Some(Duration::from_millis(22)),
+            operation_profile: Gpt2OperationProfile::default(),
         };
 
         assert_eq!(stats.total_model_tokens(), 10);

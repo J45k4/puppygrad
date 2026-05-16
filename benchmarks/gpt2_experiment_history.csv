@@ -1,0 +1,7 @@
+slice,benchmark_date,prompt,backend,threads,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second
+borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,1,4,2,7,4.000,845.411,0.046,953.026,953.151,394.979,1348.005,7.345,10.127,8.160
+borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,1,8,2,7,8.000,845.411,0.066,816.288,816.426,805.475,1621.763,8.575,9.932,9.249
+borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,2,4,2,7,4.000,734.223,0.040,408.371,408.454,416.950,825.321,17.141,9.593,13.328
+borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,2,8,2,7,8.000,734.223,0.234,1108.429,1108.539,603.803,1712.232,6.315,13.249,8.760
+borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,706.198,0.128,557.565,557.673,165.203,722.769,12.555,24.213,15.219
+borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,706.198,0.129,804.786,804.876,549.357,1354.143,8.698,14.562,11.077
