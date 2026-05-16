@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
 
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -8,8 +10,9 @@ use crate::models::autoregressive::{self, AutoregressiveDecoder};
 use crate::models::safetensors::{
     parse_safetensors, read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError,
 };
+use crate::runtime::thread_pool::ThreadPool;
 
-use super::{Gpt2AssetPaths, Gpt2Error, Result};
+use super::{Gpt2AssetPaths, Gpt2BackendConfig, Gpt2Error, Gpt2RustConfig, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2Config {
@@ -112,6 +115,7 @@ pub struct Gpt2BlockWeights {
 pub struct Gpt2Model {
     pub config: Gpt2Config,
     pub weights: Gpt2Weights,
+    pub rust_config: Gpt2RustConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -258,12 +262,73 @@ pub struct Gpt2Runtime {
     pub tokenizer: Gpt2Tokenizer,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gpt2GenerationStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub tokenize_time: Duration,
+    pub prefill_time: Duration,
+    pub decode_time: Duration,
+    pub total_generation_time: Duration,
+    pub first_token_time: Option<Duration>,
+}
+
+impl Gpt2GenerationStats {
+    pub fn total_model_tokens(&self) -> usize {
+        self.prompt_tokens + self.generated_tokens
+    }
+
+    pub fn prefill_tokens_per_second(&self) -> f64 {
+        let seconds = self.prefill_time.as_secs_f64();
+        if seconds == 0.0 {
+            return 0.0;
+        }
+        self.prompt_tokens as f64 / seconds
+    }
+
+    pub fn decode_tokens_per_second(&self) -> f64 {
+        let seconds = self.decode_time.as_secs_f64();
+        if seconds == 0.0 {
+            return 0.0;
+        }
+        self.generated_tokens as f64 / seconds
+    }
+
+    pub fn total_tokens_per_second(&self) -> f64 {
+        let seconds = self.total_generation_time.as_secs_f64();
+        if seconds == 0.0 {
+            return 0.0;
+        }
+        self.total_model_tokens() as f64 / seconds
+    }
+
+    pub fn average_decode_token_time(&self) -> Option<Duration> {
+        if self.generated_tokens == 0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            self.decode_time.as_secs_f64() / self.generated_tokens as f64,
+        ))
+    }
+}
+
 impl Gpt2Runtime {
     pub fn from_dir(model_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::from_dir_with_backend(model_dir, Gpt2BackendConfig::rust(1)?)
+    }
+
+    pub fn from_dir_with_backend(
+        model_dir: impl AsRef<Path>,
+        backend: Gpt2BackendConfig,
+    ) -> Result<Self> {
         let paths = Gpt2AssetPaths::new(model_dir.as_ref());
         let config = load_config(&paths.config)?;
         let weights = load_weights(&paths.weights, &config)?;
-        let model = Gpt2Model::new(config, weights)?;
+        let model = match backend {
+            Gpt2BackendConfig::Rust(rust_config) => {
+                Gpt2Model::new_with_rust_config(config, weights, rust_config)?
+            }
+        };
         let tokenizer = Gpt2Tokenizer::from_file(&paths.tokenizer)?;
         Ok(Self { model, tokenizer })
     }
@@ -307,6 +372,74 @@ impl Gpt2Runtime {
             })?;
 
         Ok(decoded)
+    }
+
+    pub fn stream_greedy_text_with_stats<F, E>(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        mut on_text: F,
+    ) -> std::result::Result<(String, Gpt2GenerationStats), E>
+    where
+        F: FnMut(&str) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
+        let tokenize_start = Instant::now();
+        let input_ids = self.tokenizer.encode(prompt)?;
+        let tokenize_time = tokenize_start.elapsed();
+
+        let mut output_ids = input_ids.clone();
+        let mut decoded = self.tokenizer.decode(&output_ids)?;
+        on_text(&decoded)?;
+
+        let mut cache = self.model.new_kv_cache()?;
+        let first_token_start = Instant::now();
+        let prefill_start = Instant::now();
+        let mut logits = self.model.prefill(&input_ids, &mut cache)?;
+        let prefill_time = prefill_start.elapsed();
+
+        let decode_start = Instant::now();
+        let mut first_token_time = None;
+        let mut generated_tokens = 0;
+
+        for _ in 0..max_new_tokens {
+            if output_ids.len() >= self.model.config.n_positions {
+                break;
+            }
+
+            let token_id = argmax(&logits);
+            output_ids.push(token_id);
+            let next_decoded = self.tokenizer.decode(&output_ids)?;
+            if let Some(delta) = next_decoded.strip_prefix(&decoded) {
+                on_text(delta)?;
+            } else {
+                let token_text = self.tokenizer.decode(&[token_id])?;
+                on_text(&token_text)?;
+            }
+            decoded = next_decoded;
+            generated_tokens += 1;
+            if first_token_time.is_none() {
+                first_token_time = Some(first_token_start.elapsed());
+            }
+            let needs_next_logits = generated_tokens < max_new_tokens
+                && output_ids.len() < self.model.config.n_positions;
+            if needs_next_logits {
+                logits = self.model.forward_one(token_id, &mut cache)?;
+            }
+        }
+
+        let decode_time = decode_start.elapsed();
+        let stats = Gpt2GenerationStats {
+            prompt_tokens: input_ids.len(),
+            generated_tokens,
+            tokenize_time,
+            prefill_time,
+            decode_time,
+            total_generation_time: prefill_time + decode_time,
+            first_token_time,
+        };
+
+        Ok((decoded, stats))
     }
 }
 
@@ -434,9 +567,26 @@ fn gpt2_tensor_error(err: SafeTensorLoadError) -> Gpt2Error {
 
 impl Gpt2Model {
     pub fn new(config: Gpt2Config, weights: Gpt2Weights) -> Result<Self> {
+        Self::new_with_rust_config(config, weights, Gpt2RustConfig::default())
+    }
+
+    pub fn new_with_rust_config(
+        config: Gpt2Config,
+        weights: Gpt2Weights,
+        rust_config: Gpt2RustConfig,
+    ) -> Result<Self> {
         config.validate()?;
+        rust_config.validate()?;
         validate_weights(&config, &weights)?;
-        Ok(Self { config, weights })
+        Ok(Self {
+            config,
+            weights,
+            rust_config,
+        })
+    }
+
+    fn thread_pool(&self) -> ThreadPool {
+        ThreadPool::new(self.rust_config.threads)
     }
 
     pub fn forward(&self, input_ids: &[usize]) -> Result<Gpt2Output> {
@@ -470,12 +620,17 @@ impl Gpt2Model {
         );
 
         let mut logits = vec![0.0f32; t * cfg.vocab_size];
+        let pool = self.thread_pool();
         for pos in 0..t {
             let hidden = row(&x, pos, c);
             let out = row_mut(&mut logits, pos, cfg.vocab_size);
-            for (token, logit) in out.iter_mut().enumerate().take(cfg.vocab_size) {
-                *logit = dot(hidden, row(&self.weights.wte, token, c));
-            }
+            out.copy_from_slice(&logits_from_hidden(
+                hidden,
+                &self.weights.wte,
+                cfg.vocab_size,
+                c,
+                &pool,
+            ));
         }
 
         Ok(Gpt2Output {
@@ -558,7 +713,13 @@ impl Gpt2Model {
             cfg.layer_norm_epsilon,
         );
         cache.seq_len += 1;
-        Ok(logits_from_hidden(&x, &self.weights.wte, cfg.vocab_size, c))
+        Ok(logits_from_hidden(
+            &x,
+            &self.weights.wte,
+            cfg.vocab_size,
+            c,
+            &self.thread_pool(),
+        ))
     }
 
     pub fn generate_greedy_cached(
@@ -902,10 +1063,27 @@ fn logits_from_hidden(
     token_embeddings: &[f32],
     vocab_size: usize,
     n_embd: usize,
+    pool: &ThreadPool,
 ) -> Vec<f32> {
-    let mut logits = vec![0.0f32; vocab_size];
-    for (token, logit) in logits.iter_mut().enumerate() {
-        *logit = dot(hidden, row(token_embeddings, token, n_embd));
+    if pool.threads() == 1 {
+        let mut logits = vec![0.0f32; vocab_size];
+        for (token, logit) in logits.iter_mut().enumerate() {
+            *logit = dot(hidden, row(token_embeddings, token, n_embd));
+        }
+        return logits;
+    }
+
+    let chunks = pool.parallel_chunks(vocab_size, 256, |start, end| {
+        let mut values = Vec::with_capacity(end - start);
+        for token in start..end {
+            values.push(dot(hidden, row(token_embeddings, token, n_embd)));
+        }
+        values
+    });
+
+    let mut logits = Vec::with_capacity(vocab_size);
+    for mut chunk in chunks {
+        logits.append(&mut chunk);
     }
     logits
 }
@@ -1084,6 +1262,47 @@ mod tests {
 
         assert_eq!(generic, direct);
         Ok(())
+    }
+
+    #[test]
+    fn threaded_rust_generation_matches_single_threaded() -> Result<()> {
+        let cfg = tiny_config();
+        let weights = tiny_weights(&cfg);
+        let single = Gpt2Model::new_with_rust_config(
+            cfg.clone(),
+            weights.clone(),
+            Gpt2RustConfig { threads: 1 },
+        )?;
+        let threaded =
+            Gpt2Model::new_with_rust_config(cfg, weights, Gpt2RustConfig { threads: 3 })?;
+
+        let single_tokens = single.generate_greedy_cached(&[0, 1], 3)?;
+        let threaded_tokens = threaded.generate_greedy_cached(&[0, 1], 3)?;
+
+        assert_eq!(threaded_tokens, single_tokens);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_stats_report_token_rates() {
+        let stats = Gpt2GenerationStats {
+            prompt_tokens: 4,
+            generated_tokens: 6,
+            tokenize_time: Duration::from_millis(5),
+            prefill_time: Duration::from_millis(20),
+            decode_time: Duration::from_millis(30),
+            total_generation_time: Duration::from_millis(50),
+            first_token_time: Some(Duration::from_millis(22)),
+        };
+
+        assert_eq!(stats.total_model_tokens(), 10);
+        assert_eq!(stats.prefill_tokens_per_second(), 200.0);
+        assert_eq!(stats.decode_tokens_per_second(), 200.0);
+        assert_eq!(stats.total_tokens_per_second(), 200.0);
+        assert_eq!(
+            stats.average_decode_token_time(),
+            Some(Duration::from_millis(5))
+        );
     }
 
     fn tiny_config() -> Gpt2Config {

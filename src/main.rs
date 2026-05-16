@@ -1,11 +1,13 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use puppygrad::engine::Tensor;
 use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
-    Gpt2Runtime,
+    Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime,
 };
+use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -43,6 +45,18 @@ enum Command {
         /// Max new tokens to generate.
         #[arg(long, default_value_t = 32)]
         max_new_tokens: usize,
+
+        /// Execution backend.
+        #[arg(long, value_enum, default_value_t = Gpt2BackendArg::Rust)]
+        backend: Gpt2BackendArg,
+
+        /// Number of worker threads for CPU-style backends.
+        #[arg(long, default_value_t = 1)]
+        threads: usize,
+
+        /// Print generation timing and token throughput to stderr.
+        #[arg(long)]
+        stats: bool,
     },
 
     /// Placeholder for the future in-house Qwen runtime.
@@ -104,6 +118,12 @@ enum Command {
         instruct: bool,
     },
 
+    /// Run reproducible performance sweeps.
+    Experiment {
+        #[command(subcommand)]
+        cmd: ExperimentCommand,
+    },
+
     /// Train y = 2x + 3 with scalar parameters using the in-house autograd engine.
     DemoLinear {
         /// Number of SGD steps.
@@ -123,6 +143,52 @@ enum Command {
     MatmulCheck,
 }
 
+#[derive(Subcommand, Debug)]
+enum ExperimentCommand {
+    /// Sweep GPT-2 runtime settings and print timing rows.
+    Gpt2 {
+        /// Local directory containing config.json, tokenizer.json, and model.safetensors.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long, default_value = "gpt2")]
+        model_id: String,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Prompt text.
+        #[arg(long)]
+        prompt: String,
+
+        /// Comma-separated worker-thread counts, for example 1,2,4,8.
+        #[arg(long, default_value = "1")]
+        threads: String,
+
+        /// Comma-separated max-new-token counts, for example 8,16,32.
+        #[arg(long, default_value = "32")]
+        max_new_tokens: String,
+
+        /// Measured runs per setting.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+
+        /// Warmup runs per setting, excluded from output.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ExperimentFormatArg::Table)]
+        format: ExperimentFormatArg,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -133,6 +199,9 @@ fn main() -> Result<()> {
             download,
             prompt,
             max_new_tokens,
+            backend,
+            threads,
+            stats,
         } => run_gpt2(RunGpt2Args {
             model_dir,
             model_id,
@@ -140,6 +209,9 @@ fn main() -> Result<()> {
             download,
             prompt,
             max_new_tokens,
+            backend,
+            threads,
+            stats,
         }),
         Command::Qwen {
             model_dir,
@@ -172,6 +244,31 @@ fn main() -> Result<()> {
             dtype,
             instruct,
         }),
+        Command::Experiment { cmd } => match cmd {
+            ExperimentCommand::Gpt2 {
+                model_dir,
+                model_id,
+                revision,
+                download,
+                prompt,
+                threads,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                format,
+            } => run_gpt2_experiment(RunGpt2ExperimentArgs {
+                model_dir,
+                model_id,
+                revision,
+                download,
+                prompt,
+                threads,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                format,
+            }),
+        },
         Command::DemoLinear {
             steps,
             lr,
@@ -181,6 +278,18 @@ fn main() -> Result<()> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Gpt2BackendArg {
+    Rust,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ExperimentFormatArg {
+    Table,
+    Csv,
+    Json,
+}
+
 struct RunGpt2Args {
     model_dir: Option<PathBuf>,
     model_id: String,
@@ -188,6 +297,22 @@ struct RunGpt2Args {
     download: bool,
     prompt: String,
     max_new_tokens: usize,
+    backend: Gpt2BackendArg,
+    threads: usize,
+    stats: bool,
+}
+
+struct RunGpt2ExperimentArgs {
+    model_dir: Option<PathBuf>,
+    model_id: String,
+    revision: String,
+    download: bool,
+    prompt: String,
+    threads: String,
+    max_new_tokens: String,
+    runs: usize,
+    warmup_runs: usize,
+    format: ExperimentFormatArg,
 }
 
 struct RunQwenArgs {
@@ -208,7 +333,138 @@ struct RunQwenArgs {
 }
 
 fn run_gpt2(args: RunGpt2Args) -> Result<()> {
+    let generation = Gpt2GenerationConfig::new(args.max_new_tokens);
+    generation.validate()?;
+    let backend = match args.backend {
+        Gpt2BackendArg::Rust => Gpt2BackendConfig::rust(args.threads)?,
+    };
+
     let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
+    if args.download {
+        let download_start = Instant::now();
+        eprintln!(
+            "downloading missing GPT-2 assets into {}",
+            model_dir.display()
+        );
+        if args.model_id == "gpt2" && args.revision == "main" {
+            download_gpt2_small_assets(&model_dir)?;
+        } else {
+            download_huggingface_gpt2_assets(&args.model_id, &args.revision, &model_dir)?;
+        }
+        if args.stats {
+            eprintln!(
+                "download/check time: {}",
+                format_duration(download_start.elapsed())
+            );
+        }
+    }
+
+    eprintln!("backend: {}", backend.describe());
+    eprintln!("loading GPT-2 from {}", model_dir.display());
+    let load_start = Instant::now();
+    let runtime = Gpt2Runtime::from_dir_with_backend(&model_dir, backend)?;
+    let load_time = load_start.elapsed();
+    let mut stdout = std::io::stdout().lock();
+    let (_, generation_stats) =
+        runtime.stream_greedy_text_with_stats(&args.prompt, generation.max_new_tokens, |text| {
+            write!(stdout, "{text}")?;
+            stdout.flush()?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })?;
+    writeln!(stdout)?;
+    stdout.flush()?;
+    if args.stats {
+        print_gpt2_stats(load_time, &generation_stats);
+    } else {
+        print_gpt2_speed(&generation_stats);
+    }
+    Ok(())
+}
+
+fn print_gpt2_speed(stats: &Gpt2GenerationStats) {
+    eprintln!(
+        "\ntokens/sec: {:.2} tok/s ({} generated tokens)",
+        stats.decode_tokens_per_second(),
+        stats.generated_tokens
+    );
+}
+
+fn print_gpt2_stats(load_time: Duration, stats: &Gpt2GenerationStats) {
+    eprintln!("stats:");
+    eprintln!("  load: {}", format_duration(load_time));
+    eprintln!("  tokenize: {}", format_duration(stats.tokenize_time));
+    eprintln!(
+        "  prefill: {} ({} prompt tokens, {:.2} tok/s)",
+        format_duration(stats.prefill_time),
+        stats.prompt_tokens,
+        stats.prefill_tokens_per_second()
+    );
+    if let Some(first_token_time) = stats.first_token_time {
+        eprintln!(
+            "  time to first token: {}",
+            format_duration(first_token_time)
+        );
+    }
+    eprintln!(
+        "  decode: {} ({} generated tokens, {:.2} tok/s)",
+        format_duration(stats.decode_time),
+        stats.generated_tokens,
+        stats.decode_tokens_per_second()
+    );
+    if let Some(avg_decode_token_time) = stats.average_decode_token_time() {
+        eprintln!(
+            "  avg decode token: {}",
+            format_duration(avg_decode_token_time)
+        );
+    }
+    eprintln!(
+        "  generation total: {} ({} model tokens, {:.2} tok/s)",
+        format_duration(stats.total_generation_time),
+        stats.total_model_tokens(),
+        stats.total_tokens_per_second()
+    );
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs_f64();
+    if seconds >= 1.0 {
+        return format!("{seconds:.3}s");
+    }
+    let milliseconds = seconds * 1_000.0;
+    if milliseconds >= 1.0 {
+        return format!("{milliseconds:.2}ms");
+    }
+    let microseconds = seconds * 1_000_000.0;
+    format!("{microseconds:.2}us")
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct Gpt2ExperimentRow {
+    backend: String,
+    threads: usize,
+    max_new_tokens: usize,
+    runs: usize,
+    prompt_tokens: usize,
+    generated_tokens: f64,
+    load_ms: f64,
+    tokenize_ms: f64,
+    prefill_ms: f64,
+    time_to_first_token_ms: Option<f64>,
+    decode_ms: f64,
+    total_generation_ms: f64,
+    prefill_tokens_per_second: f64,
+    decode_tokens_per_second: f64,
+    total_tokens_per_second: f64,
+}
+
+fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
+    if args.runs == 0 {
+        return Err("experiment --runs must be > 0".into());
+    }
+    let thread_counts = parse_usize_list("threads", &args.threads)?;
+    let token_counts = parse_usize_list("max-new-tokens", &args.max_new_tokens)?;
+    let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
+
     if args.download {
         eprintln!(
             "downloading missing GPT-2 assets into {}",
@@ -221,16 +477,220 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
         }
     }
 
-    eprintln!("loading GPT-2 from {}", model_dir.display());
-    let runtime = Gpt2Runtime::from_dir(&model_dir)?;
-    let mut stdout = std::io::stdout().lock();
-    runtime.stream_greedy_text(&args.prompt, args.max_new_tokens, |text| {
-        write!(stdout, "{text}")?;
-        stdout.flush()?;
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })?;
-    writeln!(stdout)?;
+    let mut rows = Vec::new();
+    for threads in thread_counts {
+        let backend = Gpt2BackendConfig::rust(threads)?;
+        eprintln!(
+            "loading GPT-2 from {} with {}",
+            model_dir.display(),
+            backend.describe()
+        );
+        let load_start = Instant::now();
+        let runtime = Gpt2Runtime::from_dir_with_backend(&model_dir, backend)?;
+        let load_time = load_start.elapsed();
+
+        for max_new_tokens in token_counts.iter().copied() {
+            let generation = Gpt2GenerationConfig::new(max_new_tokens);
+            generation.validate()?;
+
+            for _ in 0..args.warmup_runs {
+                let _ = runtime.stream_greedy_text_with_stats(
+                    &args.prompt,
+                    generation.max_new_tokens,
+                    |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                )?;
+            }
+
+            let mut stats = Vec::with_capacity(args.runs);
+            for _ in 0..args.runs {
+                let (_, run_stats) = runtime.stream_greedy_text_with_stats(
+                    &args.prompt,
+                    generation.max_new_tokens,
+                    |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                )?;
+                stats.push(run_stats);
+            }
+
+            rows.push(average_gpt2_experiment_row(
+                "rust",
+                threads,
+                max_new_tokens,
+                args.runs,
+                load_time,
+                &stats,
+            ));
+        }
+    }
+
+    match args.format {
+        ExperimentFormatArg::Table => print_gpt2_experiment_table(&rows),
+        ExperimentFormatArg::Csv => print_gpt2_experiment_csv(&rows),
+        ExperimentFormatArg::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+    }
+
     Ok(())
+}
+
+fn average_gpt2_experiment_row(
+    backend: &str,
+    threads: usize,
+    max_new_tokens: usize,
+    runs: usize,
+    load_time: Duration,
+    stats: &[Gpt2GenerationStats],
+) -> Gpt2ExperimentRow {
+    let runs_f64 = runs as f64;
+    let prompt_tokens = stats.first().map_or(0, |stats| stats.prompt_tokens);
+    let generated_tokens = stats
+        .iter()
+        .map(|stats| stats.generated_tokens as f64)
+        .sum::<f64>()
+        / runs_f64;
+    let tokenize_time = average_duration(stats.iter().map(|stats| stats.tokenize_time));
+    let prefill_time = average_duration(stats.iter().map(|stats| stats.prefill_time));
+    let decode_time = average_duration(stats.iter().map(|stats| stats.decode_time));
+    let total_generation_time =
+        average_duration(stats.iter().map(|stats| stats.total_generation_time));
+    let first_token_times: Vec<Duration> = stats
+        .iter()
+        .filter_map(|stats| stats.first_token_time)
+        .collect();
+    let first_token_time = if first_token_times.is_empty() {
+        None
+    } else {
+        Some(average_duration(first_token_times))
+    };
+
+    Gpt2ExperimentRow {
+        backend: backend.to_string(),
+        threads,
+        max_new_tokens,
+        runs,
+        prompt_tokens,
+        generated_tokens,
+        load_ms: duration_ms(load_time),
+        tokenize_ms: duration_ms(tokenize_time),
+        prefill_ms: duration_ms(prefill_time),
+        time_to_first_token_ms: first_token_time.map(duration_ms),
+        decode_ms: duration_ms(decode_time),
+        total_generation_ms: duration_ms(total_generation_time),
+        prefill_tokens_per_second: rate(prompt_tokens as f64, prefill_time),
+        decode_tokens_per_second: rate(generated_tokens, decode_time),
+        total_tokens_per_second: rate(
+            prompt_tokens as f64 + generated_tokens,
+            total_generation_time,
+        ),
+    }
+}
+
+fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
+    println!(
+        "{:<7} {:>7} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "backend",
+        "threads",
+        "new_tok",
+        "runs",
+        "prompt",
+        "gen",
+        "load_ms",
+        "prefill",
+        "decode",
+        "tok/s",
+        "total/s"
+    );
+    for row in rows {
+        println!(
+            "{:<7} {:>7} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
+            row.backend,
+            row.threads,
+            row.max_new_tokens,
+            row.runs,
+            row.prompt_tokens,
+            row.generated_tokens,
+            row.load_ms,
+            row.prefill_ms,
+            row.decode_ms,
+            row.decode_tokens_per_second,
+            row.total_tokens_per_second
+        );
+    }
+}
+
+fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
+    println!(
+        "backend,threads,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second"
+    );
+    for row in rows {
+        let first_token = row
+            .time_to_first_token_ms
+            .map(|time| format!("{time:.3}"))
+            .unwrap_or_default();
+        println!(
+            "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            row.backend,
+            row.threads,
+            row.max_new_tokens,
+            row.runs,
+            row.prompt_tokens,
+            row.generated_tokens,
+            row.load_ms,
+            row.tokenize_ms,
+            row.prefill_ms,
+            first_token,
+            row.decode_ms,
+            row.total_generation_ms,
+            row.prefill_tokens_per_second,
+            row.decode_tokens_per_second,
+            row.total_tokens_per_second
+        );
+    }
+}
+
+fn parse_usize_list(name: &str, values: &str) -> Result<Vec<usize>> {
+    let parsed: std::result::Result<Vec<_>, _> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<usize>)
+        .collect();
+    let parsed = parsed.map_err(|err| format!("invalid --{name} list: {err}"))?;
+    if parsed.is_empty() {
+        return Err(format!("--{name} must contain at least one value").into());
+    }
+    if parsed.contains(&0) {
+        return Err(format!("--{name} values must be > 0").into());
+    }
+    Ok(parsed)
+}
+
+fn average_duration<I>(durations: I) -> Duration
+where
+    I: IntoIterator<Item = Duration>,
+{
+    let mut count = 0usize;
+    let total_seconds = durations
+        .into_iter()
+        .map(|duration| {
+            count += 1;
+            duration.as_secs_f64()
+        })
+        .sum::<f64>();
+    if count == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(total_seconds / count as f64)
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn rate(tokens: f64, duration: Duration) -> f64 {
+    let seconds = duration.as_secs_f64();
+    if seconds == 0.0 {
+        return 0.0;
+    }
+    tokens / seconds
 }
 
 fn run_qwen(args: RunQwenArgs) -> Result<()> {

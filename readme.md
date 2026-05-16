@@ -28,6 +28,9 @@ First run downloads GPT-2 small assets into `models/gpt2`:
 ```bash
 ./target/release/puppygrad gpt2 \
   --download \
+  --backend rust \
+  --threads 4 \
+  --stats \
   --prompt "Hello, my name is" \
   --max-new-tokens 20
 ```
@@ -36,6 +39,9 @@ After assets are downloaded, `--download` is optional:
 
 ```bash
 ./target/release/puppygrad gpt2 \
+  --backend rust \
+  --threads 4 \
+  --stats \
   --prompt "The future of GPU compilers is" \
   --max-new-tokens 20
 ```
@@ -47,11 +53,30 @@ Use a different GPT-2-family checkpoint by giving both a model id and local dire
   --download \
   --model-id gpt2-medium \
   --model-dir models/gpt2-medium \
+  --backend rust \
+  --threads 4 \
   --prompt "Rust makes systems programming" \
   --max-new-tokens 20
 ```
 
-The GPT-2 runtime is intentionally simple: CPU `f32`, greedy token selection, no sampling yet, and no GPU kernels yet.
+The GPT-2 runtime is intentionally simple: CPU `f32`, greedy token selection, no sampling yet, and no GPU kernels yet. The only backend today is `rust`; `--threads` controls puppygrad's own thread pool, currently used by the final vocab logits projection. GPT-2 runs print generated-token throughput to stderr after generation.
+
+Pass `--stats` to print the full performance breakdown to stderr while streamed text stays on stdout. The current GPT-2 stats include model load time, tokenization time, prefill time, time to first token, decode time, average decode-token latency, and token/sec rates for prefill, decode, and total model tokens.
+
+### Run GPT-2 experiments
+
+Sweep backend settings and print averaged performance rows:
+
+```bash
+./target/release/puppygrad experiment gpt2 \
+  --threads 1,2,4,8 \
+  --max-new-tokens 16,32,64 \
+  --runs 5 \
+  --warmup-runs 1 \
+  --prompt "The future of GPU compilers is"
+```
+
+Use `--format csv` or `--format json` when you want to plot results or compare runs outside the terminal.
 
 ## Qwen Runtime Placeholder
 
