@@ -315,6 +315,39 @@ impl Gpt2Runtime {
             .generate_greedy_cached(&input_ids, max_new_tokens)?;
         self.tokenizer.decode(&output_ids)
     }
+
+    pub fn stream_greedy_text<F, E>(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        mut on_text: F,
+    ) -> std::result::Result<String, E>
+    where
+        F: FnMut(&str) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
+        let input_ids = self.tokenizer.encode(prompt)?;
+        let mut output_ids = input_ids.clone();
+        let mut decoded = self.tokenizer.decode(&output_ids)?;
+
+        on_text(&decoded)?;
+
+        self.model
+            .stream_greedy_tokens::<_, E>(&input_ids, max_new_tokens, |token_id| {
+                output_ids.push(token_id);
+                let next_decoded = self.tokenizer.decode(&output_ids)?;
+                if let Some(delta) = next_decoded.strip_prefix(&decoded) {
+                    on_text(delta)?;
+                } else {
+                    let token_text = self.tokenizer.decode(&[token_id])?;
+                    on_text(&token_text)?;
+                }
+                decoded = next_decoded;
+                Ok(())
+            })?;
+
+        Ok(decoded)
+    }
 }
 
 pub fn default_gpt2_small_dir() -> PathBuf {
@@ -652,6 +685,19 @@ impl Gpt2Model {
         input_ids: &[usize],
         max_new_tokens: usize,
     ) -> Result<Vec<usize>> {
+        self.stream_greedy_tokens(input_ids, max_new_tokens, |_| Ok::<(), Gpt2Error>(()))
+    }
+
+    pub fn stream_greedy_tokens<F, E>(
+        &self,
+        input_ids: &[usize],
+        max_new_tokens: usize,
+        mut on_token: F,
+    ) -> std::result::Result<Vec<usize>, E>
+    where
+        F: FnMut(usize) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
         self.validate_input(input_ids)?;
         let mut cache = self.new_kv_cache()?;
         let mut logits = self.prefill(input_ids, &mut cache)?;
@@ -663,6 +709,7 @@ impl Gpt2Model {
             }
             let next = argmax(&logits);
             tokens.push(next);
+            on_token(next)?;
             logits = self.forward_one(next, &mut cache)?;
         }
 
@@ -1116,6 +1163,22 @@ mod tests {
         let cached = model.generate_greedy_cached(&[0, 1], 3)?;
 
         assert_eq!(cached, full);
+        Ok(())
+    }
+
+    #[test]
+    fn streams_generated_tokens_in_order() -> Result<()> {
+        let cfg = tiny_config();
+        let model = Gpt2Model::new(cfg.clone(), tiny_weights(&cfg))?;
+        let mut streamed = Vec::new();
+
+        let tokens = model.stream_greedy_tokens(&[0, 1], 3, |token_id| {
+            streamed.push(token_id);
+            Ok::<(), Gpt2Error>(())
+        })?;
+
+        assert_eq!(&tokens[..2], &[0, 1]);
+        assert_eq!(streamed, tokens[2..]);
         Ok(())
     }
 

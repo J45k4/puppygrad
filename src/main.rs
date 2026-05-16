@@ -4,6 +4,7 @@ use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2Runtime,
 };
+use std::io::Write;
 use std::path::PathBuf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -222,8 +223,13 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
 
     eprintln!("loading GPT-2 from {}", model_dir.display());
     let runtime = Gpt2Runtime::from_dir(&model_dir)?;
-    let output = runtime.generate_greedy_text(&args.prompt, args.max_new_tokens)?;
-    println!("{output}");
+    let mut stdout = std::io::stdout().lock();
+    runtime.stream_greedy_text(&args.prompt, args.max_new_tokens, |text| {
+        write!(stdout, "{text}")?;
+        stdout.flush()?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })?;
+    writeln!(stdout)?;
     Ok(())
 }
 
