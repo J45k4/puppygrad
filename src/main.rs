@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use puppygrad::engine::Tensor;
 use puppygrad::models::autotune::{autotune, AutoTuneOptions, AutoTuneTarget};
+use puppygrad::models::generation::TextGenerationArgs;
 use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
@@ -44,33 +45,8 @@ enum Command {
         #[arg(long)]
         prompt: String,
 
-        /// Max new tokens to generate.
-        #[arg(long, default_value_t = 32)]
-        max_new_tokens: usize,
-
-        /// Temperature (0 => greedy).
-        #[arg(long, default_value_t = 0.0)]
-        temperature: f32,
-
-        /// Top-p nucleus sampling cutoff.
-        #[arg(long)]
-        top_p: Option<f32>,
-
-        /// Top-k sampling cutoff.
-        #[arg(long)]
-        top_k: Option<usize>,
-
-        /// RNG seed used when temperature is > 0.
-        #[arg(long, default_value_t = 299792458)]
-        seed: u64,
-
-        /// Repeat penalty (1.0 = disabled).
-        #[arg(long, default_value_t = 1.0)]
-        repeat_penalty: f32,
-
-        /// How many recent tokens are considered for repeat penalty.
-        #[arg(long, default_value_t = 128)]
-        repeat_last_n: usize,
+        #[command(flatten)]
+        generation: TextGenerationArgs,
 
         /// Token id that stops generation.
         #[arg(long)]
@@ -155,33 +131,8 @@ enum Command {
         #[arg(long)]
         prompt: String,
 
-        /// Max new tokens to generate
-        #[arg(long, default_value_t = 128)]
-        max_new_tokens: usize,
-
-        /// Temperature (<= 0 => greedy)
-        #[arg(long, default_value_t = 0.8)]
-        temperature: f64,
-
-        /// Top-p nucleus sampling (optional)
-        #[arg(long)]
-        top_p: Option<f64>,
-
-        /// Top-k sampling (optional)
-        #[arg(long)]
-        top_k: Option<usize>,
-
-        /// RNG seed
-        #[arg(long, default_value_t = 299792458)]
-        seed: u64,
-
-        /// Repeat penalty (1.0 = disabled)
-        #[arg(long, default_value_t = 1.1)]
-        repeat_penalty: f32,
-
-        /// How many last tokens are considered for repeat penalty
-        #[arg(long, default_value_t = 128)]
-        repeat_last_n: usize,
+        #[command(flatten)]
+        generation: TextGenerationArgs,
 
         /// Reserved dtype selector for the future native runtime.
         #[arg(long)]
@@ -404,13 +355,7 @@ fn main() -> Result<()> {
             revision,
             download,
             prompt,
-            max_new_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
-            repeat_penalty,
-            repeat_last_n,
+            generation,
             eos_token_id,
             no_eos_stop,
             backend,
@@ -432,13 +377,7 @@ fn main() -> Result<()> {
             revision,
             download,
             prompt,
-            max_new_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
-            repeat_penalty,
-            repeat_last_n,
+            generation,
             eos_token_id,
             no_eos_stop,
             backend,
@@ -463,13 +402,7 @@ fn main() -> Result<()> {
             revision,
             download,
             prompt,
-            max_new_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
-            repeat_penalty,
-            repeat_last_n,
+            generation,
             dtype,
             instruct,
         } => run_qwen(RunQwenArgs {
@@ -478,13 +411,7 @@ fn main() -> Result<()> {
             revision,
             download,
             prompt,
-            max_new_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
-            repeat_penalty,
-            repeat_last_n,
+            generation,
             dtype,
             instruct,
         }),
@@ -608,13 +535,7 @@ struct RunGpt2Args {
     revision: String,
     download: bool,
     prompt: String,
-    max_new_tokens: usize,
-    temperature: f32,
-    top_p: Option<f32>,
-    top_k: Option<usize>,
-    seed: u64,
-    repeat_penalty: f32,
-    repeat_last_n: usize,
+    generation: TextGenerationArgs,
     eos_token_id: Option<usize>,
     no_eos_stop: bool,
     backend: Gpt2BackendArg,
@@ -683,25 +604,13 @@ struct RunQwenArgs {
     revision: String,
     download: bool,
     prompt: String,
-    max_new_tokens: usize,
-    temperature: f64,
-    top_p: Option<f64>,
-    top_k: Option<usize>,
-    seed: u64,
-    repeat_penalty: f32,
-    repeat_last_n: usize,
+    generation: TextGenerationArgs,
     dtype: Option<String>,
     instruct: bool,
 }
 
 fn run_gpt2(args: RunGpt2Args) -> Result<()> {
-    let mut generation = Gpt2GenerationConfig::new(args.max_new_tokens);
-    generation.temperature = args.temperature;
-    generation.top_p = args.top_p;
-    generation.top_k = args.top_k;
-    generation.seed = args.seed;
-    generation.repeat_penalty = args.repeat_penalty;
-    generation.repeat_last_n = args.repeat_last_n;
+    let mut generation = Gpt2GenerationConfig::from_args(&args.generation);
     if args.no_eos_stop {
         generation.eos_token_id = None;
     } else if let Some(eos_token_id) = args.eos_token_id {
@@ -1860,13 +1769,13 @@ fn run_qwen(args: RunQwenArgs) -> Result<()> {
     println!("prompt: {}", args.prompt);
     println!(
         "generation args: max_new_tokens={} temperature={} top_k={:?} top_p={:?} seed={} repeat_penalty={} repeat_last_n={} dtype={:?} instruct={} download={}",
-        args.max_new_tokens,
-        args.temperature,
-        args.top_k,
-        args.top_p,
-        args.seed,
-        args.repeat_penalty,
-        args.repeat_last_n,
+        args.generation.max_new_tokens,
+        args.generation.temperature,
+        args.generation.top_k,
+        args.generation.top_p,
+        args.generation.seed,
+        args.generation.repeat_penalty,
+        args.generation.repeat_last_n,
         args.dtype,
         args.instruct,
         args.download

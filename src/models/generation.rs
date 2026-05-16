@@ -1,5 +1,52 @@
+use clap::Args;
 use std::error;
 use std::fmt;
+
+#[derive(Clone, Debug, Args, PartialEq)]
+pub struct TextGenerationArgs {
+    /// Max new tokens to generate.
+    #[arg(long, default_value_t = 32)]
+    pub max_new_tokens: usize,
+
+    /// Temperature (0 => greedy).
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Top-p nucleus sampling cutoff.
+    #[arg(long)]
+    pub top_p: Option<f32>,
+
+    /// Top-k sampling cutoff.
+    #[arg(long)]
+    pub top_k: Option<usize>,
+
+    /// RNG seed used when temperature is > 0.
+    #[arg(long, default_value_t = 299792458)]
+    pub seed: u64,
+
+    /// Repeat penalty (1.0 = disabled).
+    #[arg(long, default_value_t = 1.0)]
+    pub repeat_penalty: f32,
+
+    /// How many recent tokens are considered for repeat penalty.
+    #[arg(long, default_value_t = 128)]
+    pub repeat_last_n: usize,
+}
+
+impl TextGenerationArgs {
+    pub fn to_config(&self) -> TextGenerationConfig {
+        TextGenerationConfig {
+            max_new_tokens: self.max_new_tokens,
+            eos_token_id: None,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            seed: self.seed,
+            repeat_penalty: self.repeat_penalty,
+            repeat_last_n: self.repeat_last_n,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextGenerationConfig {

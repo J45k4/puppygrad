@@ -1,20 +1,16 @@
 # Puppygrad TODO
 
-## GPT-2 Rust Backend Performance
+## Shared Model Runtime Extractions
 
-- [x] Persistent worker thread pool.
-- [x] Parallel dense projections for attention QKV, attention projection, MLP `c_fc`, MLP `c_proj`, and final vocab projection.
-- [x] Transposed dense weights at model construction for contiguous projection dot products.
-- [x] Avoid copying input activations into `Arc<[f32]>` for every parallel dense call by adding scoped worker jobs over borrowed activation buffers.
-- [x] Reuse scratch buffers during cached generation for layernorm outputs, QKV, attention output, MLP activations, projection outputs, and logits.
-- [x] Parallelize attention heads for full and cached attention when attention work is large enough.
-- [x] Improve cached attention memory layout with per-head contiguous key/value blocks.
-- [x] Decode streamed text more efficiently by decoding only the new token on the common safe path, with accumulated-token fallback for tokenizer edge cases.
-- [x] Add SIMD dot-product kernels with a portable scalar fallback, NEON on Apple Silicon/aarch64, and AVX on x86/x86_64.
-- [x] Tune dense chunk sizes per operation by making QKV, MLP expand, MLP project, attention project, and vocab projection chunk sizes separately configurable.
-- [x] Make parallel thresholds configurable and sweepable from `experiment gpt2`.
-- [x] Add benchmark statistics beyond averages: min, median, p95, max, and standard deviation.
-- [x] Add prompt-file experiment support with per-prompt and aggregate performance rows.
-- [x] Add operation-level profiling for layernorm, QKV projection, attention, MLP projections, final logits, tokenization, and decoding.
-- [x] Add an experimental row-wise int8 weight path while keeping the current f32 path as the correctness/reference backend.
-- [x] Draw a chart of benchmark improvements over time from `benchmarks/gpt2_experiment_history.csv`.
+- [x] Extract shared CLI generation arguments with `clap::Args`, including `max_new_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `repeat_penalty`, and `repeat_last_n`.
+- [ ] Add a generic token streaming module with a tokenizer/decoder trait and an incremental text streamer reusable by GPT-2, Qwen, Llama, and similar text models.
+- [ ] Extract generic generation stats for prompt tokens, generated tokens, tokenization time, prefill time, decode time, time to first token, and token/sec helpers.
+- [ ] Keep model-specific operation profiles separate for now, but make them attachable to generic generation stats.
+- [ ] Expand shared Hugging Face asset utilities for required-file checks, model directory resolution, cache path conventions, and download orchestration.
+- [ ] Add generic JSON config loading helpers for model config files.
+- [ ] Improve safetensors helpers with a tensor store API for required tensors, optional tensors, dtype checks, and shape validation.
+- [ ] Extract reusable CPU math kernels from GPT-2, including dot product, dense projection, transposed dense projection, row-wise quantized matvec, layernorm, GELU, softmax, and causal attention helpers where appropriate.
+- [ ] Introduce a minimal KV cache trait for shared cache concepts like `seq_len`, `max_seq_len`, and `clear`, without forcing a common memory layout yet.
+- [ ] Delay broader transformer block extraction until there is at least one second real model, so GPT-2 learned positions and Qwen/Llama RoPE do not get forced into the wrong abstraction.
+- [ ] Review whether `Gpt2RustConfig` can be split into generic CPU backend options and model/op-specific tuning options.
+- [ ] Move generic autoregressive generation examples and documentation out of GPT-2-specific docs.

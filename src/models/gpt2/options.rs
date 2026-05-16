@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-use crate::models::generation::TextGenerationConfig;
+use crate::models::generation::{TextGenerationArgs, TextGenerationConfig};
 
 use super::{Gpt2Error, Result};
 
@@ -122,6 +122,12 @@ impl Gpt2GenerationConfig {
         Self {
             common: TextGenerationConfig::new(max_new_tokens)
                 .with_eos_token_id(Some(GPT2_EOS_TOKEN_ID)),
+        }
+    }
+
+    pub fn from_args(args: &TextGenerationArgs) -> Self {
+        Self {
+            common: args.to_config().with_eos_token_id(Some(GPT2_EOS_TOKEN_ID)),
         }
     }
 
