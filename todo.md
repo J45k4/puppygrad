@@ -17,4 +17,4 @@
 - [x] Add prompt-file experiment support with per-prompt and aggregate performance rows.
 - [x] Add operation-level profiling for layernorm, QKV projection, attention, MLP projections, final logits, tokenization, and decoding.
 - [x] Add an experimental row-wise int8 weight path while keeping the current f32 path as the correctness/reference backend.
-- [ ] Draw a chart of benchmark improvements over time from `benchmarks/gpt2_experiment_history.csv`.
+- [x] Draw a chart of benchmark improvements over time from `benchmarks/gpt2_experiment_history.csv`.

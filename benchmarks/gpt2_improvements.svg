@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="500" viewBox="0 0 1100 500" role="img" aria-labelledby="title desc">
+  <title id="title">GPT-2 benchmark improvements over optimization slices</title>
+  <desc id="desc">Best total tokens per second from benchmarks/gpt2_experiment_history.csv for each optimization slice.</desc>
+  <rect width="1100" height="500" fill="#ffffff"/>
+  <text x="40" y="42" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#111827">GPT-2 benchmark improvements over time</text>
+  <text x="40" y="70" font-family="Arial, sans-serif" font-size="14" fill="#4b5563">Best total tokens/sec per recorded optimization slice. Higher is better.</text>
+
+  <line x1="300" y1="420" x2="980" y2="420" stroke="#d1d5db" stroke-width="1"/>
+  <line x1="300" y1="96" x2="300" y2="420" stroke="#d1d5db" stroke-width="1"/>
+  <text x="296" y="444" font-family="Arial, sans-serif" font-size="12" fill="#6b7280" text-anchor="middle">0</text>
+  <text x="447" y="444" font-family="Arial, sans-serif" font-size="12" fill="#6b7280" text-anchor="middle">20</text>
+  <text x="598" y="444" font-family="Arial, sans-serif" font-size="12" fill="#6b7280" text-anchor="middle">40</text>
+  <text x="749" y="444" font-family="Arial, sans-serif" font-size="12" fill="#6b7280" text-anchor="middle">60</text>
+  <text x="900" y="444" font-family="Arial, sans-serif" font-size="12" fill="#6b7280" text-anchor="middle">80</text>
+  <line x1="451" y1="96" x2="451" y2="420" stroke="#f3f4f6" stroke-width="1"/>
+  <line x1="602" y1="96" x2="602" y2="420" stroke="#f3f4f6" stroke-width="1"/>
+  <line x1="753" y1="96" x2="753" y2="420" stroke="#f3f4f6" stroke-width="1"/>
+  <line x1="904" y1="96" x2="904" y2="420" stroke="#f3f4f6" stroke-width="1"/>
+
+  <text x="40" y="119" font-family="Arial, sans-serif" font-size="13" fill="#111827">Borrowed parallel + scratch + attention/KV</text>
+  <rect x="300" y="100" width="115" height="24" fill="#2563eb"/>
+  <text x="427" y="118" font-family="Arial, sans-serif" font-size="13" fill="#111827">15.22</text>
+
+  <text x="40" y="164" font-family="Arial, sans-serif" font-size="13" fill="#111827">Incremental streaming decode</text>
+  <rect x="300" y="145" width="111" height="24" fill="#2563eb"/>
+  <text x="423" y="163" font-family="Arial, sans-serif" font-size="13" fill="#111827">14.72</text>
+
+  <text x="40" y="209" font-family="Arial, sans-serif" font-size="13" fill="#111827">SIMD dot kernels</text>
+  <rect x="300" y="190" width="612" height="24" fill="#16a34a"/>
+  <text x="924" y="208" font-family="Arial, sans-serif" font-size="13" fill="#111827">81.12</text>
+
+  <text x="40" y="254" font-family="Arial, sans-serif" font-size="13" fill="#111827">Experiment stats + prompt-file profiling</text>
+  <rect x="300" y="235" width="417" height="24" fill="#0891b2"/>
+  <text x="729" y="253" font-family="Arial, sans-serif" font-size="13" fill="#111827">55.23</text>
+
+  <text x="40" y="299" font-family="Arial, sans-serif" font-size="13" fill="#111827">Tunable thresholds + chunks</text>
+  <rect x="300" y="280" width="506" height="24" fill="#0891b2"/>
+  <text x="818" y="298" font-family="Arial, sans-serif" font-size="13" fill="#111827">67.11</text>
+
+  <text x="40" y="344" font-family="Arial, sans-serif" font-size="13" fill="#111827">Quantized experiment baseline f32</text>
+  <rect x="300" y="325" width="433" height="24" fill="#0891b2"/>
+  <text x="745" y="343" font-family="Arial, sans-serif" font-size="13" fill="#111827">57.33</text>
+
+  <text x="40" y="389" font-family="Arial, sans-serif" font-size="13" fill="#111827">Quantized experiment int8</text>
+  <rect x="300" y="370" width="186" height="24" fill="#d97706"/>
+  <text x="498" y="388" font-family="Arial, sans-serif" font-size="13" fill="#111827">24.62</text>
+
+  <text x="40" y="472" font-family="Arial, sans-serif" font-size="12" fill="#6b7280">Source: benchmarks/gpt2_experiment_history.csv. Values are best total_tokens_per_second observed per slice.</text>
+</svg>
