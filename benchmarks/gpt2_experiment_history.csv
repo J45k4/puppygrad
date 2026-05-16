@@ -19,3 +19,7 @@ simd-dot-kernels,2026-05-16,"The future of small language models is",rust,4,4,2,
 simd-dot-kernels,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,578.204,0.034,102.413,102.485,97.780,200.193,68.351,81.816,74.928
 experiment-stats-prompt-file-profile,2026-05-16,"<aggregate prompt-file>",rust,1,4,6,7,4.000,1360.400,0.065,192.452,192.556,124.690,317.142,36.373,32.079,34.685
 experiment-stats-prompt-file-profile,2026-05-16,"<aggregate prompt-file>",rust,2,4,6,7,4.000,641.359,0.050,135.058,135.167,64.127,199.185,51.830,62.376,55.225
+tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=65536",rust,2,4,2,7,4.000,1176.165,0.049,153.097,153.177,57.839,210.936,45.723,69.157,52.148
+tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=262144",rust,2,4,2,7,4.000,707.637,0.039,143.148,143.237,59.098,202.246,48.900,67.684,54.389
+tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=65536",rust,4,4,2,7,4.000,671.245,0.040,114.376,114.448,54.516,168.892,61.202,73.372,65.130
+tunable-thresholds-chunks,2026-05-16,"The future of small language models is dense=262144",rust,4,4,2,7,4.000,670.639,0.154,117.807,117.878,46.105,163.912,59.419,86.758,67.109

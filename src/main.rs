@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use puppygrad::engine::Tensor;
 use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
-    Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime,
+    Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
 use serde::Serialize;
 use std::fs;
@@ -54,6 +54,34 @@ enum Command {
         /// Number of worker threads for CPU-style backends.
         #[arg(long, default_value_t = 1)]
         threads: usize,
+
+        /// Minimum dense multiply-add work items before parallel execution.
+        #[arg(long)]
+        dense_parallel_threshold: Option<usize>,
+
+        /// Dense output chunk size for QKV projection jobs.
+        #[arg(long)]
+        qkv_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for attention projection jobs.
+        #[arg(long)]
+        attention_projection_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for MLP expansion jobs.
+        #[arg(long)]
+        mlp_fc_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for MLP projection jobs.
+        #[arg(long)]
+        mlp_projection_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for final logits jobs.
+        #[arg(long)]
+        logits_chunk_size: Option<usize>,
+
+        /// Minimum attention work items before parallelizing across heads.
+        #[arg(long)]
+        attention_head_parallel_threshold: Option<usize>,
 
         /// Print generation timing and token throughput to stderr.
         #[arg(long)]
@@ -176,6 +204,34 @@ enum ExperimentCommand {
         #[arg(long, default_value = "1")]
         threads: String,
 
+        /// Comma-separated dense parallel thresholds to sweep.
+        #[arg(long, default_value = "262144")]
+        dense_parallel_thresholds: String,
+
+        /// Dense output chunk size for QKV projection jobs.
+        #[arg(long)]
+        qkv_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for attention projection jobs.
+        #[arg(long)]
+        attention_projection_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for MLP expansion jobs.
+        #[arg(long)]
+        mlp_fc_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for MLP projection jobs.
+        #[arg(long)]
+        mlp_projection_chunk_size: Option<usize>,
+
+        /// Dense output chunk size for final logits jobs.
+        #[arg(long)]
+        logits_chunk_size: Option<usize>,
+
+        /// Minimum attention work items before parallelizing across heads.
+        #[arg(long)]
+        attention_head_parallel_threshold: Option<usize>,
+
         /// Comma-separated max-new-token counts, for example 8,16,32.
         #[arg(long, default_value = "32")]
         max_new_tokens: String,
@@ -206,6 +262,13 @@ fn main() -> Result<()> {
             max_new_tokens,
             backend,
             threads,
+            dense_parallel_threshold,
+            qkv_chunk_size,
+            attention_projection_chunk_size,
+            mlp_fc_chunk_size,
+            mlp_projection_chunk_size,
+            logits_chunk_size,
+            attention_head_parallel_threshold,
             stats,
         } => run_gpt2(RunGpt2Args {
             model_dir,
@@ -216,6 +279,15 @@ fn main() -> Result<()> {
             max_new_tokens,
             backend,
             threads,
+            tuning: RustTuning {
+                dense_parallel_threshold,
+                qkv_chunk_size,
+                attention_projection_chunk_size,
+                mlp_fc_chunk_size,
+                mlp_projection_chunk_size,
+                logits_chunk_size,
+                attention_head_parallel_threshold,
+            },
             stats,
         }),
         Command::Qwen {
@@ -258,6 +330,13 @@ fn main() -> Result<()> {
                 prompt,
                 prompt_file,
                 threads,
+                dense_parallel_thresholds,
+                qkv_chunk_size,
+                attention_projection_chunk_size,
+                mlp_fc_chunk_size,
+                mlp_projection_chunk_size,
+                logits_chunk_size,
+                attention_head_parallel_threshold,
                 max_new_tokens,
                 runs,
                 warmup_runs,
@@ -270,6 +349,16 @@ fn main() -> Result<()> {
                 prompt,
                 prompt_file,
                 threads,
+                dense_parallel_thresholds,
+                tuning: RustTuning {
+                    dense_parallel_threshold: None,
+                    qkv_chunk_size,
+                    attention_projection_chunk_size,
+                    mlp_fc_chunk_size,
+                    mlp_projection_chunk_size,
+                    logits_chunk_size,
+                    attention_head_parallel_threshold,
+                },
                 max_new_tokens,
                 runs,
                 warmup_runs,
@@ -306,7 +395,19 @@ struct RunGpt2Args {
     max_new_tokens: usize,
     backend: Gpt2BackendArg,
     threads: usize,
+    tuning: RustTuning,
     stats: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RustTuning {
+    dense_parallel_threshold: Option<usize>,
+    qkv_chunk_size: Option<usize>,
+    attention_projection_chunk_size: Option<usize>,
+    mlp_fc_chunk_size: Option<usize>,
+    mlp_projection_chunk_size: Option<usize>,
+    logits_chunk_size: Option<usize>,
+    attention_head_parallel_threshold: Option<usize>,
 }
 
 struct RunGpt2ExperimentArgs {
@@ -317,6 +418,8 @@ struct RunGpt2ExperimentArgs {
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
     threads: String,
+    dense_parallel_thresholds: String,
+    tuning: RustTuning,
     max_new_tokens: String,
     runs: usize,
     warmup_runs: usize,
@@ -344,7 +447,7 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
     let generation = Gpt2GenerationConfig::new(args.max_new_tokens);
     generation.validate()?;
     let backend = match args.backend {
-        Gpt2BackendArg::Rust => Gpt2BackendConfig::rust(args.threads)?,
+        Gpt2BackendArg::Rust => Gpt2BackendConfig::Rust(rust_config(args.threads, args.tuning)?),
     };
 
     let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
@@ -387,6 +490,37 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
         print_gpt2_speed(&generation_stats);
     }
     Ok(())
+}
+
+fn rust_config(
+    threads: usize,
+    tuning: RustTuning,
+) -> puppygrad::models::gpt2::Result<Gpt2RustConfig> {
+    let defaults = Gpt2RustConfig::default();
+    let config = Gpt2RustConfig {
+        threads,
+        dense_parallel_threshold: tuning
+            .dense_parallel_threshold
+            .unwrap_or(defaults.dense_parallel_threshold),
+        qkv_chunk_size: tuning.qkv_chunk_size.unwrap_or(defaults.qkv_chunk_size),
+        attention_projection_chunk_size: tuning
+            .attention_projection_chunk_size
+            .unwrap_or(defaults.attention_projection_chunk_size),
+        mlp_fc_chunk_size: tuning
+            .mlp_fc_chunk_size
+            .unwrap_or(defaults.mlp_fc_chunk_size),
+        mlp_projection_chunk_size: tuning
+            .mlp_projection_chunk_size
+            .unwrap_or(defaults.mlp_projection_chunk_size),
+        logits_chunk_size: tuning
+            .logits_chunk_size
+            .unwrap_or(defaults.logits_chunk_size),
+        attention_head_parallel_threshold: tuning
+            .attention_head_parallel_threshold
+            .unwrap_or(defaults.attention_head_parallel_threshold),
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 fn print_gpt2_speed(stats: &Gpt2GenerationStats) {
@@ -489,6 +623,13 @@ struct Gpt2ExperimentRow {
     prompt_index: Option<usize>,
     prompt: String,
     threads: usize,
+    dense_parallel_threshold: usize,
+    qkv_chunk_size: usize,
+    attention_projection_chunk_size: usize,
+    mlp_fc_chunk_size: usize,
+    mlp_projection_chunk_size: usize,
+    logits_chunk_size: usize,
+    attention_head_parallel_threshold: usize,
     max_new_tokens: usize,
     runs: usize,
     prompt_tokens: usize,
@@ -537,6 +678,8 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
         return Err("experiment --runs must be > 0".into());
     }
     let thread_counts = parse_usize_list("threads", &args.threads)?;
+    let dense_parallel_thresholds =
+        parse_usize_list("dense-parallel-thresholds", &args.dense_parallel_thresholds)?;
     let token_counts = parse_usize_list("max-new-tokens", &args.max_new_tokens)?;
     let prompts = load_experiment_prompts(args.prompt.as_deref(), args.prompt_file.as_ref())?;
     let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
@@ -555,64 +698,71 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
 
     let mut rows = Vec::new();
     for threads in thread_counts {
-        let backend = Gpt2BackendConfig::rust(threads)?;
-        eprintln!(
-            "loading GPT-2 from {} with {}",
-            model_dir.display(),
-            backend.describe()
-        );
-        let load_start = Instant::now();
-        let runtime = Gpt2Runtime::from_dir_with_backend(&model_dir, backend)?;
-        let load_time = load_start.elapsed();
+        for dense_parallel_threshold in dense_parallel_thresholds.iter().copied() {
+            let mut tuning = args.tuning;
+            tuning.dense_parallel_threshold = Some(dense_parallel_threshold);
+            let rust_config = rust_config(threads, tuning)?;
+            let backend = Gpt2BackendConfig::Rust(rust_config.clone());
+            eprintln!(
+                "loading GPT-2 from {} with {}",
+                model_dir.display(),
+                backend.describe()
+            );
+            let load_start = Instant::now();
+            let runtime = Gpt2Runtime::from_dir_with_backend(&model_dir, backend)?;
+            let load_time = load_start.elapsed();
 
-        for max_new_tokens in token_counts.iter().copied() {
-            let generation = Gpt2GenerationConfig::new(max_new_tokens);
-            generation.validate()?;
+            for max_new_tokens in token_counts.iter().copied() {
+                let generation = Gpt2GenerationConfig::new(max_new_tokens);
+                generation.validate()?;
 
-            let mut aggregate_stats = Vec::with_capacity(args.runs * prompts.len());
-            for (prompt_index, prompt) in prompts.iter().enumerate() {
-                for _ in 0..args.warmup_runs {
-                    let _ = runtime.stream_greedy_text_with_stats(
+                let mut aggregate_stats = Vec::with_capacity(args.runs * prompts.len());
+                for (prompt_index, prompt) in prompts.iter().enumerate() {
+                    for _ in 0..args.warmup_runs {
+                        let _ = runtime.stream_greedy_text_with_stats(
+                            prompt,
+                            generation.max_new_tokens,
+                            |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                        )?;
+                    }
+
+                    let mut stats = Vec::with_capacity(args.runs);
+                    for _ in 0..args.runs {
+                        let (_, run_stats) = runtime.stream_greedy_text_with_stats(
+                            prompt,
+                            generation.max_new_tokens,
+                            |_| Ok::<(), Box<dyn std::error::Error>>(()),
+                        )?;
+                        aggregate_stats.push(run_stats.clone());
+                        stats.push(run_stats);
+                    }
+
+                    rows.push(average_gpt2_experiment_row(
+                        "rust",
+                        &rust_config,
+                        Some(prompt_index),
                         prompt,
-                        generation.max_new_tokens,
-                        |_| Ok::<(), Box<dyn std::error::Error>>(()),
-                    )?;
+                        threads,
+                        max_new_tokens,
+                        args.runs,
+                        load_time,
+                        &stats,
+                    ));
                 }
 
-                let mut stats = Vec::with_capacity(args.runs);
-                for _ in 0..args.runs {
-                    let (_, run_stats) = runtime.stream_greedy_text_with_stats(
-                        prompt,
-                        generation.max_new_tokens,
-                        |_| Ok::<(), Box<dyn std::error::Error>>(()),
-                    )?;
-                    aggregate_stats.push(run_stats.clone());
-                    stats.push(run_stats);
+                if prompts.len() > 1 {
+                    rows.push(average_gpt2_experiment_row(
+                        "rust",
+                        &rust_config,
+                        None,
+                        "<aggregate>",
+                        threads,
+                        max_new_tokens,
+                        aggregate_stats.len(),
+                        load_time,
+                        &aggregate_stats,
+                    ));
                 }
-
-                rows.push(average_gpt2_experiment_row(
-                    "rust",
-                    Some(prompt_index),
-                    prompt,
-                    threads,
-                    max_new_tokens,
-                    args.runs,
-                    load_time,
-                    &stats,
-                ));
-            }
-
-            if prompts.len() > 1 {
-                rows.push(average_gpt2_experiment_row(
-                    "rust",
-                    None,
-                    "<aggregate>",
-                    threads,
-                    max_new_tokens,
-                    aggregate_stats.len(),
-                    load_time,
-                    &aggregate_stats,
-                ));
             }
         }
     }
@@ -628,6 +778,7 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
 
 fn average_gpt2_experiment_row(
     backend: &str,
+    rust_config: &Gpt2RustConfig,
     prompt_index: Option<usize>,
     prompt: &str,
     threads: usize,
@@ -666,6 +817,13 @@ fn average_gpt2_experiment_row(
         prompt_index,
         prompt: prompt.to_string(),
         threads,
+        dense_parallel_threshold: rust_config.dense_parallel_threshold,
+        qkv_chunk_size: rust_config.qkv_chunk_size,
+        attention_projection_chunk_size: rust_config.attention_projection_chunk_size,
+        mlp_fc_chunk_size: rust_config.mlp_fc_chunk_size,
+        mlp_projection_chunk_size: rust_config.mlp_projection_chunk_size,
+        logits_chunk_size: rust_config.logits_chunk_size,
+        attention_head_parallel_threshold: rust_config.attention_head_parallel_threshold,
         max_new_tokens,
         runs,
         prompt_tokens,
@@ -736,10 +894,11 @@ fn average_gpt2_experiment_row(
 
 fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
     println!(
-        "{:<7} {:>6} {:>7} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+        "{:<7} {:>6} {:>7} {:>9} {:>8} {:>5} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
         "backend",
         "prompt",
         "threads",
+        "dense_th",
         "new_tok",
         "runs",
         "prompt",
@@ -758,10 +917,11 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
             .map(|index| index.to_string())
             .unwrap_or_else(|| "all".to_string());
         println!(
-            "{:<7} {:>6} {:>7} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
+            "{:<7} {:>6} {:>7} {:>9} {:>8} {:>5} {:>7} {:>7.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>10.2} {:>10.2}",
             row.backend,
             prompt_index,
             row.threads,
+            row.dense_parallel_threshold,
             row.max_new_tokens,
             row.runs,
             row.prompt_tokens,
@@ -779,7 +939,7 @@ fn print_gpt2_experiment_table(rows: &[Gpt2ExperimentRow]) {
 
 fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
     println!(
-        "backend,prompt_index,prompt,threads,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,decode_ms_min,decode_ms_median,decode_ms_p95,decode_ms_max,decode_ms_stddev,total_generation_ms_min,total_generation_ms_median,total_generation_ms_p95,total_generation_ms_max,total_generation_ms_stddev,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second,profile_tokenization_ms,profile_layer_norm_ms,profile_qkv_projection_ms,profile_attention_ms,profile_attention_projection_ms,profile_mlp_fc_projection_ms,profile_mlp_projection_ms,profile_final_logits_ms,profile_decoding_ms"
+        "backend,prompt_index,prompt,threads,dense_parallel_threshold,qkv_chunk_size,attention_projection_chunk_size,mlp_fc_chunk_size,mlp_projection_chunk_size,logits_chunk_size,attention_head_parallel_threshold,max_new_tokens,runs,prompt_tokens,generated_tokens,load_ms,tokenize_ms,prefill_ms,time_to_first_token_ms,decode_ms,total_generation_ms,decode_ms_min,decode_ms_median,decode_ms_p95,decode_ms_max,decode_ms_stddev,total_generation_ms_min,total_generation_ms_median,total_generation_ms_p95,total_generation_ms_max,total_generation_ms_stddev,prefill_tokens_per_second,decode_tokens_per_second,total_tokens_per_second,profile_tokenization_ms,profile_layer_norm_ms,profile_qkv_projection_ms,profile_attention_ms,profile_attention_projection_ms,profile_mlp_fc_projection_ms,profile_mlp_projection_ms,profile_final_logits_ms,profile_decoding_ms"
     );
     for row in rows {
         let first_token = row
@@ -791,11 +951,18 @@ fn print_gpt2_experiment_csv(rows: &[Gpt2ExperimentRow]) {
             .map(|index| index.to_string())
             .unwrap_or_default();
         println!(
-            "{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
             row.backend,
             prompt_index,
             csv_escape(&row.prompt),
             row.threads,
+            row.dense_parallel_threshold,
+            row.qkv_chunk_size,
+            row.attention_projection_chunk_size,
+            row.mlp_fc_chunk_size,
+            row.mlp_projection_chunk_size,
+            row.logits_chunk_size,
+            row.attention_head_parallel_threshold,
             row.max_new_tokens,
             row.runs,
             row.prompt_tokens,
