@@ -1,14 +1,15 @@
-use std::error;
-use std::fmt;
-use std::fs::{self, File};
-use std::io;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 
-use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::models::autoregressive::{self, AutoregressiveDecoder};
+use crate::models::safetensors::{
+    parse_safetensors, read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError,
+};
+
+use super::{Gpt2AssetPaths, Gpt2Error, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2Config {
@@ -216,49 +217,6 @@ impl Gpt2LayerKvCache {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Gpt2Error {
-    Asset(String),
-    InvalidConfig(String),
-    InvalidInput(String),
-    InvalidWeights(String),
-}
-
-impl fmt::Display for Gpt2Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Gpt2Error::Asset(msg) => write!(f, "GPT-2 asset error: {msg}"),
-            Gpt2Error::InvalidConfig(msg) => write!(f, "invalid GPT-2 config: {msg}"),
-            Gpt2Error::InvalidInput(msg) => write!(f, "invalid GPT-2 input: {msg}"),
-            Gpt2Error::InvalidWeights(msg) => write!(f, "invalid GPT-2 weights: {msg}"),
-        }
-    }
-}
-
-impl error::Error for Gpt2Error {}
-
-pub type Result<T> = std::result::Result<T, Gpt2Error>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Gpt2AssetPaths {
-    pub model_dir: PathBuf,
-    pub config: PathBuf,
-    pub tokenizer: PathBuf,
-    pub weights: PathBuf,
-}
-
-impl Gpt2AssetPaths {
-    pub fn new(model_dir: impl Into<PathBuf>) -> Self {
-        let model_dir = model_dir.into();
-        Self {
-            config: model_dir.join("config.json"),
-            tokenizer: model_dir.join("tokenizer.json"),
-            weights: model_dir.join("model.safetensors"),
-            model_dir,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct Gpt2Tokenizer {
     tokenizer: Tokenizer,
@@ -352,34 +310,6 @@ impl Gpt2Runtime {
     }
 }
 
-pub fn default_gpt2_small_dir() -> PathBuf {
-    PathBuf::from("models/gpt2")
-}
-
-pub fn download_gpt2_small_assets(model_dir: impl AsRef<Path>) -> Result<Gpt2AssetPaths> {
-    download_huggingface_gpt2_assets("gpt2", "main", model_dir)
-}
-
-pub fn download_huggingface_gpt2_assets(
-    model_id: &str,
-    revision: &str,
-    model_dir: impl AsRef<Path>,
-) -> Result<Gpt2AssetPaths> {
-    let paths = Gpt2AssetPaths::new(model_dir.as_ref());
-    fs::create_dir_all(&paths.model_dir).map_err(|err| {
-        Gpt2Error::Asset(format!(
-            "failed to create model dir {}: {err}",
-            paths.model_dir.display()
-        ))
-    })?;
-
-    download_hf_file(model_id, revision, "config.json", &paths.config)?;
-    download_hf_file(model_id, revision, "tokenizer.json", &paths.tokenizer)?;
-    download_hf_file(model_id, revision, "model.safetensors", &paths.weights)?;
-
-    Ok(paths)
-}
-
 #[derive(Debug, Deserialize)]
 struct HfGpt2Config {
     vocab_size: usize,
@@ -414,15 +344,9 @@ fn load_config(path: &Path) -> Result<Gpt2Config> {
 }
 
 fn load_weights(path: &Path, cfg: &Gpt2Config) -> Result<Gpt2Weights> {
-    let bytes = fs::read(path).map_err(|err| {
-        Gpt2Error::Asset(format!("failed to read weights {}: {err}", path.display()))
-    })?;
-    let tensors = SafeTensors::deserialize(&bytes).map_err(|err| {
-        Gpt2Error::Asset(format!(
-            "failed to parse safetensors {}: {err}",
-            path.display()
-        ))
-    })?;
+    let bytes = read_safetensors_file(path).map_err(|err| Gpt2Error::Asset(err.to_string()))?;
+    let tensors =
+        parse_safetensors(path, &bytes).map_err(|err| Gpt2Error::Asset(err.to_string()))?;
 
     let mut blocks = Vec::with_capacity(cfg.n_layer);
     for layer in 0..cfg.n_layer {
@@ -480,77 +404,32 @@ fn load_weights(path: &Path, cfg: &Gpt2Config) -> Result<Gpt2Weights> {
     })
 }
 
-fn tensor_f32(tensors: &SafeTensors<'_>, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
+fn tensor_f32(
+    tensors: &safetensors::SafeTensors<'_>,
+    name: &str,
+    expected_shape: &[usize],
+) -> Result<Vec<f32>> {
     let prefixed_name = format!("transformer.{name}");
-    let tensor = match tensors.tensor(name) {
-        Ok(tensor) => tensor,
-        Err(err) => tensors.tensor(&prefixed_name).map_err(|prefixed_err| {
-            Gpt2Error::Asset(format!(
-                "failed to read tensor {name} ({err}) or {prefixed_name} ({prefixed_err})"
-            ))
-        })?,
-    };
-    if tensor.dtype() != Dtype::F32 {
-        return Err(Gpt2Error::Asset(format!(
-            "tensor {name} has dtype {:?}, expected F32",
-            tensor.dtype()
-        )));
+    match safetensor_f32(tensors, name, expected_shape) {
+        Ok(values) => Ok(values),
+        Err(SafeTensorLoadError::TensorNotFound { .. }) => {
+            safetensor_f32(tensors, &prefixed_name, expected_shape).map_err(gpt2_tensor_error)
+        }
+        Err(err) => Err(gpt2_tensor_error(err)),
     }
-    if tensor.shape() != expected_shape {
-        return Err(Gpt2Error::InvalidWeights(format!(
-            "tensor {name} shape {:?} does not match expected {:?}",
-            tensor.shape(),
-            expected_shape
-        )));
-    }
-
-    let data = tensor.data();
-    if data.len() % 4 != 0 {
-        return Err(Gpt2Error::Asset(format!(
-            "tensor {name} byte length {} is not divisible by 4",
-            data.len()
-        )));
-    }
-
-    Ok(data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        .collect())
 }
 
-fn download_hf_file(model_id: &str, revision: &str, filename: &str, dst: &Path) -> Result<()> {
-    if dst.exists() {
-        return Ok(());
+fn gpt2_tensor_error(err: SafeTensorLoadError) -> Gpt2Error {
+    match err {
+        SafeTensorLoadError::WrongShape {
+            name,
+            actual,
+            expected,
+        } => Gpt2Error::InvalidWeights(format!(
+            "tensor {name} shape {actual:?} does not match expected {expected:?}"
+        )),
+        err => Gpt2Error::Asset(err.to_string()),
     }
-
-    let tmp = dst.with_extension("download");
-    let url = format!("https://huggingface.co/{model_id}/resolve/{revision}/{filename}");
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("puppygrad/0.1")
-        .build()
-        .map_err(|err| Gpt2Error::Asset(format!("failed to build HTTP client: {err}")))?;
-    let mut response = client
-        .get(&url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|err| Gpt2Error::Asset(format!("failed to download {url}: {err}")))?;
-    let mut file = File::create(&tmp).map_err(|err| {
-        Gpt2Error::Asset(format!(
-            "failed to create temporary file {}: {err}",
-            tmp.display()
-        ))
-    })?;
-    io::copy(&mut response, &mut file).map_err(|err| {
-        Gpt2Error::Asset(format!("failed to write download {}: {err}", tmp.display()))
-    })?;
-    fs::rename(&tmp, dst).map_err(|err| {
-        Gpt2Error::Asset(format!(
-            "failed to move {} to {}: {err}",
-            tmp.display(),
-            dst.display()
-        ))
-    })?;
-    Ok(())
 }
 
 impl Gpt2Model {
