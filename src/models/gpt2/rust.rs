@@ -378,14 +378,7 @@ impl Gpt2Runtime {
         self.model
             .stream_greedy_tokens::<_, E>(&input_ids, max_new_tokens, |token_id| {
                 output_ids.push(token_id);
-                let next_decoded = self.tokenizer.decode(&output_ids)?;
-                if let Some(delta) = next_decoded.strip_prefix(&decoded) {
-                    on_text(delta)?;
-                } else {
-                    let token_text = self.tokenizer.decode(&[token_id])?;
-                    on_text(&token_text)?;
-                }
-                decoded = next_decoded;
+                self.stream_decoded_token(&output_ids, &mut decoded, token_id, &mut on_text)?;
                 Ok(())
             })?;
 
@@ -434,18 +427,13 @@ impl Gpt2Runtime {
 
             let token_id = argmax(&logits);
             output_ids.push(token_id);
-            let decode_text_start = Instant::now();
-            let next_decoded = self.tokenizer.decode(&output_ids)?;
-            operation_profile.decoding += decode_text_start.elapsed();
-            if let Some(delta) = next_decoded.strip_prefix(&decoded) {
-                on_text(delta)?;
-            } else {
-                let decode_text_start = Instant::now();
-                let token_text = self.tokenizer.decode(&[token_id])?;
-                operation_profile.decoding += decode_text_start.elapsed();
-                on_text(&token_text)?;
-            }
-            decoded = next_decoded;
+            self.stream_decoded_token_profiled(
+                &output_ids,
+                &mut decoded,
+                token_id,
+                &mut operation_profile,
+                &mut on_text,
+            )?;
             generated_tokens += 1;
             if first_token_time.is_none() {
                 first_token_time = Some(first_token_start.elapsed());
@@ -475,6 +463,71 @@ impl Gpt2Runtime {
 
         Ok((decoded, stats))
     }
+
+    fn stream_decoded_token<F, E>(
+        &self,
+        output_ids: &[usize],
+        decoded: &mut String,
+        token_id: usize,
+        on_text: &mut F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(&str) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
+        let token_text = self.tokenizer.decode(&[token_id])?;
+        if is_incremental_decode_safe(&token_text) {
+            on_text(&token_text)?;
+            decoded.push_str(&token_text);
+            return Ok(());
+        }
+
+        let next_decoded = self.tokenizer.decode(output_ids)?;
+        if let Some(delta) = next_decoded.strip_prefix(decoded.as_str()) {
+            on_text(delta)?;
+        } else {
+            on_text(&token_text)?;
+        }
+        *decoded = next_decoded;
+        Ok(())
+    }
+
+    fn stream_decoded_token_profiled<F, E>(
+        &self,
+        output_ids: &[usize],
+        decoded: &mut String,
+        token_id: usize,
+        profile: &mut Gpt2OperationProfile,
+        on_text: &mut F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(&str) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
+        let decode_text_start = Instant::now();
+        let token_text = self.tokenizer.decode(&[token_id])?;
+        profile.decoding += decode_text_start.elapsed();
+        if is_incremental_decode_safe(&token_text) {
+            on_text(&token_text)?;
+            decoded.push_str(&token_text);
+            return Ok(());
+        }
+
+        let decode_text_start = Instant::now();
+        let next_decoded = self.tokenizer.decode(output_ids)?;
+        profile.decoding += decode_text_start.elapsed();
+        if let Some(delta) = next_decoded.strip_prefix(decoded.as_str()) {
+            on_text(delta)?;
+        } else {
+            on_text(&token_text)?;
+        }
+        *decoded = next_decoded;
+        Ok(())
+    }
+}
+
+fn is_incremental_decode_safe(token_text: &str) -> bool {
+    !token_text.is_empty() && !token_text.contains(char::REPLACEMENT_CHARACTER)
 }
 
 #[derive(Debug)]
@@ -1764,6 +1817,14 @@ mod tests {
             stats.average_decode_token_time(),
             Some(Duration::from_millis(5))
         );
+    }
+
+    #[test]
+    fn incremental_decode_rejects_empty_and_replacement_text() {
+        assert!(is_incremental_decode_safe(" hello"));
+        assert!(!is_incremental_decode_safe(""));
+        assert!(!is_incremental_decode_safe("\u{fffd}"));
+        assert!(!is_incremental_decode_safe("a\u{fffd}"));
     }
 
     fn tiny_config() -> Gpt2Config {

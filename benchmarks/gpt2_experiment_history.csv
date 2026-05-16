@@ -5,3 +5,9 @@ borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language 
 borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,2,8,2,7,8.000,734.223,0.234,1108.429,1108.539,603.803,1712.232,6.315,13.249,8.760
 borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,706.198,0.128,557.565,557.673,165.203,722.769,12.555,24.213,15.219
 borrowed-parallel-scratch-attention-kv,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,706.198,0.129,804.786,804.876,549.357,1354.143,8.698,14.562,11.077
+incremental-stream-decode,2026-05-16,"The future of small language models is",rust,1,4,2,7,4.000,1289.537,0.059,1124.208,1124.322,420.130,1544.338,6.227,9.521,7.123
+incremental-stream-decode,2026-05-16,"The future of small language models is",rust,1,8,2,7,8.000,1289.537,0.066,1110.210,1111.017,1030.861,2141.071,6.305,7.761,7.006
+incremental-stream-decode,2026-05-16,"The future of small language models is",rust,2,4,2,7,4.000,1130.309,0.064,552.596,552.686,261.537,814.133,12.667,15.294,13.511
+incremental-stream-decode,2026-05-16,"The future of small language models is",rust,2,8,2,7,8.000,1130.309,0.055,552.363,552.507,636.973,1189.336,12.673,12.559,12.612
+incremental-stream-decode,2026-05-16,"The future of small language models is",rust,4,4,2,7,4.000,2525.421,0.093,866.915,866.999,464.784,1331.699,8.075,8.606,8.260
+incremental-stream-decode,2026-05-16,"The future of small language models is",rust,4,8,2,7,8.000,2525.421,0.140,507.010,507.121,512.358,1019.367,13.806,15.614,14.715
