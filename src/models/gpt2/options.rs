@@ -62,6 +62,23 @@ pub struct Gpt2RustConfig {
     pub quantized_weights: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gpt2CpuBackendOptions {
+    pub threads: usize,
+    pub dense_parallel_threshold: usize,
+    pub attention_head_parallel_threshold: usize,
+    pub quantized_weights: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gpt2OperationTuning {
+    pub qkv_chunk_size: usize,
+    pub attention_projection_chunk_size: usize,
+    pub mlp_fc_chunk_size: usize,
+    pub mlp_projection_chunk_size: usize,
+    pub logits_chunk_size: usize,
+}
+
 impl Default for Gpt2RustConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +96,25 @@ impl Default for Gpt2RustConfig {
 }
 
 impl Gpt2RustConfig {
+    pub fn cpu_options(&self) -> Gpt2CpuBackendOptions {
+        Gpt2CpuBackendOptions {
+            threads: self.threads,
+            dense_parallel_threshold: self.dense_parallel_threshold,
+            attention_head_parallel_threshold: self.attention_head_parallel_threshold,
+            quantized_weights: self.quantized_weights,
+        }
+    }
+
+    pub fn operation_tuning(&self) -> Gpt2OperationTuning {
+        Gpt2OperationTuning {
+            qkv_chunk_size: self.qkv_chunk_size,
+            attention_projection_chunk_size: self.attention_projection_chunk_size,
+            mlp_fc_chunk_size: self.mlp_fc_chunk_size,
+            mlp_projection_chunk_size: self.mlp_projection_chunk_size,
+            logits_chunk_size: self.logits_chunk_size,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.threads == 0 {
             return Err(Gpt2Error::InvalidConfig(
@@ -149,5 +185,45 @@ impl Deref for Gpt2GenerationConfig {
 impl DerefMut for Gpt2GenerationConfig {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.common
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_config_splits_cpu_options_from_operation_tuning() {
+        let config = Gpt2RustConfig {
+            threads: 4,
+            dense_parallel_threshold: 1024,
+            qkv_chunk_size: 8,
+            attention_projection_chunk_size: 16,
+            mlp_fc_chunk_size: 32,
+            mlp_projection_chunk_size: 64,
+            logits_chunk_size: 128,
+            attention_head_parallel_threshold: 256,
+            quantized_weights: true,
+        };
+
+        assert_eq!(
+            config.cpu_options(),
+            Gpt2CpuBackendOptions {
+                threads: 4,
+                dense_parallel_threshold: 1024,
+                attention_head_parallel_threshold: 256,
+                quantized_weights: true,
+            }
+        );
+        assert_eq!(
+            config.operation_tuning(),
+            Gpt2OperationTuning {
+                qkv_chunk_size: 8,
+                attention_projection_chunk_size: 16,
+                mlp_fc_chunk_size: 32,
+                mlp_projection_chunk_size: 64,
+                logits_chunk_size: 128,
+            }
+        );
     }
 }
