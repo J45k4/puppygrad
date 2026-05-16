@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
+
+use crate::models::generation::TextGenerationConfig;
 
 use super::{Gpt2Error, Result};
+
+pub const GPT2_EOS_TOKEN_ID: usize = 50_256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gpt2BackendName {
@@ -109,55 +114,34 @@ impl Gpt2RustConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2GenerationConfig {
-    pub max_new_tokens: usize,
-    pub eos_token_id: Option<usize>,
-    pub temperature: f32,
-    pub top_p: Option<f32>,
-    pub top_k: Option<usize>,
-    pub seed: u64,
-    pub repeat_penalty: f32,
-    pub repeat_last_n: usize,
+    pub common: TextGenerationConfig,
 }
 
 impl Gpt2GenerationConfig {
     pub fn new(max_new_tokens: usize) -> Self {
         Self {
-            max_new_tokens,
-            eos_token_id: Some(50_256),
-            temperature: 0.0,
-            top_p: None,
-            top_k: None,
-            seed: 299_792_458,
-            repeat_penalty: 1.0,
-            repeat_last_n: 128,
+            common: TextGenerationConfig::new(max_new_tokens)
+                .with_eos_token_id(Some(GPT2_EOS_TOKEN_ID)),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !self.temperature.is_finite() || self.temperature < 0.0 {
-            return Err(Gpt2Error::InvalidConfig(
-                "generation temperature must be finite and >= 0".to_string(),
-            ));
-        }
-        if let Some(top_p) = self.top_p {
-            if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
-                return Err(Gpt2Error::InvalidConfig(
-                    "generation top_p must be finite and in (0, 1]".to_string(),
-                ));
-            }
-        }
-        if let Some(top_k) = self.top_k {
-            if top_k == 0 {
-                return Err(Gpt2Error::InvalidConfig(
-                    "generation top_k must be > 0".to_string(),
-                ));
-            }
-        }
-        if !self.repeat_penalty.is_finite() || self.repeat_penalty <= 0.0 {
-            return Err(Gpt2Error::InvalidConfig(
-                "generation repeat_penalty must be finite and > 0".to_string(),
-            ));
-        }
-        Ok(())
+        self.common
+            .validate()
+            .map_err(|err| Gpt2Error::InvalidConfig(format!("generation {err}")))
+    }
+}
+
+impl Deref for Gpt2GenerationConfig {
+    type Target = TextGenerationConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+
+impl DerefMut for Gpt2GenerationConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.common
     }
 }
