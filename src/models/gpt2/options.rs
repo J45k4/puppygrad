@@ -107,17 +107,57 @@ impl Gpt2RustConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2GenerationConfig {
     pub max_new_tokens: usize,
+    pub eos_token_id: Option<usize>,
+    pub temperature: f32,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub seed: u64,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
 }
 
 impl Gpt2GenerationConfig {
     pub fn new(max_new_tokens: usize) -> Self {
-        Self { max_new_tokens }
+        Self {
+            max_new_tokens,
+            eos_token_id: Some(50_256),
+            temperature: 0.0,
+            top_p: None,
+            top_k: None,
+            seed: 299_792_458,
+            repeat_penalty: 1.0,
+            repeat_last_n: 128,
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(Gpt2Error::InvalidConfig(
+                "generation temperature must be finite and >= 0".to_string(),
+            ));
+        }
+        if let Some(top_p) = self.top_p {
+            if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+                return Err(Gpt2Error::InvalidConfig(
+                    "generation top_p must be finite and in (0, 1]".to_string(),
+                ));
+            }
+        }
+        if let Some(top_k) = self.top_k {
+            if top_k == 0 {
+                return Err(Gpt2Error::InvalidConfig(
+                    "generation top_k must be > 0".to_string(),
+                ));
+            }
+        }
+        if !self.repeat_penalty.is_finite() || self.repeat_penalty <= 0.0 {
+            return Err(Gpt2Error::InvalidConfig(
+                "generation repeat_penalty must be finite and > 0".to_string(),
+            ));
+        }
         Ok(())
     }
 }

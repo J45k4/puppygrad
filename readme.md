@@ -16,7 +16,7 @@ Implemented:
 
 | Model | Status | Runtime | Notes |
 | --- | --- | --- | --- |
-| GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy decoding, token streaming, and a KV cache. |
+| GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy/sampled decoding, token streaming, and a KV cache. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -59,7 +59,21 @@ Use a different GPT-2-family checkpoint by giving both a model id and local dire
   --max-new-tokens 20
 ```
 
-The GPT-2 runtime is intentionally simple: CPU `f32`, greedy token selection, no sampling yet, and no GPU kernels yet. The only backend today is `rust`; `--threads` controls puppygrad's own thread pool, currently used by the final vocab logits projection. GPT-2 runs print generated-token throughput to stderr after generation.
+The GPT-2 runtime is intentionally simple: CPU `f32` and no GPU kernels yet. The only backend today is `rust`; `--threads` controls puppygrad's own thread pool. GPT-2 runs print generated-token throughput to stderr after generation.
+
+Greedy decoding is the default. For less repetitive text, enable sampling and repeat penalty:
+
+```bash
+./target/release/puppygrad gpt2 \
+  --prompt "Hello, my name is" \
+  --max-new-tokens 80 \
+  --temperature 0.8 \
+  --top-k 50 \
+  --top-p 0.95 \
+  --repeat-penalty 1.1 \
+  --repeat-last-n 128 \
+  --seed 42
+```
 
 When `models/gpt2/puppygrad-tune.json` exists, the `gpt2` command loads it automatically. Explicit CLI flags override the saved config. Use `--no-tuning` to ignore the saved file, or `--tuning-file path/to/tune.json` to load a different file.
 

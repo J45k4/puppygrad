@@ -48,6 +48,38 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         max_new_tokens: usize,
 
+        /// Temperature (0 => greedy).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+
+        /// Top-p nucleus sampling cutoff.
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Top-k sampling cutoff.
+        #[arg(long)]
+        top_k: Option<usize>,
+
+        /// RNG seed used when temperature is > 0.
+        #[arg(long, default_value_t = 299792458)]
+        seed: u64,
+
+        /// Repeat penalty (1.0 = disabled).
+        #[arg(long, default_value_t = 1.0)]
+        repeat_penalty: f32,
+
+        /// How many recent tokens are considered for repeat penalty.
+        #[arg(long, default_value_t = 128)]
+        repeat_last_n: usize,
+
+        /// Token id that stops generation.
+        #[arg(long)]
+        eos_token_id: Option<usize>,
+
+        /// Do not stop when the GPT-2 EOS token is generated.
+        #[arg(long)]
+        no_eos_stop: bool,
+
         /// Execution backend.
         #[arg(long, value_enum, default_value_t = Gpt2BackendArg::Rust)]
         backend: Gpt2BackendArg,
@@ -373,6 +405,14 @@ fn main() -> Result<()> {
             download,
             prompt,
             max_new_tokens,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            repeat_penalty,
+            repeat_last_n,
+            eos_token_id,
+            no_eos_stop,
             backend,
             threads,
             tuning_file,
@@ -393,6 +433,14 @@ fn main() -> Result<()> {
             download,
             prompt,
             max_new_tokens,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            repeat_penalty,
+            repeat_last_n,
+            eos_token_id,
+            no_eos_stop,
             backend,
             threads,
             tuning_file,
@@ -561,6 +609,14 @@ struct RunGpt2Args {
     download: bool,
     prompt: String,
     max_new_tokens: usize,
+    temperature: f32,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    seed: u64,
+    repeat_penalty: f32,
+    repeat_last_n: usize,
+    eos_token_id: Option<usize>,
+    no_eos_stop: bool,
     backend: Gpt2BackendArg,
     threads: Option<usize>,
     tuning_file: Option<PathBuf>,
@@ -639,7 +695,18 @@ struct RunQwenArgs {
 }
 
 fn run_gpt2(args: RunGpt2Args) -> Result<()> {
-    let generation = Gpt2GenerationConfig::new(args.max_new_tokens);
+    let mut generation = Gpt2GenerationConfig::new(args.max_new_tokens);
+    generation.temperature = args.temperature;
+    generation.top_p = args.top_p;
+    generation.top_k = args.top_k;
+    generation.seed = args.seed;
+    generation.repeat_penalty = args.repeat_penalty;
+    generation.repeat_last_n = args.repeat_last_n;
+    if args.no_eos_stop {
+        generation.eos_token_id = None;
+    } else if let Some(eos_token_id) = args.eos_token_id {
+        generation.eos_token_id = Some(eos_token_id);
+    }
     generation.validate()?;
     let model_dir = args.model_dir.unwrap_or_else(default_gpt2_small_dir);
     if args.download {
@@ -679,7 +746,7 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
     let load_time = load_start.elapsed();
     let mut stdout = std::io::stdout().lock();
     let (_, generation_stats) =
-        runtime.stream_greedy_text_with_stats(&args.prompt, generation.max_new_tokens, |text| {
+        runtime.stream_text_with_stats(&args.prompt, &generation, |text| {
             write!(stdout, "{text}")?;
             stdout.flush()?;
             Ok::<(), Box<dyn std::error::Error>>(())

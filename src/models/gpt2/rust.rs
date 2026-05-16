@@ -13,7 +13,9 @@ use crate::models::safetensors::{
 };
 use crate::runtime::thread_pool::ThreadPool;
 
-use super::{Gpt2AssetPaths, Gpt2BackendConfig, Gpt2Error, Gpt2RustConfig, Result};
+use super::{
+    Gpt2AssetPaths, Gpt2BackendConfig, Gpt2Error, Gpt2GenerationConfig, Gpt2RustConfig, Result,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gpt2Config {
@@ -412,12 +414,37 @@ impl Gpt2Runtime {
         &self,
         prompt: &str,
         max_new_tokens: usize,
+        on_text: F,
+    ) -> std::result::Result<(String, Gpt2GenerationStats), E>
+    where
+        F: FnMut(&str) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
+        let generation = Gpt2GenerationConfig::new(max_new_tokens);
+        self.stream_text_with_stats(prompt, &generation, on_text)
+    }
+
+    pub fn stream_text_with_stats<F, E>(
+        &self,
+        prompt: &str,
+        generation: &Gpt2GenerationConfig,
         mut on_text: F,
     ) -> std::result::Result<(String, Gpt2GenerationStats), E>
     where
         F: FnMut(&str) -> std::result::Result<(), E>,
         E: From<Gpt2Error>,
     {
+        generation.validate()?;
+        if let Some(eos_token_id) = generation.eos_token_id {
+            if eos_token_id >= self.model.config.vocab_size {
+                return Err(Gpt2Error::InvalidConfig(format!(
+                    "generation eos_token_id {eos_token_id} is outside vocab_size {}",
+                    self.model.config.vocab_size
+                ))
+                .into());
+            }
+        }
+
         let mut operation_profile = Gpt2OperationProfile::default();
 
         let tokenize_start = Instant::now();
@@ -442,13 +469,18 @@ impl Gpt2Runtime {
         let decode_start = Instant::now();
         let mut first_token_time = None;
         let mut generated_tokens = 0;
+        let mut rng = SmallRng::new(generation.seed);
 
-        for _ in 0..max_new_tokens {
+        for _ in 0..generation.max_new_tokens {
             if output_ids.len() >= self.model.config.n_positions {
                 break;
             }
 
-            let token_id = argmax(&logits);
+            let token_id = select_next_token(&logits, &output_ids, generation, &mut rng)?;
+            if generation.eos_token_id == Some(token_id) {
+                break;
+            }
+
             output_ids.push(token_id);
             self.stream_decoded_token_profiled(
                 &output_ids,
@@ -461,7 +493,7 @@ impl Gpt2Runtime {
             if first_token_time.is_none() {
                 first_token_time = Some(first_token_start.elapsed());
             }
-            let needs_next_logits = generated_tokens < max_new_tokens
+            let needs_next_logits = generated_tokens < generation.max_new_tokens
                 && output_ids.len() < self.model.config.n_positions;
             if needs_next_logits {
                 logits = self.model.forward_one_profiled(
@@ -1992,6 +2024,136 @@ fn row_mut(values: &mut [f32], row: usize, cols: usize) -> &mut [f32] {
     &mut values[row * cols..(row + 1) * cols]
 }
 
+#[derive(Clone, Debug)]
+struct SmallRng {
+    state: u64,
+}
+
+impl SmallRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed ^ 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn next_unit_f64(&mut self) -> f64 {
+        let value = self.next_u64() >> 11;
+        value as f64 * (1.0 / ((1u64 << 53) as f64))
+    }
+}
+
+fn select_next_token(
+    logits: &[f32],
+    history: &[usize],
+    generation: &Gpt2GenerationConfig,
+    rng: &mut SmallRng,
+) -> Result<usize> {
+    let mut adjusted = logits.to_vec();
+    apply_repeat_penalty(
+        &mut adjusted,
+        history,
+        generation.repeat_penalty,
+        generation.repeat_last_n,
+    );
+
+    if generation.temperature <= 0.0 {
+        return Ok(argmax(&adjusted));
+    }
+
+    sample_logits(&adjusted, generation, rng)
+}
+
+fn apply_repeat_penalty(logits: &mut [f32], history: &[usize], penalty: f32, last_n: usize) {
+    if penalty == 1.0 || last_n == 0 {
+        return;
+    }
+
+    let mut seen = Vec::new();
+    for token_id in history.iter().rev().take(last_n).copied() {
+        if token_id >= logits.len() || seen.contains(&token_id) {
+            continue;
+        }
+        seen.push(token_id);
+        if logits[token_id] < 0.0 {
+            logits[token_id] *= penalty;
+        } else {
+            logits[token_id] /= penalty;
+        }
+    }
+}
+
+fn sample_logits(
+    logits: &[f32],
+    generation: &Gpt2GenerationConfig,
+    rng: &mut SmallRng,
+) -> Result<usize> {
+    let mut candidates: Vec<(usize, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, logit)| logit.is_finite())
+        .collect();
+    if candidates.is_empty() {
+        return Err(Gpt2Error::InvalidInput(
+            "cannot sample from empty or non-finite logits".to_string(),
+        ));
+    }
+
+    candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
+    if let Some(top_k) = generation.top_k {
+        candidates.truncate(top_k.min(candidates.len()));
+    }
+
+    let max_logit = candidates[0].1 as f64 / generation.temperature as f64;
+    let mut weighted: Vec<(usize, f64)> = candidates
+        .into_iter()
+        .map(|(token_id, logit)| {
+            let scaled = logit as f64 / generation.temperature as f64;
+            (token_id, (scaled - max_logit).exp())
+        })
+        .collect();
+
+    if let Some(top_p) = generation.top_p {
+        let full_total = weighted.iter().map(|(_, weight)| *weight).sum::<f64>();
+        if full_total > 0.0 {
+            let mut cumulative = 0.0;
+            let mut keep_len = 0;
+            for (_, weight) in &weighted {
+                cumulative += *weight;
+                keep_len += 1;
+                if cumulative / full_total >= top_p as f64 {
+                    break;
+                }
+            }
+            weighted.truncate(keep_len.max(1));
+        }
+    }
+
+    let total = weighted.iter().map(|(_, weight)| *weight).sum::<f64>();
+    if total <= 0.0 || !total.is_finite() {
+        return Ok(weighted[0].0);
+    }
+
+    let fallback = weighted.last().map(|(token_id, _)| *token_id).unwrap();
+    let mut target = rng.next_unit_f64() * total;
+    for (token_id, weight) in weighted {
+        target -= weight;
+        if target <= 0.0 {
+            return Ok(token_id);
+        }
+    }
+
+    Ok(fallback)
+}
+
 fn argmax(values: &[f32]) -> usize {
     let mut best_idx = 0;
     let mut best = f32::NEG_INFINITY;
@@ -2166,6 +2328,35 @@ mod tests {
             stats.average_decode_token_time(),
             Some(Duration::from_millis(5))
         );
+    }
+
+    #[test]
+    fn repeat_penalty_can_change_greedy_selection() -> Result<()> {
+        let generation = Gpt2GenerationConfig {
+            repeat_penalty: 2.0,
+            ..Gpt2GenerationConfig::new(1)
+        };
+        let mut rng = SmallRng::new(generation.seed);
+
+        let token = select_next_token(&[1.0, 3.0, 2.0], &[1], &generation, &mut rng)?;
+
+        assert_eq!(token, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn top_k_one_samples_best_candidate() -> Result<()> {
+        let generation = Gpt2GenerationConfig {
+            temperature: 1.0,
+            top_k: Some(1),
+            ..Gpt2GenerationConfig::new(1)
+        };
+        let mut rng = SmallRng::new(generation.seed);
+
+        let token = select_next_token(&[0.0, 10.0, 9.0], &[], &generation, &mut rng)?;
+
+        assert_eq!(token, 1);
+        Ok(())
     }
 
     #[test]
