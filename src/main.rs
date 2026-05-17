@@ -1,14 +1,19 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use puppygrad::engine::Tensor;
 use puppygrad::models::autotune::{autotune, AutoTuneOptions, AutoTuneTarget};
-use puppygrad::models::generation::TextGenerationArgs;
+use puppygrad::models::generation::{TextGenerationArgs, TextGenerationConfig};
 use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
+use puppygrad::models::whisper::{
+    default_whisper_dir, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
+    WhisperBackendConfig, WhisperOperationProfile, WhisperRuntime, WhisperRustConfig, WhisperSize,
+    WhisperTask as RuntimeWhisperTask, WHISPER_SAMPLE_RATE,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -143,6 +148,92 @@ enum Command {
         instruct: bool,
     },
 
+    /// Prepare assets and run the native Whisper runtime.
+    Whisper {
+        /// Audio WAV path to transcribe, or "-" to read WAV bytes from stdin. Use --download/--print-config without audio to prepare assets.
+        #[arg(long)]
+        audio: Option<PathBuf>,
+
+        /// Whisper checkpoint size.
+        #[arg(long, value_enum, default_value_t = WhisperSize::TinyEn)]
+        size: WhisperSize,
+
+        /// Local directory containing config.json, tokenizer.json, preprocessor_config.json, and model.safetensors.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long)]
+        model_id: Option<String>,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Print loaded model and preprocessor dimensions.
+        #[arg(long)]
+        print_config: bool,
+
+        /// Whisper task.
+        #[arg(long, value_enum, default_value_t = WhisperTaskArg::Transcribe)]
+        task: WhisperTaskArg,
+
+        /// Language code, for example en.
+        #[arg(long)]
+        language: Option<String>,
+
+        /// Enable timestamp token generation and decode timestamp-token segment timings.
+        #[arg(long, conflicts_with = "no_timestamps")]
+        timestamps: bool,
+
+        /// Disable timestamp token generation.
+        #[arg(long)]
+        no_timestamps: bool,
+
+        /// Do not prepend previous segment text to later segment prompts.
+        #[arg(long)]
+        no_condition_on_previous_text: bool,
+
+        /// Number of worker threads for Whisper CPU projections and attention heads.
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// Execution backend.
+        #[arg(long, value_enum, default_value_t = WhisperBackendArg::Rust)]
+        backend: WhisperBackendArg,
+
+        /// Use experimental row-wise int8 logits weights.
+        #[arg(long)]
+        quantized_weights: bool,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = WhisperOutputFormatArg::Text)]
+        output: WhisperOutputFormatArg,
+
+        /// Skip a segment if the decoder no-speech probability is at least this threshold.
+        #[arg(long)]
+        no_speech_threshold: Option<f32>,
+
+        #[command(flatten)]
+        generation: TextGenerationArgs,
+
+        /// Write first decoder-step logits as little-endian f32 and exit.
+        #[arg(long, hide = true)]
+        first_logits_out: Option<PathBuf>,
+
+        /// Write the first encoded-audio values as little-endian f32 and exit.
+        #[arg(long, hide = true)]
+        encoder_slice_out: Option<PathBuf>,
+
+        /// Print timing/profile information to stderr.
+        #[arg(long)]
+        stats: bool,
+    },
+
     /// Run reproducible performance sweeps.
     Experiment {
         #[command(subcommand)]
@@ -254,8 +345,68 @@ enum ExperimentCommand {
         #[arg(long, value_enum, default_value_t = ExperimentFormatArg::Table)]
         format: ExperimentFormatArg,
     },
+
+    /// Time Whisper preprocessing, encode, and decode stages.
+    Whisper {
+        /// Audio WAV path to transcribe.
+        #[arg(long)]
+        audio: PathBuf,
+
+        /// Whisper checkpoint size.
+        #[arg(long, value_enum, default_value_t = WhisperSize::TinyEn)]
+        size: WhisperSize,
+
+        /// Local directory containing Whisper assets.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long)]
+        model_id: Option<String>,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Whisper task.
+        #[arg(long, value_enum, default_value_t = WhisperTaskArg::Transcribe)]
+        task: WhisperTaskArg,
+
+        /// Language code, for example en.
+        #[arg(long)]
+        language: Option<String>,
+
+        /// Disable timestamp token generation.
+        #[arg(long)]
+        no_timestamps: bool,
+
+        /// Number of worker threads for Whisper CPU projections and attention heads.
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// New tokens per measured decode.
+        #[arg(long, default_value_t = 8)]
+        max_new_tokens: usize,
+
+        /// Measured runs.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+
+        /// Warmup runs, excluded from output.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ExperimentFormatArg::Table)]
+        format: ExperimentFormatArg,
+    },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum AutoTuneCommand {
     /// Autotune GPT-2 Rust backend settings.
@@ -344,6 +495,65 @@ enum AutoTuneCommand {
         #[arg(long)]
         save_tuning: Option<PathBuf>,
     },
+
+    /// Autotune Whisper decode length candidates for the current reference path.
+    Whisper {
+        /// Audio WAV path to transcribe.
+        #[arg(long)]
+        audio: PathBuf,
+
+        /// Whisper checkpoint size.
+        #[arg(long, value_enum, default_value_t = WhisperSize::TinyEn)]
+        size: WhisperSize,
+
+        /// Local directory containing Whisper assets.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long)]
+        model_id: Option<String>,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Whisper task.
+        #[arg(long, value_enum, default_value_t = WhisperTaskArg::Transcribe)]
+        task: WhisperTaskArg,
+
+        /// Language code, for example en.
+        #[arg(long)]
+        language: Option<String>,
+
+        /// Disable timestamp token generation.
+        #[arg(long)]
+        no_timestamps: bool,
+
+        /// Number of worker threads for Whisper CPU projections and attention heads.
+        #[arg(long)]
+        threads: Option<usize>,
+
+        /// Comma-separated max-new-token candidates.
+        #[arg(long, default_value = "1,2,4,8")]
+        max_new_tokens: String,
+
+        /// Measured runs per candidate.
+        #[arg(long, default_value_t = 2)]
+        runs: usize,
+
+        /// Warmup runs per candidate.
+        #[arg(long, default_value_t = 1)]
+        warmup_runs: usize,
+
+        /// Stop after this many candidate configs.
+        #[arg(long, default_value_t = 4)]
+        max_trials: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -415,6 +625,51 @@ fn main() -> Result<()> {
             dtype,
             instruct,
         }),
+        Command::Whisper {
+            audio,
+            size,
+            model_dir,
+            model_id,
+            revision,
+            download,
+            print_config,
+            task,
+            language,
+            timestamps,
+            no_timestamps,
+            no_condition_on_previous_text,
+            threads,
+            backend,
+            quantized_weights,
+            output,
+            no_speech_threshold,
+            generation,
+            first_logits_out,
+            encoder_slice_out,
+            stats,
+        } => run_whisper(RunWhisperArgs {
+            audio,
+            size,
+            model_dir,
+            model_id,
+            revision,
+            download,
+            print_config,
+            task,
+            language,
+            timestamps,
+            no_timestamps,
+            no_condition_on_previous_text,
+            threads,
+            backend,
+            quantized_weights,
+            output,
+            no_speech_threshold,
+            generation,
+            first_logits_out,
+            encoder_slice_out,
+            stats,
+        }),
         Command::Experiment { cmd } => match cmd {
             ExperimentCommand::Gpt2 {
                 model_dir,
@@ -455,6 +710,37 @@ fn main() -> Result<()> {
                     attention_head_parallel_threshold,
                     quantized_weights: Some(quantized_weights),
                 },
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                format,
+            }),
+            ExperimentCommand::Whisper {
+                audio,
+                size,
+                model_dir,
+                model_id,
+                revision,
+                download,
+                task,
+                language,
+                no_timestamps,
+                threads,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                format,
+            } => run_whisper_experiment(RunWhisperExperimentArgs {
+                audio,
+                size,
+                model_dir,
+                model_id,
+                revision,
+                download,
+                task,
+                language,
+                no_timestamps,
+                threads,
                 max_new_tokens,
                 runs,
                 warmup_runs,
@@ -507,6 +793,37 @@ fn main() -> Result<()> {
                 max_trials,
                 save_tuning,
             }),
+            AutoTuneCommand::Whisper {
+                audio,
+                size,
+                model_dir,
+                model_id,
+                revision,
+                download,
+                task,
+                language,
+                no_timestamps,
+                threads,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                max_trials,
+            } => run_whisper_autotune(RunWhisperAutoTuneArgs {
+                audio,
+                size,
+                model_dir,
+                model_id,
+                revision,
+                download,
+                task,
+                language,
+                no_timestamps,
+                threads,
+                max_new_tokens,
+                runs,
+                warmup_runs,
+                max_trials,
+            }),
         },
         Command::DemoLinear {
             steps,
@@ -523,10 +840,39 @@ enum Gpt2BackendArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WhisperBackendArg {
+    Rust,
+    Gpu,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ExperimentFormatArg {
     Table,
     Csv,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WhisperTaskArg {
+    Transcribe,
+    Translate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WhisperOutputFormatArg {
+    Text,
+    Json,
+    Srt,
+    Vtt,
+}
+
+impl From<WhisperTaskArg> for RuntimeWhisperTask {
+    fn from(value: WhisperTaskArg) -> Self {
+        match value {
+            WhisperTaskArg::Transcribe => RuntimeWhisperTask::Transcribe,
+            WhisperTaskArg::Translate => RuntimeWhisperTask::Translate,
+        }
+    }
 }
 
 struct RunGpt2Args {
@@ -574,6 +920,23 @@ struct RunGpt2ExperimentArgs {
     format: ExperimentFormatArg,
 }
 
+struct RunWhisperExperimentArgs {
+    audio: PathBuf,
+    size: WhisperSize,
+    model_dir: Option<PathBuf>,
+    model_id: Option<String>,
+    revision: String,
+    download: bool,
+    task: WhisperTaskArg,
+    language: Option<String>,
+    no_timestamps: bool,
+    threads: Option<usize>,
+    max_new_tokens: usize,
+    runs: usize,
+    warmup_runs: usize,
+    format: ExperimentFormatArg,
+}
+
 struct RunGpt2AutoTuneArgs {
     model_dir: Option<PathBuf>,
     model_id: String,
@@ -598,6 +961,23 @@ struct RunGpt2AutoTuneArgs {
     save_tuning: Option<PathBuf>,
 }
 
+struct RunWhisperAutoTuneArgs {
+    audio: PathBuf,
+    size: WhisperSize,
+    model_dir: Option<PathBuf>,
+    model_id: Option<String>,
+    revision: String,
+    download: bool,
+    task: WhisperTaskArg,
+    language: Option<String>,
+    no_timestamps: bool,
+    threads: Option<usize>,
+    max_new_tokens: String,
+    runs: usize,
+    warmup_runs: usize,
+    max_trials: usize,
+}
+
 struct RunQwenArgs {
     model_dir: Option<PathBuf>,
     model_id: String,
@@ -607,6 +987,37 @@ struct RunQwenArgs {
     generation: TextGenerationArgs,
     dtype: Option<String>,
     instruct: bool,
+}
+
+struct RunWhisperArgs {
+    audio: Option<PathBuf>,
+    size: WhisperSize,
+    model_dir: Option<PathBuf>,
+    model_id: Option<String>,
+    revision: String,
+    download: bool,
+    print_config: bool,
+    task: WhisperTaskArg,
+    language: Option<String>,
+    timestamps: bool,
+    no_timestamps: bool,
+    no_condition_on_previous_text: bool,
+    threads: Option<usize>,
+    backend: WhisperBackendArg,
+    quantized_weights: bool,
+    output: WhisperOutputFormatArg,
+    no_speech_threshold: Option<f32>,
+    generation: TextGenerationArgs,
+    first_logits_out: Option<PathBuf>,
+    encoder_slice_out: Option<PathBuf>,
+    stats: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WhisperSegmentOutput {
+    start: f32,
+    end: f32,
+    text: String,
 }
 
 fn run_gpt2(args: RunGpt2Args) -> Result<()> {
@@ -670,11 +1081,379 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
     Ok(())
 }
 
+fn run_whisper(args: RunWhisperArgs) -> Result<()> {
+    let model_dir = args
+        .model_dir
+        .unwrap_or_else(|| default_whisper_dir(args.size));
+    if args.download {
+        eprintln!(
+            "downloading/checking Whisper assets for {} into {}",
+            args.size,
+            model_dir.display()
+        );
+    }
+
+    let backend = whisper_backend_config(
+        args.size,
+        args.threads,
+        args.backend,
+        args.quantized_weights,
+    )?;
+    let load_start = Instant::now();
+    let runtime = WhisperRuntime::prepare_from_huggingface_with_backend(
+        args.size,
+        args.model_id.as_deref(),
+        &args.revision,
+        &model_dir,
+        args.download,
+        backend,
+    )?;
+    let load_time = load_start.elapsed();
+
+    if args.print_config || args.audio.is_none() {
+        for line in runtime.metadata_lines() {
+            println!("{line}");
+        }
+        if args.audio.is_none() {
+            if args.stats {
+                eprintln!("stats:");
+                eprintln!("  load: {}", format_duration(load_time));
+            }
+            return Ok(());
+        }
+    }
+
+    let no_timestamps = args.no_timestamps || !args.timestamps;
+    let prefix = runtime.tokenizer.prompt_prefix(
+        args.task.into(),
+        args.language.as_deref(),
+        no_timestamps,
+        args.size,
+    )?;
+
+    let audio_path = args.audio.expect("checked above");
+    let audio_start = Instant::now();
+    let audio = load_audio_arg(&audio_path)?;
+    if audio.sample_rate != WHISPER_SAMPLE_RATE {
+        return Err(format!(
+            "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
+            audio_path.display(),
+            audio.sample_rate
+        )
+        .into());
+    }
+    let audio_time = audio_start.elapsed();
+
+    let mut generation_template = args.generation.to_config_with_default(1);
+    generation_template.eos_token_id = Some(runtime.tokenizer.special_tokens().eos);
+    generation_template.validate()?;
+    let mut profile = WhisperOperationProfile::default();
+    let mut features_time = Duration::ZERO;
+    let mut encode_time = Duration::ZERO;
+    let mut prefill_time = Duration::ZERO;
+    let mut decode_time = Duration::ZERO;
+    let mut generated_tokens = 0usize;
+    let mut segments = Vec::new();
+    let mut previous_text_tokens = Vec::new();
+    let chunk_samples = runtime.preprocessor.n_samples;
+    let total_samples = audio.samples.len().max(1);
+
+    for (segment_index, start_sample) in (0..total_samples).step_by(chunk_samples).enumerate() {
+        let end_sample = (start_sample + chunk_samples).min(audio.samples.len());
+        let chunk = &audio.samples[start_sample..end_sample];
+        let features_start = Instant::now();
+        let features = log_mel_spectrogram(chunk, &runtime.preprocessor)?;
+        features_time += features_start.elapsed();
+
+        let encode_start = Instant::now();
+        let encoded = runtime.encode_audio(&features, &mut profile)?;
+        encode_time += encode_start.elapsed();
+
+        if let Some(path) = args.encoder_slice_out.as_ref() {
+            if segment_index == 0 {
+                let take = encoded.values.len().min(64);
+                let bytes = encoded.values[..take]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>();
+                fs::write(path, bytes)?;
+                if args.stats {
+                    eprintln!("stats:");
+                    eprintln!("  load: {}", format_duration(load_time));
+                    eprintln!(
+                        "  audio preprocessing: {}",
+                        format_duration(audio_time + features_time)
+                    );
+                    eprintln!("    wav decode: {}", format_duration(audio_time));
+                    eprintln!("    log-mel: {}", format_duration(features_time));
+                    eprintln!("  encode: {}", format_duration(encode_time));
+                    eprintln!("  encoder slice: {}", path.display());
+                }
+                return Ok(());
+            }
+        }
+
+        let mut segment_prompt = prefix.clone();
+        let mut segment_generation = generation_template.clone();
+        let default_max_new_tokens = runtime
+            .config
+            .n_text_ctx
+            .saturating_sub(segment_prompt.len());
+        segment_generation.max_new_tokens = args
+            .generation
+            .max_new_tokens
+            .unwrap_or(default_max_new_tokens);
+        segment_generation.max_new_tokens = segment_generation
+            .max_new_tokens
+            .min(default_max_new_tokens);
+
+        if !args.no_condition_on_previous_text && !previous_text_tokens.is_empty() {
+            let available = runtime
+                .config
+                .n_text_ctx
+                .saturating_sub(segment_generation.max_new_tokens)
+                .saturating_sub(segment_prompt.len());
+            let keep = available.min(previous_text_tokens.len()).min(224);
+            segment_prompt
+                .extend_from_slice(&previous_text_tokens[previous_text_tokens.len() - keep..]);
+        }
+        segment_generation.max_new_tokens = segment_generation.max_new_tokens.min(
+            runtime
+                .config
+                .n_text_ctx
+                .saturating_sub(segment_prompt.len()),
+        );
+        segment_generation.validate()?;
+
+        let prefill_start = Instant::now();
+        let first_logits = runtime.decoder_logits(&encoded, &segment_prompt, &mut profile)?;
+        prefill_time += prefill_start.elapsed();
+
+        if let Some(path) = args.first_logits_out.as_ref() {
+            if segment_index == 0 {
+                let bytes = first_logits
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>();
+                fs::write(path, bytes)?;
+                if args.stats {
+                    eprintln!("stats:");
+                    eprintln!("  load: {}", format_duration(load_time));
+                    eprintln!(
+                        "  audio preprocessing: {}",
+                        format_duration(audio_time + features_time)
+                    );
+                    eprintln!("    wav decode: {}", format_duration(audio_time));
+                    eprintln!("    log-mel: {}", format_duration(features_time));
+                    eprintln!("  encode: {}", format_duration(encode_time));
+                    eprintln!(
+                        "  prefill: {} ({} prompt tokens)",
+                        format_duration(prefill_time),
+                        segment_prompt.len()
+                    );
+                    eprintln!("  first logits: {}", path.display());
+                }
+                return Ok(());
+            }
+        }
+
+        let no_speech_probability = runtime
+            .tokenizer
+            .special_tokens()
+            .no_speech
+            .map(|token_id| logits_probability(&first_logits, token_id))
+            .unwrap_or(0.0);
+        if args
+            .no_speech_threshold
+            .is_some_and(|threshold| no_speech_probability >= threshold)
+        {
+            segments.push(WhisperSegmentOutput {
+                start: start_sample as f32 / audio.sample_rate as f32,
+                end: end_sample as f32 / audio.sample_rate as f32,
+                text: String::new(),
+            });
+            continue;
+        }
+
+        let decode_start = Instant::now();
+        let output_tokens = runtime.generate_greedy(
+            &encoded,
+            &segment_prompt,
+            &segment_generation,
+            no_timestamps,
+            &mut profile,
+        )?;
+        decode_time += decode_start.elapsed();
+        let segment_generated = output_tokens.len().saturating_sub(segment_prompt.len());
+        generated_tokens += segment_generated;
+        let generated = &output_tokens[segment_prompt.len()..];
+        let window_start = start_sample as f32 / audio.sample_rate as f32;
+        let window_end = end_sample as f32 / audio.sample_rate as f32;
+        let mut decoded_segments = if no_timestamps {
+            let transcript = runtime.tokenizer.decode(generated)?;
+            vec![WhisperSegmentOutput {
+                start: window_start,
+                end: window_end,
+                text: transcript.trim().to_string(),
+            }]
+        } else {
+            decode_timestamped_segments(&runtime, generated, window_start, window_end)?
+        };
+        for segment in &decoded_segments {
+            if !segment.text.is_empty() {
+                previous_text_tokens.extend(runtime.tokenizer.encode(&segment.text)?);
+            }
+        }
+        segments.append(&mut decoded_segments);
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    match args.output {
+        WhisperOutputFormatArg::Text => {
+            let transcript = segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(stdout, "{transcript}")?;
+        }
+        WhisperOutputFormatArg::Json => {
+            serde_json::to_writer_pretty(&mut stdout, &segments)?;
+            writeln!(stdout)?;
+        }
+        WhisperOutputFormatArg::Srt => {
+            for (i, segment) in segments
+                .iter()
+                .filter(|segment| !segment.text.is_empty())
+                .enumerate()
+            {
+                writeln!(stdout, "{}", i + 1)?;
+                writeln!(
+                    stdout,
+                    "{} --> {}",
+                    format_srt_timestamp(segment.start),
+                    format_srt_timestamp(segment.end)
+                )?;
+                writeln!(stdout, "{}\n", segment.text)?;
+            }
+        }
+        WhisperOutputFormatArg::Vtt => {
+            writeln!(stdout, "WEBVTT\n")?;
+            for segment in segments.iter().filter(|segment| !segment.text.is_empty()) {
+                writeln!(
+                    stdout,
+                    "{} --> {}",
+                    format_vtt_timestamp(segment.start),
+                    format_vtt_timestamp(segment.end)
+                )?;
+                writeln!(stdout, "{}\n", segment.text)?;
+            }
+        }
+    }
+    stdout.flush()?;
+
+    if args.stats {
+        eprintln!("stats:");
+        eprintln!("  load: {}", format_duration(load_time));
+        eprintln!(
+            "  audio preprocessing: {}",
+            format_duration(audio_time + features_time)
+        );
+        eprintln!("    wav decode: {}", format_duration(audio_time));
+        eprintln!("    log-mel: {}", format_duration(features_time));
+        eprintln!("  encode: {}", format_duration(encode_time));
+        eprintln!(
+            "  prefill: {} ({} prompt tokens)",
+            format_duration(prefill_time),
+            prefix.len()
+        );
+        eprintln!(
+            "  decode: {} ({} generated tokens)",
+            format_duration(decode_time),
+            generated_tokens
+        );
+        eprintln!("  profile:");
+        eprintln!(
+            "    audio projection: {}",
+            format_duration(profile.audio_projection)
+        );
+        eprintln!(
+            "    encoder attention: {}",
+            format_duration(profile.encoder_attention)
+        );
+        eprintln!("    encoder mlp: {}", format_duration(profile.encoder_mlp));
+        eprintln!(
+            "    encoder layernorm: {}",
+            format_duration(profile.encoder_layer_norm)
+        );
+        eprintln!(
+            "    decoder self-attention: {}",
+            format_duration(profile.decoder_self_attention)
+        );
+        eprintln!(
+            "    decoder cross-attention: {}",
+            format_duration(profile.decoder_cross_attention)
+        );
+        eprintln!("    decoder mlp: {}", format_duration(profile.decoder_mlp));
+        eprintln!(
+            "    decoder layernorm: {}",
+            format_duration(profile.decoder_layer_norm)
+        );
+        eprintln!(
+            "    final logits: {}",
+            format_duration(profile.final_logits)
+        );
+        eprintln!(
+            "  total: {}",
+            format_duration(
+                load_time + audio_time + features_time + encode_time + prefill_time + decode_time
+            )
+        );
+    }
+    Ok(())
+}
+
+fn load_audio_arg(audio_path: &PathBuf) -> Result<puppygrad::models::whisper::PcmAudio> {
+    if audio_path.as_os_str() == "-" {
+        let mut data = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut data)?;
+        return Ok(load_wav_pcm_bytes(PathBuf::from("<stdin>"), &data)?);
+    }
+    Ok(load_wav_pcm(audio_path)?)
+}
+
 fn rust_config(
     threads: usize,
     tuning: RustTuning,
 ) -> puppygrad::models::gpt2::Result<Gpt2RustConfig> {
     rust_config_from(Gpt2RustConfig::default(), Some(threads), tuning)
+}
+
+fn whisper_rust_config(
+    size: WhisperSize,
+    threads: Option<usize>,
+) -> puppygrad::models::whisper::Result<WhisperRustConfig> {
+    let mut config = WhisperRustConfig::for_size(size);
+    if let Some(threads) = threads {
+        config = config.with_threads(threads);
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+fn whisper_backend_config(
+    size: WhisperSize,
+    threads: Option<usize>,
+    backend: WhisperBackendArg,
+    quantized_weights: bool,
+) -> puppygrad::models::whisper::Result<WhisperBackendConfig> {
+    match backend {
+        WhisperBackendArg::Rust => Ok(WhisperBackendConfig::Rust(
+            whisper_rust_config(size, threads)?.with_quantized_weights(quantized_weights),
+        )),
+        WhisperBackendArg::Gpu => Ok(WhisperBackendConfig::Gpu),
+    }
 }
 
 fn rust_config_from(
@@ -1128,6 +1907,188 @@ fn print_gpt2_autotune_config(config: &Gpt2AutoTuneConfig) {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WhisperAutoTuneConfig {
+    max_new_tokens: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct WhisperAutoTuneMeasurement {
+    segments: usize,
+    generated_tokens: usize,
+    decode_tokens_per_second: f64,
+    total_ms: f64,
+    log_mel_ms: f64,
+    encode_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+}
+
+struct WhisperAutoTuneTarget {
+    runtime: WhisperRuntime,
+    samples: Vec<f32>,
+    prefix: Vec<usize>,
+    no_timestamps: bool,
+    candidates: Vec<WhisperAutoTuneConfig>,
+}
+
+impl AutoTuneTarget for WhisperAutoTuneTarget {
+    type Config = WhisperAutoTuneConfig;
+    type Measurement = WhisperAutoTuneMeasurement;
+    type Error = Box<dyn std::error::Error>;
+
+    fn candidate_configs(&self) -> Vec<Self::Config> {
+        self.candidates.clone()
+    }
+
+    fn evaluate_config(
+        &mut self,
+        config: &Self::Config,
+        options: &AutoTuneOptions,
+    ) -> std::result::Result<Self::Measurement, Self::Error> {
+        eprintln!(
+            "autotune whisper trial: max_new_tokens={}",
+            config.max_new_tokens
+        );
+        let mut generation = TextGenerationConfig::new(config.max_new_tokens);
+        generation.eos_token_id = Some(self.runtime.tokenizer.special_tokens().eos);
+        generation.validate()?;
+
+        for _ in 0..options.warmup_runs {
+            let _ = whisper_experiment_run(
+                &self.runtime,
+                &self.samples,
+                &self.prefix,
+                &generation,
+                self.no_timestamps,
+            )?;
+        }
+
+        let mut measurements = Vec::with_capacity(options.measured_runs);
+        for _ in 0..options.measured_runs {
+            measurements.push(whisper_experiment_run(
+                &self.runtime,
+                &self.samples,
+                &self.prefix,
+                &generation,
+                self.no_timestamps,
+            )?);
+        }
+
+        let generated_tokens = measurements
+            .iter()
+            .map(|measurement| measurement.generated_tokens)
+            .sum::<usize>();
+        let log_mel_time = sum_duration(measurements.iter().map(|m| m.log_mel_time));
+        let encode_time = sum_duration(measurements.iter().map(|m| m.encode_time));
+        let prefill_time = sum_duration(measurements.iter().map(|m| m.prefill_time));
+        let decode_time = sum_duration(measurements.iter().map(|m| m.decode_time));
+        let total_time = log_mel_time + encode_time + prefill_time + decode_time;
+        let runs = measurements.len().max(1) as f64;
+        Ok(WhisperAutoTuneMeasurement {
+            segments: measurements.first().map_or(0, |m| m.segments),
+            generated_tokens,
+            decode_tokens_per_second: rate(generated_tokens as f64, decode_time),
+            total_ms: duration_ms(total_time) / runs,
+            log_mel_ms: duration_ms(log_mel_time) / runs,
+            encode_ms: duration_ms(encode_time) / runs,
+            prefill_ms: duration_ms(prefill_time) / runs,
+            decode_ms: duration_ms(decode_time) / runs,
+        })
+    }
+
+    fn score(&self, measurement: &Self::Measurement) -> f64 {
+        measurement.decode_tokens_per_second
+    }
+}
+
+fn run_whisper_autotune(args: RunWhisperAutoTuneArgs) -> Result<()> {
+    if args.runs == 0 {
+        return Err("autotune whisper --runs must be > 0".into());
+    }
+    if args.max_trials == 0 {
+        return Err("autotune whisper --max-trials must be > 0".into());
+    }
+    let token_candidates = parse_usize_list("max-new-tokens", &args.max_new_tokens)?;
+    let candidates = token_candidates
+        .into_iter()
+        .map(|max_new_tokens| WhisperAutoTuneConfig { max_new_tokens })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err("autotune whisper generated no candidates".into());
+    }
+
+    let model_dir = args
+        .model_dir
+        .clone()
+        .unwrap_or_else(|| default_whisper_dir(args.size));
+    if args.download {
+        eprintln!(
+            "downloading/checking Whisper assets for {} into {}",
+            args.size,
+            model_dir.display()
+        );
+    }
+    let rust_config = whisper_rust_config(args.size, args.threads)?;
+    let runtime = WhisperRuntime::prepare_from_huggingface_with_rust_config(
+        args.size,
+        args.model_id.as_deref(),
+        &args.revision,
+        &model_dir,
+        args.download,
+        rust_config,
+    )?;
+    let audio = load_wav_pcm(&args.audio)?;
+    if audio.sample_rate != WHISPER_SAMPLE_RATE {
+        return Err(format!(
+            "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
+            args.audio.display(),
+            audio.sample_rate
+        )
+        .into());
+    }
+    let prefix = runtime.tokenizer.prompt_prefix(
+        args.task.into(),
+        args.language.as_deref(),
+        args.no_timestamps,
+        args.size,
+    )?;
+    let mut target = WhisperAutoTuneTarget {
+        runtime,
+        samples: audio.samples,
+        prefix,
+        no_timestamps: args.no_timestamps,
+        candidates,
+    };
+    let options = AutoTuneOptions {
+        warmup_runs: args.warmup_runs,
+        measured_runs: args.runs,
+        max_trials: Some(args.max_trials),
+    };
+    let result = autotune(&mut target, &options)?;
+
+    println!("best:");
+    println!("  --max-new-tokens {}", result.best_config.max_new_tokens);
+    println!("  score: {:.2} decode tok/s", result.best_score);
+    println!();
+    println!(
+        "{:>5} {:>14} {:>10} {:>10} {:>10} {:>10}",
+        "trial", "max_new", "tok/s", "encode", "decode", "total"
+    );
+    for (index, trial) in result.trials.iter().enumerate() {
+        println!(
+            "{:>5} {:>14} {:>10.2} {:>10.2} {:>10.2} {:>10.2}",
+            index + 1,
+            trial.config.max_new_tokens,
+            trial.measurement.decode_tokens_per_second,
+            trial.measurement.encode_ms,
+            trial.measurement.decode_ms,
+            trial.measurement.total_ms
+        );
+    }
+    Ok(())
+}
+
 fn print_gpt2_speed(stats: &Gpt2GenerationStats) {
     eprintln!(
         "\ntokens/sec: {:.2} tok/s ({} generated tokens)",
@@ -1222,6 +2183,99 @@ fn format_duration(duration: Duration) -> String {
     format!("{microseconds:.2}us")
 }
 
+fn logits_probability(logits: &[f32], token_id: usize) -> f32 {
+    if token_id >= logits.len() {
+        return 0.0;
+    }
+    let max = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |acc, value| acc.max(value));
+    let denominator = logits.iter().map(|value| (*value - max).exp()).sum::<f32>();
+    if denominator == 0.0 {
+        return 0.0;
+    }
+    (logits[token_id] - max).exp() / denominator
+}
+
+fn decode_timestamped_segments(
+    runtime: &WhisperRuntime,
+    token_ids: &[usize],
+    window_start: f32,
+    window_end: f32,
+) -> Result<Vec<WhisperSegmentOutput>> {
+    let Some(timestamp_begin) = runtime.tokenizer.special_tokens().timestamp_begin else {
+        let text = runtime.tokenizer.decode(token_ids)?.trim().to_string();
+        return Ok(vec![WhisperSegmentOutput {
+            start: window_start,
+            end: window_end,
+            text,
+        }]);
+    };
+
+    let mut segments = Vec::new();
+    let mut text_tokens = Vec::new();
+    let mut segment_start = window_start;
+    for token_id in token_ids.iter().copied() {
+        if token_id >= timestamp_begin {
+            let timestamp = timestamp_token_seconds(timestamp_begin, token_id, window_start);
+            if !text_tokens.is_empty() {
+                let text = runtime.tokenizer.decode(&text_tokens)?.trim().to_string();
+                if !text.is_empty() {
+                    segments.push(WhisperSegmentOutput {
+                        start: segment_start,
+                        end: timestamp.max(segment_start),
+                        text,
+                    });
+                }
+                text_tokens.clear();
+            }
+            segment_start = timestamp;
+        } else {
+            text_tokens.push(token_id);
+        }
+    }
+    if !text_tokens.is_empty() {
+        let text = runtime.tokenizer.decode(&text_tokens)?.trim().to_string();
+        if !text.is_empty() {
+            segments.push(WhisperSegmentOutput {
+                start: segment_start,
+                end: window_end.max(segment_start),
+                text,
+            });
+        }
+    }
+    if segments.is_empty() {
+        segments.push(WhisperSegmentOutput {
+            start: window_start,
+            end: window_end,
+            text: String::new(),
+        });
+    }
+    Ok(segments)
+}
+
+fn timestamp_token_seconds(timestamp_begin: usize, token_id: usize, window_start: f32) -> f32 {
+    window_start + (token_id.saturating_sub(timestamp_begin) as f32 * 0.02)
+}
+
+fn format_srt_timestamp(seconds: f32) -> String {
+    format_timestamp(seconds, ',')
+}
+
+fn format_vtt_timestamp(seconds: f32) -> String {
+    format_timestamp(seconds, '.')
+}
+
+fn format_timestamp(seconds: f32, decimal_separator: char) -> String {
+    let millis = (seconds.max(0.0) * 1_000.0).round() as u64;
+    let hours = millis / 3_600_000;
+    let minutes = (millis / 60_000) % 60;
+    let seconds = (millis / 1_000) % 60;
+    let millis = millis % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02}{decimal_separator}{millis:03}")
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Gpt2ExperimentRow {
     backend: String,
@@ -1278,6 +2332,32 @@ struct DistributionSummary {
     p95: f64,
     max: f64,
     stddev: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WhisperExperimentRow {
+    size: String,
+    audio: String,
+    run: usize,
+    segments: usize,
+    max_new_tokens: usize,
+    generated_tokens: usize,
+    load_ms: f64,
+    audio_decode_ms: f64,
+    log_mel_ms: f64,
+    encode_ms: f64,
+    prefill_ms: f64,
+    decode_ms: f64,
+    total_ms: f64,
+    audio_projection_ms: f64,
+    encoder_attention_ms: f64,
+    encoder_mlp_ms: f64,
+    encoder_layer_norm_ms: f64,
+    decoder_self_attention_ms: f64,
+    decoder_cross_attention_ms: f64,
+    decoder_mlp_ms: f64,
+    decoder_layer_norm_ms: f64,
+    final_logits_ms: f64,
 }
 
 fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
@@ -1381,6 +2461,244 @@ fn run_gpt2_experiment(args: RunGpt2ExperimentArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_whisper_experiment(args: RunWhisperExperimentArgs) -> Result<()> {
+    if args.runs == 0 {
+        return Err("experiment whisper --runs must be > 0".into());
+    }
+    if args.max_new_tokens == 0 {
+        return Err("experiment whisper --max-new-tokens must be > 0".into());
+    }
+    let model_dir = args
+        .model_dir
+        .clone()
+        .unwrap_or_else(|| default_whisper_dir(args.size));
+    if args.download {
+        eprintln!(
+            "downloading/checking Whisper assets for {} into {}",
+            args.size,
+            model_dir.display()
+        );
+    }
+
+    let load_start = Instant::now();
+    let rust_config = whisper_rust_config(args.size, args.threads)?;
+    let runtime = WhisperRuntime::prepare_from_huggingface_with_rust_config(
+        args.size,
+        args.model_id.as_deref(),
+        &args.revision,
+        &model_dir,
+        args.download,
+        rust_config,
+    )?;
+    let load_time = load_start.elapsed();
+
+    let audio_decode_start = Instant::now();
+    let audio = load_wav_pcm(&args.audio)?;
+    if audio.sample_rate != WHISPER_SAMPLE_RATE {
+        return Err(format!(
+            "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
+            args.audio.display(),
+            audio.sample_rate
+        )
+        .into());
+    }
+    let audio_decode_time = audio_decode_start.elapsed();
+
+    let prefix = runtime.tokenizer.prompt_prefix(
+        args.task.into(),
+        args.language.as_deref(),
+        args.no_timestamps,
+        args.size,
+    )?;
+    let mut generation = TextGenerationConfig::new(args.max_new_tokens);
+    generation.eos_token_id = Some(runtime.tokenizer.special_tokens().eos);
+    generation.validate()?;
+
+    for _ in 0..args.warmup_runs {
+        let _ = whisper_experiment_run(
+            &runtime,
+            &audio.samples,
+            &prefix,
+            &generation,
+            args.no_timestamps,
+        )?;
+    }
+
+    let mut rows = Vec::with_capacity(args.runs);
+    for run in 1..=args.runs {
+        let measurement = whisper_experiment_run(
+            &runtime,
+            &audio.samples,
+            &prefix,
+            &generation,
+            args.no_timestamps,
+        )?;
+        rows.push(WhisperExperimentRow {
+            size: args.size.to_string(),
+            audio: args.audio.display().to_string(),
+            run,
+            segments: measurement.segments,
+            max_new_tokens: args.max_new_tokens,
+            generated_tokens: measurement.generated_tokens,
+            load_ms: duration_ms(load_time),
+            audio_decode_ms: duration_ms(audio_decode_time),
+            log_mel_ms: duration_ms(measurement.log_mel_time),
+            encode_ms: duration_ms(measurement.encode_time),
+            prefill_ms: duration_ms(measurement.prefill_time),
+            decode_ms: duration_ms(measurement.decode_time),
+            total_ms: duration_ms(
+                measurement.log_mel_time
+                    + measurement.encode_time
+                    + measurement.prefill_time
+                    + measurement.decode_time,
+            ),
+            audio_projection_ms: duration_ms(measurement.profile.audio_projection),
+            encoder_attention_ms: duration_ms(measurement.profile.encoder_attention),
+            encoder_mlp_ms: duration_ms(measurement.profile.encoder_mlp),
+            encoder_layer_norm_ms: duration_ms(measurement.profile.encoder_layer_norm),
+            decoder_self_attention_ms: duration_ms(measurement.profile.decoder_self_attention),
+            decoder_cross_attention_ms: duration_ms(measurement.profile.decoder_cross_attention),
+            decoder_mlp_ms: duration_ms(measurement.profile.decoder_mlp),
+            decoder_layer_norm_ms: duration_ms(measurement.profile.decoder_layer_norm),
+            final_logits_ms: duration_ms(measurement.profile.final_logits),
+        });
+    }
+
+    match args.format {
+        ExperimentFormatArg::Table => print_whisper_experiment_table(&rows),
+        ExperimentFormatArg::Csv => print_whisper_experiment_csv(&rows),
+        ExperimentFormatArg::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct WhisperExperimentMeasurement {
+    segments: usize,
+    generated_tokens: usize,
+    log_mel_time: Duration,
+    encode_time: Duration,
+    prefill_time: Duration,
+    decode_time: Duration,
+    profile: WhisperOperationProfile,
+}
+
+fn whisper_experiment_run(
+    runtime: &WhisperRuntime,
+    samples: &[f32],
+    prefix: &[usize],
+    generation: &TextGenerationConfig,
+    no_timestamps: bool,
+) -> Result<WhisperExperimentMeasurement> {
+    let mut profile = WhisperOperationProfile::default();
+    let mut log_mel_time = Duration::ZERO;
+    let mut encode_time = Duration::ZERO;
+    let mut prefill_time = Duration::ZERO;
+    let mut decode_time = Duration::ZERO;
+    let mut generated_tokens = 0usize;
+    let mut segments = 0usize;
+    let chunk_samples = runtime.preprocessor.n_samples;
+    let total_samples = samples.len().max(1);
+
+    for start_sample in (0..total_samples).step_by(chunk_samples) {
+        let end_sample = (start_sample + chunk_samples).min(samples.len());
+        let chunk = &samples[start_sample..end_sample];
+        let start = Instant::now();
+        let features = log_mel_spectrogram(chunk, &runtime.preprocessor)?;
+        log_mel_time += start.elapsed();
+
+        let start = Instant::now();
+        let encoded = runtime.encode_audio(&features, &mut profile)?;
+        encode_time += start.elapsed();
+
+        let start = Instant::now();
+        let _ = runtime.decoder_logits(&encoded, prefix, &mut profile)?;
+        prefill_time += start.elapsed();
+
+        let start = Instant::now();
+        let output =
+            runtime.generate_greedy(&encoded, prefix, generation, no_timestamps, &mut profile)?;
+        decode_time += start.elapsed();
+        generated_tokens += output.len().saturating_sub(prefix.len());
+        segments += 1;
+    }
+
+    Ok(WhisperExperimentMeasurement {
+        segments,
+        generated_tokens,
+        log_mel_time,
+        encode_time,
+        prefill_time,
+        decode_time,
+        profile,
+    })
+}
+
+fn print_whisper_experiment_table(rows: &[WhisperExperimentRow]) {
+    println!(
+        "{:>4} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
+        "run",
+        "segments",
+        "tokens",
+        "logmel",
+        "encode",
+        "prefill",
+        "decode",
+        "enc_attn",
+        "xattn",
+        "total"
+    );
+    for row in rows {
+        println!(
+            "{:>4} {:>8} {:>8} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+            row.run,
+            row.segments,
+            row.generated_tokens,
+            row.log_mel_ms,
+            row.encode_ms,
+            row.prefill_ms,
+            row.decode_ms,
+            row.encoder_attention_ms,
+            row.decoder_cross_attention_ms,
+            row.total_ms
+        );
+    }
+}
+
+fn print_whisper_experiment_csv(rows: &[WhisperExperimentRow]) {
+    println!(
+        "size,audio,run,segments,max_new_tokens,generated_tokens,load_ms,audio_decode_ms,log_mel_ms,encode_ms,prefill_ms,decode_ms,total_ms,audio_projection_ms,encoder_attention_ms,encoder_mlp_ms,encoder_layer_norm_ms,decoder_self_attention_ms,decoder_cross_attention_ms,decoder_mlp_ms,decoder_layer_norm_ms,final_logits_ms"
+    );
+    for row in rows {
+        println!(
+            "{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+            row.size,
+            row.audio,
+            row.run,
+            row.segments,
+            row.max_new_tokens,
+            row.generated_tokens,
+            row.load_ms,
+            row.audio_decode_ms,
+            row.log_mel_ms,
+            row.encode_ms,
+            row.prefill_ms,
+            row.decode_ms,
+            row.total_ms,
+            row.audio_projection_ms,
+            row.encoder_attention_ms,
+            row.encoder_mlp_ms,
+            row.encoder_layer_norm_ms,
+            row.decoder_self_attention_ms,
+            row.decoder_cross_attention_ms,
+            row.decoder_mlp_ms,
+            row.decoder_layer_norm_ms,
+            row.final_logits_ms
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1769,7 +3087,7 @@ fn run_qwen(args: RunQwenArgs) -> Result<()> {
     println!("prompt: {}", args.prompt);
     println!(
         "generation args: max_new_tokens={} temperature={} top_k={:?} top_p={:?} seed={} repeat_penalty={} repeat_last_n={} dtype={:?} instruct={} download={}",
-        args.generation.max_new_tokens,
+        args.generation.max_new_tokens_or(32),
         args.generation.temperature,
         args.generation.top_k,
         args.generation.top_p,

@@ -7,3 +7,4 @@ pub mod generation;
 pub mod gpt2;
 pub mod safetensors;
 pub mod streaming;
+pub mod whisper;

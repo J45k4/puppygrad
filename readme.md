@@ -17,6 +17,7 @@ Implemented:
 | Model | Status | Runtime | Notes |
 | --- | --- | --- | --- |
 | GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy/sampled decoding, token streaming, and a KV cache. |
+| Whisper | Working MVP | Rust reference | Prepares Hugging Face Whisper assets, loads typed model/preprocessor/tokenizer/weight metadata, decodes PCM WAV input, computes log-mel features, and runs greedy `tiny.en`/`tiny` transcription. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -24,6 +25,71 @@ Model assets are stored under the project-root `models/` directory, which is ign
 Shared model runtime code is intentionally limited to pieces that already have clear cross-model shape: generation CLI args and sampling config, token streaming, generation stats, asset/config loading, safetensors access, CPU math kernels, and minimal autoregressive/KV-cache traits. Full transformer block extraction is deferred until a second native model exists, so GPT-2 learned-position blocks and future RoPE-based Qwen/Llama blocks do not get forced through the wrong abstraction.
 
 See `docs/model-runtime.md` for shared autoregressive runtime notes and examples.
+
+### Whisper native runtime status
+
+The `whisper` command currently supports asset preparation and the native audio preprocessing path. It downloads or checks these Hugging Face files: `config.json`, `tokenizer.json`, `preprocessor_config.json`, and `model.safetensors`.
+
+Prepare the default `tiny.en` assets and print resolved metadata:
+
+```bash
+./target/release/puppygrad whisper \
+  --size tiny.en \
+  --download \
+  --print-config
+```
+
+The default local directory is `models/whisper-tiny.en`. Use `--model-dir`, `--model-id`, and `--revision` to select a different checkpoint or location.
+
+The smoke-test command for the intended first transcription path is:
+
+```bash
+./target/release/puppygrad whisper \
+  --audio tests/data/audio/jfk_16khz_mono.wav \
+  --size tiny.en \
+  --download \
+  --task transcribe \
+  --language en \
+  --no-timestamps \
+  --stats
+```
+
+When `--max-new-tokens` is omitted, Whisper decodes until EOS or the remaining decoder text context is full. Pass `--max-new-tokens N` only when you want to cap a run for a shorter smoke test.
+
+Use `--audio -` to read 16 kHz PCM WAV bytes from stdin, for example `cat clip.wav | ./target/release/puppygrad whisper --audio - --size tiny.en --language en --no-timestamps`.
+
+For segment metadata instead of plain text, pass `--output json`. `--output srt` and `--output vtt` emit segment-window subtitle timestamps by default; with `--timestamps`, Whisper timestamp tokens are decoded into segment timings. Audio longer than one 30-second Whisper window is split into consecutive windows; by default later segments may include previous segment text in the prompt. Pass `--no-condition-on-previous-text` to disable that. Use `--no-speech-threshold` to skip segments when the model's no-speech probability is high enough.
+
+The native CPU path defaults to one worker thread for reproducibility. Pass `--threads N` to parallelize Whisper dense projections, convolution projections, final logits, and attention heads. Size presets provide default chunk sizes for `tiny.en` through `turbo`; `--print-config` includes the resolved Rust CPU tuning. `--quantized-weights` uses experimental row-wise int8 logits weights while keeping the hidden-state path in f32. `--backend gpu` is currently a typed hook that fails clearly until Whisper GPU kernels are implemented.
+
+Whisper timing sweeps are available through:
+
+```bash
+./target/release/puppygrad experiment whisper \
+  --audio tests/data/audio/jfk_16khz_mono.wav \
+  --size tiny.en \
+  --threads 4 \
+  --max-new-tokens 8 \
+  --runs 3
+```
+
+`autotune whisper` can rank max-new-token candidates for the current CPU reference path:
+
+```bash
+./target/release/puppygrad autotune whisper \
+  --audio tests/data/audio/jfk_16khz_mono.wav \
+  --size tiny.en \
+  --max-new-tokens 1,2,4 \
+  --runs 2
+```
+
+Known limitations: the command currently uses a straightforward CPU reference path with full-sequence decoder passes and no active KV-cache reuse, so long clips decode slowly. Quantization currently covers the logits projection only, and GPU execution is still TODO. By default the audio loader accepts PCM WAV; building with `--features audio-formats` also enables FLAC decoding. Arbitrary sample-rate inputs are decoded but still rejected by the Whisper command unless they are 16 kHz, so convert audio to 16 kHz mono PCM WAV for the default path.
+
+The current supported Whisper size presets are `tiny.en`, `tiny`, `base.en`, `base`, `small.en`, `small`, `medium.en`, `medium`, `large-v1`, `large-v2`, `large-v3`, and `turbo`. Presets are used for model ids, default local directory names, approximate size metadata, and fallback architecture shape expectations; downloaded `config.json` and `preprocessor_config.json` are loaded and validated as the source of truth at runtime.
+
+Whisper audio fixtures live in `tests/data/audio/`. See `tests/data/audio/README.md` for source URLs, conversion commands, formats, and SHA-256 checksums so the clips can be refreshed intentionally.
+
+Transformer block sharing has been revisited now that GPT-2 and Whisper both have native paths. The code keeps them separate for now: GPT-2 is decoder-only with cached causal self-attention, while Whisper has an audio convolution/encoder stack plus decoder cross-attention. Shared CPU kernels remain in `src/models/cpu.rs`; a higher-level block abstraction should wait until a third model proves the common shape.
 
 ### Run GPT-2 small
 

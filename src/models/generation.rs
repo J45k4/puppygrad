@@ -5,9 +5,9 @@ use std::time::Duration;
 
 #[derive(Clone, Debug, Args, PartialEq)]
 pub struct TextGenerationArgs {
-    /// Max new tokens to generate.
-    #[arg(long, default_value_t = 32)]
-    pub max_new_tokens: usize,
+    /// Max new tokens to generate. GPT-style commands default to 32; Whisper defaults to the remaining decoder text context.
+    #[arg(long)]
+    pub max_new_tokens: Option<usize>,
 
     /// Temperature (0 => greedy).
     #[arg(long, default_value_t = 0.0)]
@@ -36,8 +36,12 @@ pub struct TextGenerationArgs {
 
 impl TextGenerationArgs {
     pub fn to_config(&self) -> TextGenerationConfig {
+        self.to_config_with_default(32)
+    }
+
+    pub fn to_config_with_default(&self, default_max_new_tokens: usize) -> TextGenerationConfig {
         TextGenerationConfig {
-            max_new_tokens: self.max_new_tokens,
+            max_new_tokens: self.max_new_tokens.unwrap_or(default_max_new_tokens),
             eos_token_id: None,
             temperature: self.temperature,
             top_p: self.top_p,
@@ -46,6 +50,10 @@ impl TextGenerationArgs {
             repeat_penalty: self.repeat_penalty,
             repeat_last_n: self.repeat_last_n,
         }
+    }
+
+    pub fn max_new_tokens_or(&self, default_max_new_tokens: usize) -> usize {
+        self.max_new_tokens.unwrap_or(default_max_new_tokens)
     }
 }
 

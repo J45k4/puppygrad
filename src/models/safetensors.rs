@@ -171,7 +171,7 @@ pub fn validate_tensor(
 
 fn f32_data(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
     let data = tensor.data();
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
         return Err(SafeTensorLoadError::MisalignedF32 {
             name: name.to_string(),
             byte_len: data.len(),
