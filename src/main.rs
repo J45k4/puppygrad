@@ -1,4 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use puppygrad::audio::{
+    inspect_wav, list_input_devices, record_input_device, resample_linear, write_wav_pcm16,
+    PcmAudio as SharedPcmAudio,
+};
 use puppygrad::engine::Tensor;
 use puppygrad::models::autotune::{autotune, AutoTuneOptions, AutoTuneTarget};
 use puppygrad::models::generation::{TextGenerationArgs, TextGenerationConfig};
@@ -6,6 +10,7 @@ use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
+use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
 use puppygrad::models::whisper::{
     default_whisper_dir, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
     WhisperBackendConfig, WhisperOperationProfile, WhisperRuntime, WhisperRustConfig, WhisperSize,
@@ -28,6 +33,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Shared audio utilities for microphone capture and WAV inspection.
+    Audio {
+        #[command(subcommand)]
+        cmd: AudioCommand,
+    },
+
     /// Run GPT-2 small through puppygrad's native reference model.
     Gpt2 {
         /// Local directory containing config.json, tokenizer.json, and model.safetensors.
@@ -112,6 +123,10 @@ enum Command {
         /// Print generation timing and token throughput to stderr.
         #[arg(long)]
         stats: bool,
+
+        /// Stream raw tokenizer tokens as TSV rows instead of decoded text.
+        #[arg(long)]
+        stream_raw_tokens: bool,
     },
 
     /// Placeholder for the future in-house Qwen runtime.
@@ -151,8 +166,20 @@ enum Command {
     /// Prepare assets and run the native Whisper runtime.
     Whisper {
         /// Audio WAV path to transcribe, or "-" to read WAV bytes from stdin. Use --download/--print-config without audio to prepare assets.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "mic")]
         audio: Option<PathBuf>,
+
+        /// Record from the default microphone and transcribe fixed-size chunks.
+        #[arg(long)]
+        mic: bool,
+
+        /// Input device index for --mic. Indices come from `puppygrad audio list-input-devices`.
+        #[arg(long, requires = "mic")]
+        input_device: Option<usize>,
+
+        /// Seconds per microphone chunk.
+        #[arg(long, default_value_t = 5.0)]
+        chunk_seconds: f32,
 
         /// Whisper checkpoint size.
         #[arg(long, value_enum, default_value_t = WhisperSize::TinyEn)]
@@ -214,6 +241,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = WhisperOutputFormatArg::Text)]
         output: WhisperOutputFormatArg,
 
+        /// Stream raw decoder tokens as TSV rows: segment, phase, token id, raw token.
+        #[arg(long)]
+        stream_raw_tokens: bool,
+
         /// Skip a segment if the decoder no-speech probability is at least this threshold.
         #[arg(long)]
         no_speech_threshold: Option<f32>,
@@ -263,6 +294,33 @@ enum Command {
 
     /// Quick matrix multiply + backward sanity check.
     MatmulCheck,
+}
+
+#[derive(Subcommand, Debug)]
+enum AudioCommand {
+    /// List available audio input devices.
+    ListInputDevices,
+
+    /// Record a fixed-duration clip from an input device to PCM WAV.
+    Record {
+        /// Input device index from `audio list-input-devices`; omitted means OS default.
+        #[arg(long)]
+        input_device: Option<usize>,
+
+        /// Recording duration in seconds.
+        #[arg(long)]
+        seconds: f32,
+
+        /// Output PCM WAV path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Inspect a PCM WAV file.
+    Inspect {
+        /// WAV path to inspect.
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -559,6 +617,7 @@ enum AutoTuneCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Command::Audio { cmd } => run_audio(cmd),
         Command::Gpt2 {
             model_dir,
             model_id,
@@ -581,6 +640,7 @@ fn main() -> Result<()> {
             attention_head_parallel_threshold,
             quantized_weights,
             stats,
+            stream_raw_tokens,
         } => run_gpt2(RunGpt2Args {
             model_dir,
             model_id,
@@ -605,6 +665,7 @@ fn main() -> Result<()> {
                 quantized_weights: quantized_weights.then_some(true),
             },
             stats,
+            stream_raw_tokens,
         }),
         Command::Qwen {
             model_dir,
@@ -627,6 +688,9 @@ fn main() -> Result<()> {
         }),
         Command::Whisper {
             audio,
+            mic,
+            input_device,
+            chunk_seconds,
             size,
             model_dir,
             model_id,
@@ -642,6 +706,7 @@ fn main() -> Result<()> {
             backend,
             quantized_weights,
             output,
+            stream_raw_tokens,
             no_speech_threshold,
             generation,
             first_logits_out,
@@ -649,6 +714,9 @@ fn main() -> Result<()> {
             stats,
         } => run_whisper(RunWhisperArgs {
             audio,
+            mic,
+            input_device,
+            chunk_seconds,
             size,
             model_dir,
             model_id,
@@ -664,6 +732,7 @@ fn main() -> Result<()> {
             backend,
             quantized_weights,
             output,
+            stream_raw_tokens,
             no_speech_threshold,
             generation,
             first_logits_out,
@@ -890,6 +959,7 @@ struct RunGpt2Args {
     no_tuning: bool,
     tuning: RustTuning,
     stats: bool,
+    stream_raw_tokens: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -991,6 +1061,9 @@ struct RunQwenArgs {
 
 struct RunWhisperArgs {
     audio: Option<PathBuf>,
+    mic: bool,
+    input_device: Option<usize>,
+    chunk_seconds: f32,
     size: WhisperSize,
     model_dir: Option<PathBuf>,
     model_id: Option<String>,
@@ -1006,6 +1079,7 @@ struct RunWhisperArgs {
     backend: WhisperBackendArg,
     quantized_weights: bool,
     output: WhisperOutputFormatArg,
+    stream_raw_tokens: bool,
     no_speech_threshold: Option<f32>,
     generation: TextGenerationArgs,
     first_logits_out: Option<PathBuf>,
@@ -1018,6 +1092,58 @@ struct WhisperSegmentOutput {
     start: f32,
     end: f32,
     text: String,
+}
+
+fn run_audio(cmd: AudioCommand) -> Result<()> {
+    match cmd {
+        AudioCommand::ListInputDevices => {
+            let devices = list_input_devices()?;
+            if devices.is_empty() {
+                println!("no input devices found");
+                return Ok(());
+            }
+            for device in devices {
+                let default = if device.is_default { " default" } else { "" };
+                println!("{}\t{}{}", device.index, device.name, default);
+            }
+            Ok(())
+        }
+        AudioCommand::Record {
+            input_device,
+            seconds,
+            out,
+        } => {
+            let duration = audio_duration(seconds, "seconds")?;
+            eprintln!(
+                "recording {} from {}",
+                format_duration(duration),
+                input_device
+                    .map(|index| format!("input device {index}"))
+                    .unwrap_or_else(|| "default input device".to_string())
+            );
+            let audio = record_input_device(input_device, duration)?;
+            write_wav_pcm16(&out, &audio)?;
+            eprintln!(
+                "wrote {}: {} Hz, {} channel(s), {:.3}s, {} samples",
+                out.display(),
+                audio.sample_rate,
+                audio.channels,
+                audio.duration_seconds(),
+                audio.samples.len()
+            );
+            Ok(())
+        }
+        AudioCommand::Inspect { path } => {
+            let info = inspect_wav(&path)?;
+            println!("path: {}", path.display());
+            println!("format: {}", info.format);
+            println!("sample_rate: {}", info.sample_rate);
+            println!("channels: {}", info.channels);
+            println!("duration_seconds: {:.3}", info.duration_seconds);
+            println!("sample_count: {}", info.sample_count);
+            Ok(())
+        }
+    }
 }
 
 fn run_gpt2(args: RunGpt2Args) -> Result<()> {
@@ -1065,14 +1191,38 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
     let runtime = Gpt2Runtime::from_dir_with_backend(&model_dir, backend)?;
     let load_time = load_start.elapsed();
     let mut stdout = std::io::stdout().lock();
-    let (_, generation_stats) =
-        runtime.stream_text_with_stats(&args.prompt, &generation, |text| {
-            write!(stdout, "{text}")?;
-            stdout.flush()?;
-            Ok::<(), Box<dyn std::error::Error>>(())
-        })?;
-    writeln!(stdout)?;
-    stdout.flush()?;
+    let generation_stats = if args.stream_raw_tokens {
+        let prompt_tokens = runtime.tokenizer.encode(&args.prompt)?;
+        for token_id in &prompt_tokens {
+            write_raw_token_event(&mut stdout, None, "prompt", *token_id, &runtime.tokenizer)?;
+        }
+        stdout.flush()?;
+        let (_, generation_stats) =
+            runtime.stream_token_ids_with_stats(&args.prompt, &generation, |token_id| {
+                write_raw_token_event(
+                    &mut stdout,
+                    None,
+                    "generated",
+                    token_id,
+                    &runtime.tokenizer,
+                )?;
+                stdout.flush()?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })?;
+        generation_stats
+    } else {
+        let (_, generation_stats) =
+            runtime.stream_text_with_stats(&args.prompt, &generation, |text| {
+                write!(stdout, "{text}")?;
+                stdout.flush()?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })?;
+        writeln!(stdout)?;
+        generation_stats
+    };
+    if args.stream_raw_tokens {
+        stdout.flush()?;
+    }
     if args.stats {
         print_gpt2_stats(load_time, &generation_stats);
     } else {
@@ -1093,9 +1243,16 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
         );
     }
 
+    let backend_threads = if args.mic && args.threads.is_none() {
+        std::thread::available_parallelism()
+            .ok()
+            .map(|threads| threads.get().clamp(1, 8))
+    } else {
+        args.threads
+    };
     let backend = whisper_backend_config(
         args.size,
-        args.threads,
+        backend_threads,
         args.backend,
         args.quantized_weights,
     )?;
@@ -1110,11 +1267,11 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
     )?;
     let load_time = load_start.elapsed();
 
-    if args.print_config || args.audio.is_none() {
+    if args.print_config || (args.audio.is_none() && !args.mic) {
         for line in runtime.metadata_lines() {
             println!("{line}");
         }
-        if args.audio.is_none() {
+        if args.audio.is_none() && !args.mic {
             if args.stats {
                 eprintln!("stats:");
                 eprintln!("  load: {}", format_duration(load_time));
@@ -1131,17 +1288,37 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
         args.size,
     )?;
 
-    let audio_path = args.audio.expect("checked above");
     let audio_start = Instant::now();
-    let audio = load_audio_arg(&audio_path)?;
-    if audio.sample_rate != WHISPER_SAMPLE_RATE {
-        return Err(format!(
-            "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
-            audio_path.display(),
-            audio.sample_rate
-        )
-        .into());
-    }
+    let audio = if args.mic {
+        let duration = audio_duration(args.chunk_seconds, "chunk-seconds")?;
+        eprintln!(
+            "recording {} from {}",
+            format_duration(duration),
+            args.input_device
+                .map(|index| format!("input device {index}"))
+                .unwrap_or_else(|| "default input device".to_string())
+        );
+        let recorded = record_input_device(args.input_device, duration)?;
+        eprintln!(
+            "recorded {:.3}s at {} Hz; resampling to {WHISPER_SAMPLE_RATE} Hz mono for Whisper",
+            recorded.duration_seconds(),
+            recorded.sample_rate
+        );
+        let resampled = resample_linear(&recorded, WHISPER_SAMPLE_RATE)?;
+        whisper_audio_from_shared(resampled)
+    } else {
+        let audio_path = args.audio.as_ref().expect("checked above");
+        let audio = load_audio_arg(audio_path)?;
+        if audio.sample_rate != WHISPER_SAMPLE_RATE {
+            return Err(format!(
+                "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
+                audio_path.display(),
+                audio.sample_rate
+            )
+            .into());
+        }
+        audio
+    };
     let audio_time = audio_start.elapsed();
 
     let mut generation_template = args.generation.to_config_with_default(1);
@@ -1157,6 +1334,7 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
     let mut previous_text_tokens = Vec::new();
     let chunk_samples = runtime.preprocessor.n_samples;
     let total_samples = audio.samples.len().max(1);
+    let mut stdout = std::io::stdout().lock();
 
     for (segment_index, start_sample) in (0..total_samples).step_by(chunk_samples).enumerate() {
         let end_sample = (start_sample + chunk_samples).min(audio.samples.len());
@@ -1199,10 +1377,15 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
             .config
             .n_text_ctx
             .saturating_sub(segment_prompt.len());
+        let default_segment_max_new_tokens = if args.mic {
+            default_max_new_tokens.min(2)
+        } else {
+            default_max_new_tokens
+        };
         segment_generation.max_new_tokens = args
             .generation
             .max_new_tokens
-            .unwrap_or(default_max_new_tokens);
+            .unwrap_or(default_segment_max_new_tokens);
         segment_generation.max_new_tokens = segment_generation
             .max_new_tokens
             .min(default_max_new_tokens);
@@ -1276,13 +1459,45 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
         }
 
         let decode_start = Instant::now();
-        let output_tokens = runtime.generate_greedy(
-            &encoded,
-            &segment_prompt,
-            &segment_generation,
-            no_timestamps,
-            &mut profile,
-        )?;
+        let output_tokens = if args.stream_raw_tokens {
+            let raw_tokenizer = runtime.tokenizer.clone();
+            for token_id in &segment_prompt {
+                write_raw_token_event(
+                    &mut stdout,
+                    Some(segment_index),
+                    "prompt",
+                    *token_id,
+                    &raw_tokenizer,
+                )?;
+            }
+            stdout.flush()?;
+            runtime.stream_greedy_tokens(
+                &encoded,
+                &segment_prompt,
+                &segment_generation,
+                no_timestamps,
+                &mut profile,
+                |token_id| {
+                    write_raw_token_event(
+                        &mut stdout,
+                        Some(segment_index),
+                        "generated",
+                        token_id,
+                        &raw_tokenizer,
+                    )?;
+                    stdout.flush()?;
+                    Ok::<(), Box<dyn std::error::Error>>(())
+                },
+            )?
+        } else {
+            runtime.generate_greedy(
+                &encoded,
+                &segment_prompt,
+                &segment_generation,
+                no_timestamps,
+                &mut profile,
+            )?
+        };
         decode_time += decode_start.elapsed();
         let segment_generated = output_tokens.len().saturating_sub(segment_prompt.len());
         generated_tokens += segment_generated;
@@ -1304,50 +1519,63 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
                 previous_text_tokens.extend(runtime.tokenizer.encode(&segment.text)?);
             }
         }
-        segments.append(&mut decoded_segments);
-    }
-
-    let mut stdout = std::io::stdout().lock();
-    match args.output {
-        WhisperOutputFormatArg::Text => {
-            let transcript = segments
+        if args.mic && !args.stream_raw_tokens && args.output == WhisperOutputFormatArg::Text {
+            let transcript = decoded_segments
                 .iter()
                 .map(|segment| segment.text.as_str())
                 .filter(|text| !text.is_empty())
                 .collect::<Vec<_>>()
                 .join(" ");
-            writeln!(stdout, "{transcript}")?;
-        }
-        WhisperOutputFormatArg::Json => {
-            serde_json::to_writer_pretty(&mut stdout, &segments)?;
-            writeln!(stdout)?;
-        }
-        WhisperOutputFormatArg::Srt => {
-            for (i, segment) in segments
-                .iter()
-                .filter(|segment| !segment.text.is_empty())
-                .enumerate()
-            {
-                writeln!(stdout, "{}", i + 1)?;
-                writeln!(
-                    stdout,
-                    "{} --> {}",
-                    format_srt_timestamp(segment.start),
-                    format_srt_timestamp(segment.end)
-                )?;
-                writeln!(stdout, "{}\n", segment.text)?;
+            if !transcript.is_empty() {
+                writeln!(stdout, "{transcript}")?;
+                stdout.flush()?;
             }
         }
-        WhisperOutputFormatArg::Vtt => {
-            writeln!(stdout, "WEBVTT\n")?;
-            for segment in segments.iter().filter(|segment| !segment.text.is_empty()) {
-                writeln!(
-                    stdout,
-                    "{} --> {}",
-                    format_vtt_timestamp(segment.start),
-                    format_vtt_timestamp(segment.end)
-                )?;
-                writeln!(stdout, "{}\n", segment.text)?;
+        segments.append(&mut decoded_segments);
+    }
+
+    if !args.stream_raw_tokens && !(args.mic && args.output == WhisperOutputFormatArg::Text) {
+        match args.output {
+            WhisperOutputFormatArg::Text => {
+                let transcript = segments
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                writeln!(stdout, "{transcript}")?;
+            }
+            WhisperOutputFormatArg::Json => {
+                serde_json::to_writer_pretty(&mut stdout, &segments)?;
+                writeln!(stdout)?;
+            }
+            WhisperOutputFormatArg::Srt => {
+                for (i, segment) in segments
+                    .iter()
+                    .filter(|segment| !segment.text.is_empty())
+                    .enumerate()
+                {
+                    writeln!(stdout, "{}", i + 1)?;
+                    writeln!(
+                        stdout,
+                        "{} --> {}",
+                        format_srt_timestamp(segment.start),
+                        format_srt_timestamp(segment.end)
+                    )?;
+                    writeln!(stdout, "{}\n", segment.text)?;
+                }
+            }
+            WhisperOutputFormatArg::Vtt => {
+                writeln!(stdout, "WEBVTT\n")?;
+                for segment in segments.iter().filter(|segment| !segment.text.is_empty()) {
+                    writeln!(
+                        stdout,
+                        "{} --> {}",
+                        format_vtt_timestamp(segment.start),
+                        format_vtt_timestamp(segment.end)
+                    )?;
+                    writeln!(stdout, "{}\n", segment.text)?;
+                }
             }
         }
     }
@@ -1414,6 +1642,31 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
     Ok(())
 }
 
+fn write_raw_token_event<W, D>(
+    writer: &mut W,
+    segment_index: Option<usize>,
+    phase: &str,
+    token_id: usize,
+    decoder: &D,
+) -> Result<()>
+where
+    W: Write,
+    D: RawTokenDecoder,
+    D::Error: std::error::Error + 'static,
+{
+    let token = decoder.raw_token(token_id)?;
+    if let Some(segment_index) = segment_index {
+        writeln!(
+            writer,
+            "{segment_index}\t{phase}\t{token_id}\t{}",
+            escape_raw_token(&token)
+        )?;
+    } else {
+        writeln!(writer, "{phase}\t{token_id}\t{}", escape_raw_token(&token))?;
+    }
+    Ok(())
+}
+
 fn load_audio_arg(audio_path: &PathBuf) -> Result<puppygrad::models::whisper::PcmAudio> {
     if audio_path.as_os_str() == "-" {
         let mut data = Vec::new();
@@ -1421,6 +1674,22 @@ fn load_audio_arg(audio_path: &PathBuf) -> Result<puppygrad::models::whisper::Pc
         return Ok(load_wav_pcm_bytes(PathBuf::from("<stdin>"), &data)?);
     }
     Ok(load_wav_pcm(audio_path)?)
+}
+
+fn whisper_audio_from_shared(audio: SharedPcmAudio) -> puppygrad::models::whisper::PcmAudio {
+    puppygrad::models::whisper::PcmAudio {
+        path: audio.path,
+        sample_rate: audio.sample_rate,
+        channels: audio.channels,
+        samples: audio.samples,
+    }
+}
+
+fn audio_duration(seconds: f32, arg_name: &str) -> Result<Duration> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!("--{arg_name} must be a positive finite number of seconds").into());
+    }
+    Ok(Duration::from_secs_f32(seconds))
 }
 
 fn rust_config(

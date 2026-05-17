@@ -3,7 +3,7 @@ use std::path::Path;
 
 use tokenizers::Tokenizer;
 
-use crate::models::streaming::TokenDecoder;
+use crate::models::streaming::{RawTokenDecoder, TokenDecoder};
 
 use super::{Result, WhisperError, WhisperSize};
 
@@ -128,6 +128,18 @@ impl TokenDecoder for WhisperTokenizer {
 
     fn decode_tokens(&self, token_ids: &[usize]) -> Result<String> {
         self.decode(token_ids)
+    }
+}
+
+impl RawTokenDecoder for WhisperTokenizer {
+    type Error = WhisperError;
+
+    fn raw_token(&self, token_id: usize) -> Result<String> {
+        let token_id = u32::try_from(token_id)
+            .map_err(|_| WhisperError::InvalidInput("token id does not fit in u32".to_string()))?;
+        self.tokenizer
+            .id_to_token(token_id)
+            .ok_or_else(|| WhisperError::InvalidInput(format!("unknown token id {token_id}")))
     }
 }
 

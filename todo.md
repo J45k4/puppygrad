@@ -1,174 +1,120 @@
 # Puppygrad TODO
 
-## Whisper Native Runtime Plan
+## Shared Audio And Whisper Mic Support Plan
 
-### Phase 1: Model Shape And Assets
+### Phase 1: Audio Module Boundary
 
-- [x] Add `src/models/whisper/` module boundary with `mod.rs`.
-- [x] Add Whisper error/result types.
-- [x] Add Whisper size enum for `tiny.en`, `tiny`, `base.en`, `base`, `small.en`, `small`, `medium.en`, `medium`, `large-v1`, `large-v2`, `large-v3`, and `turbo`.
-- [x] Add size preset metadata: Hugging Face model id, default local directory name, English-only flag, approximate parameter count, approximate VRAM, and relative speed.
-- [x] Add `WhisperConfig` architecture dimensions for audio encoder and text decoder.
-- [x] Add config validation for nonzero dimensions and head divisibility.
-- [x] Add Hugging Face asset paths for `config.json`, `tokenizer.json`, `preprocessor_config.json`, and `model.safetensors`.
-- [x] Add audio fixture directory with committed 16 kHz mono WAV clips and source/checksum manifest for regenerating originals.
-- [x] Wire a `whisper` CLI command that can prepare/download assets and print resolved model metadata.
-- [x] Add README section for Whisper model sizes, asset preparation, and current implementation status.
-- [x] Add fixture provenance note to README or developer docs so test clips can be refreshed intentionally.
+- [x] Add a shared audio module outside `src/models/whisper/`, for example `src/audio/` or `src/runtime/audio/`.
+- [x] Keep OS/device audio capture, device listing, sample conversion, resampling, and WAV writing in the shared audio module.
+- [x] Keep Whisper-specific log-mel preprocessing and model execution in `src/models/whisper/`.
+- [x] Define a shared `AudioError` / `AudioResult` type so CLI and models do not need to depend on Whisper errors for generic audio operations.
+- [x] Define a shared `PcmAudio` or compatible audio buffer type with sample rate, channel count/mono policy, and normalized `f32` samples.
 
-### Phase 2: Config And Preprocessor Loading
+### Phase 2: Audio CLI Namespace
 
-- [x] Load Hugging Face Whisper `config.json` into `WhisperConfig`.
-- [x] Load `preprocessor_config.json` into a typed audio preprocessing config.
-- [x] Validate expected sample rate, chunk length, hop length, FFT size, feature count, and normalization settings.
-- [x] Add tests that parse representative configs for `tiny`, `large-v3`, and `turbo`.
-- [x] Decide whether model presets are fallback-only or checked against downloaded configs.
-- [x] Add `puppygrad whisper --print-config` or equivalent debug output for loaded model/preprocessor dimensions.
+- [x] Add a top-level `audio` CLI command group.
+- [x] Add `puppygrad audio list-input-devices`.
+- [x] Add `puppygrad audio record --seconds N --out clip.wav`.
+- [x] Add `puppygrad audio record --input-device N --seconds N --out clip.wav`.
+- [x] Add `puppygrad audio inspect path.wav` for sample rate, channel count, duration, sample count, and format summary.
+- [x] Make shared audio commands independent from Whisper assets or model loading.
 
-### Phase 3: Tokenizer And Special Tokens
+### Phase 3: Microphone Device Discovery
 
-- [x] Load Whisper `tokenizer.json` with the existing `tokenizers` dependency.
-- [x] Add a `WhisperTokenizer` wrapper implementing the shared token decoder trait.
-- [x] Identify and expose special tokens: start-of-transcript, EOS, no-timestamps, translate, transcribe, language tokens, timestamp range, and no-speech token if present.
-- [x] Build prompt prefix creation for transcription mode.
-- [x] Build prompt prefix creation for translation mode.
-- [x] Add language selection support for multilingual checkpoints.
-- [x] Add tests for tokenization, decoding, and prompt-prefix token IDs.
-- [x] Add tokenizer tests using downloaded tiny/tiny.en assets once asset preparation is wired.
+- [x] Add `cpal` or another deliberate cross-platform audio input dependency.
+- [x] Enumerate input devices with stable display output.
+- [x] Mark the OS default input device in `audio list-input-devices`.
+- [x] Support default-device capture when no explicit input device is passed.
+- [x] Support optional input-device index for quick CLI selection.
+- [x] Document that device indices can change after reconnects/reboots.
+- [x] Consider name matching later, for example `--input-device-name "MacBook"`.
 
-### Phase 4: Audio Input And Log-Mel Features
+### Phase 4: Microphone Capture
 
-- [x] Add audio file loading strategy. Support WAV first with `jfk_16khz_mono.wav` and `micro_machines_16khz_mono.wav`; keep FLAC support out of the MVP unless a dependency is deliberately added.
-- [x] Decode mono/stereo PCM WAV into normalized `f32` samples.
-- [x] Validate `jfk_16khz_mono.wav` loads as 16 kHz mono PCM and has 176,000 samples.
-- [x] Validate `micro_machines_16khz_mono.wav` loads as 16 kHz mono PCM and is near one full Whisper 30s window.
-- [x] Add stereo/downmix tests using generated in-memory WAV data instead of committing a large stereo fixture.
-- [x] Add resampling path if input sample rate is not Whisper's expected sample rate, or explicitly reject non-16 kHz WAVs until resampling is implemented.
-- [x] Implement padding/trimming to Whisper chunk length.
-- [x] Implement STFT.
-- [x] Implement mel filterbank generation/loading.
-- [x] Implement log-mel spectrogram extraction.
-- [x] Match Whisper feature normalization semantics.
-- [x] Add deterministic log-mel feature snapshot tests for `jfk_16khz_mono.wav`.
-- [x] Add deterministic log-mel feature snapshot tests for `micro_machines_16khz_mono.wav`.
-- [x] Compare log-mel output for `jfk_16khz_mono.wav` against Python Whisper or another trusted reference and record tolerance.
+- [x] Implement blocking capture for a fixed duration.
+- [x] Convert supported input sample formats to normalized `f32`.
+- [x] Downmix multi-channel input to mono.
+- [x] Preserve the original device sample rate in the captured buffer.
+- [x] Add backpressure/buffer overflow handling with clear errors.
+- [x] Make `audio record` write a valid PCM WAV file.
+- [x] Add a short manual smoke-test recipe for recording and inspecting a clip.
 
-### Phase 5: Weight Loading
+### Phase 5: Resampling And Audio Normalization
 
-- [x] Define `WhisperWeights` with audio encoder, text decoder, cross-attention, embeddings, layer norms, and final projection.
-- [x] Map Hugging Face safetensors names to internal weight structs.
-- [x] Load all encoder block weights.
-- [x] Load all decoder block weights, including self-attention and cross-attention.
-- [x] Load token embeddings and positional embeddings.
-- [x] Support tied output projection if the checkpoint uses token embeddings for logits.
-- [x] Validate every tensor shape against `WhisperConfig`.
-- [x] Add focused tests with tiny synthetic tensors to catch name/shape mistakes.
-- [x] Add a tiny/tiny.en real checkpoint load smoke test that validates tensor names and shapes without running inference.
+- [x] Add a built-in linear resampler for the MVP, or choose a dedicated resampling crate if quality is worth the dependency.
+- [x] Convert arbitrary mic sample rates such as 44.1 kHz and 48 kHz to Whisper's 16 kHz mono input.
+- [x] Add unit tests for downmixing.
+- [x] Add unit tests for sample format conversion.
+- [x] Add unit tests for resampler output length and basic waveform shape.
+- [x] Reuse the same normalization path for `audio record`, `audio inspect`, and Whisper mic input where practical.
 
-### Phase 6: Encoder Forward Pass
+### Phase 6: Whisper Input Modes
 
-- [x] Implement audio input projection/convolution stack.
-- [x] Add encoder positional embeddings.
-- [x] Implement encoder self-attention.
-- [x] Implement encoder MLP.
-- [x] Implement encoder layer norm/residual flow.
-- [x] Return encoded audio memory in a layout suitable for decoder cross-attention.
-- [x] Add operation-level profile buckets for audio projection, encoder attention, encoder MLP, and encoder layer norms.
-- [x] Validate encoder output shape for each size preset.
-- [x] Run encoder shape smoke test on `jfk_16khz_mono.wav` with `tiny.en`.
-- [x] Compare a small slice of encoder output against a trusted reference for `jfk_16khz_mono.wav`.
+- [x] Add `--mic` to `puppygrad whisper`.
+- [x] Make `--audio` and `--mic` mutually exclusive.
+- [x] Add `--input-device N` for `puppygrad whisper --mic`.
+- [x] Keep existing file and stdin modes:
+  - `puppygrad whisper --audio clip.wav`
+  - `puppygrad whisper --audio -`
+- [x] Ensure model/backend/generation options continue to work with both file and mic input.
+- [x] Fail clearly if microphone capture is requested on a platform/device setup that is unavailable.
 
-### Phase 7: Decoder Forward Pass
+### Phase 7: Live Chunking
 
-- [x] Define decoder KV cache for text self-attention.
-- [x] Decide whether cross-attention K/V over encoded audio should be precomputed and cached.
-- [x] Implement decoder token and positional embeddings.
-- [x] Implement masked decoder self-attention.
-- [x] Implement decoder cross-attention over encoder output.
-- [x] Implement decoder MLP.
-- [x] Implement decoder layer norm/residual flow.
-- [x] Implement final logits projection.
-- [x] Add decoder-only unit tests with synthetic weights and small dimensions.
-- [x] Compare first-step logits for `tiny.en` on `jfk_16khz_mono.wav` against a trusted reference.
+- [x] Add `--chunk-seconds N` for mic mode.
+- [x] Default mic chunks to a short value such as 5 seconds.
+- [x] Convert each captured chunk to 16 kHz mono before Whisper preprocessing.
+- [x] Run existing Whisper log-mel, encoder, and decoder paths per chunk.
+- [x] Print chunk-level transcripts as each chunk finishes.
+- [x] Track chunk start/end wall-clock times for future JSON/SRT/VTT support.
+- [x] Defer overlap and rolling-context behavior until the basic mic path works.
 
-### Phase 8: Conditional Autoregressive Generation
+### Phase 8: Streaming Output
 
-- [x] Add a shared conditional autoregressive trait where generation depends on `condition + previous tokens`.
-- [x] Make Whisper's condition type be encoded audio memory.
-- [x] Reuse `TextGenerationConfig`, `LogitsSampler`, token streaming, and generic generation stats.
-- [x] Implement greedy decoding first.
-- [x] Add temperature/top-k/top-p sampling after greedy correctness is stable.
-- [x] Add EOS stopping.
-- [x] Add timestamp-token suppression or enabling flags.
-- [x] Add no-timestamps mode for plain transcription.
-- [x] Add no-speech handling once the decoder exposes the needed logits/probabilities.
-- [x] Add an end-to-end greedy decode smoke test for `jfk_16khz_mono.wav` with `tiny.en`.
-- [x] Add an end-to-end near-30s decode smoke test for `micro_machines_16khz_mono.wav` with `tiny.en`.
+- [x] Reuse `--stream-raw-tokens` for mic chunks.
+- [x] Emit raw prompt/control tokens and generated tokens for each mic chunk.
+- [x] Keep transcript text output as the default when raw streaming is disabled.
+- [x] Add text streaming later if useful, separate from raw-token streaming.
+- [x] Make stdout/stderr behavior consistent: transcripts/tokens on stdout, stats/status on stderr.
 
-### Phase 9: CLI MVP
+### Phase 9: Silence And Usability
 
-- [x] Add `puppygrad whisper --audio path.wav --size tiny --download`.
-- [x] Add `--model-dir`, `--model-id`, and `--revision`.
-- [x] Add `--task transcribe|translate`.
-- [x] Add `--language` for multilingual models.
-- [x] Add `--timestamps` / `--no-timestamps`.
-- [x] Reuse shared generation args where they make sense.
-- [x] Add `--stats` for load, audio preprocessing, encode, prefill, decode, and total timings.
-- [x] Print transcript to stdout and stats to stderr.
-- [x] Confirm `puppygrad whisper --audio tests/data/audio/jfk_16khz_mono.wav --size tiny.en --download --task transcribe --language en --no-timestamps --stats` works from a clean checkout after assets download.
-- [x] Confirm CLI errors clearly for unsupported audio formats, missing assets, invalid language, and unsupported timestamp mode.
+- [x] Reuse Whisper no-speech probability for optional silence skipping.
+- [x] Add `--no-speech-threshold` support for mic chunks.
+- [x] Consider a simple RMS gate before running Whisper on silent chunks.
+- [x] Avoid printing empty transcript lines by default.
+- [x] Add clear status output for recording start/stop only on stderr.
 
-### Phase 10: Long Audio And Segments
+### Phase 10: Tests And Manual Verification
 
-- [x] Split audio into Whisper-sized windows.
-- [x] Carry previous text prompt between segments when useful.
-- [x] Track segment start/end times.
-- [x] Decode timestamp tokens into segment timings.
-- [x] Add VAD/no-speech based segment skipping if model outputs support it.
-- [x] Produce plain text output first.
-- [x] Add optional JSON segment output.
-- [x] Add optional SRT/VTT output later.
+- [x] Keep file-based Whisper tests as deterministic correctness tests.
+- [x] Unit test shared audio conversion/downmix/resampling without requiring a real microphone.
+- [x] Add `audio inspect` tests using existing 16 kHz WAV fixtures.
+- [x] Add manual test notes for `audio list-input-devices`.
+- [x] Add manual test notes for `audio record --seconds 3 --out /tmp/puppygrad-mic.wav`.
+- [x] Add manual test notes for `whisper --mic --chunk-seconds 5 --stream-raw-tokens`.
+- [x] Avoid making CI depend on an actual microphone.
 
-### Phase 11: Performance Work
+### Phase 11: Documentation
 
-- [x] Reuse existing CPU kernels where possible before adding Whisper-specific kernels.
-- [x] Parallelize encoder layers and projections where safe.
-- [x] Parallelize attention heads for encoder, decoder self-attention, and cross-attention.
-- [x] Add persistent scratch buffers for encoder and decoder.
-- [x] Add transposed dense weights at model construction.
-- [x] Add model-size-specific chunk tuning.
-- [x] Add `experiment whisper` for audio preprocessing, encode, and decode timings.
-- [x] Add `autotune whisper` after the reference path is correct.
-
-### Phase 12: Correctness And Compatibility
-
-- [x] Compare tiny model logits against a reference implementation on `jfk_16khz_mono.wav`.
-- [x] Compare generated transcript for `jfk_16khz_mono.wav`; expected text should contain "ask not what your country can do for you".
-- [x] Compare generated transcript for `micro_machines_16khz_mono.wav`; use it as a longer-window smoke test rather than a strict word-for-word fixture at first.
-- [x] Test `tiny.en` and `tiny` first.
-- [x] Test `base`, `small`, `medium`, `large-v3`, and `turbo` after tiny is stable.
-- [x] Document unsupported features clearly while runtime is incomplete.
-- [x] Keep Whisper-specific architecture code separate until duplication with GPT-2 or future models proves a shared abstraction.
-
-### Phase 13: Future Extensions
-
-- [x] Add quantized weight path only after f32 correctness is stable.
-- [x] Add GPU backend hooks after CPU reference behavior is reliable.
-- [x] Consider broader audio format support through an optional feature flag.
-- [x] Consider streaming microphone/audio input after file transcription works.
-- [x] Revisit transformer block extraction once GPT-2 and Whisper both have working native paths.
+- [x] Document `puppygrad audio list-input-devices`.
+- [x] Document `puppygrad audio record`.
+- [x] Document `puppygrad audio inspect`.
+- [x] Document `puppygrad whisper --mic`.
+- [x] Document default-device behavior and optional input-device index.
+- [x] Document that mic audio is resampled/downmixed to 16 kHz mono for Whisper.
+- [x] Document known limitations: chunk-level output first, no overlap/VAD polish initially, CPU Whisper latency.
 
 ## Completion Criteria
 
-- [x] `cargo fmt --check`, `cargo test`, and `cargo clippy -- -D warnings` pass with Whisper code and fixtures present.
-- [x] A clean checkout can prepare `tiny.en` assets using the documented `puppygrad whisper --download` flow.
-- [x] `jfk_16khz_mono.wav` loads through the native WAV path as 16 kHz mono PCM with the expected duration/sample count.
-- [x] Native log-mel features for `jfk_16khz_mono.wav` match a trusted Whisper reference within documented tolerance.
-- [x] `tiny.en` `config.json`, `preprocessor_config.json`, `tokenizer.json`, and `model.safetensors` load into typed Puppygrad structs with full shape validation.
-- [x] Encoder forward pass runs on `jfk_16khz_mono.wav` and returns the expected encoded-audio shape.
-- [x] Decoder first-token logits for `jfk_16khz_mono.wav` match a trusted reference within documented tolerance.
-- [x] End-to-end greedy transcription for `jfk_16khz_mono.wav` produces recognizable JFK text containing "ask not what your country can do for you".
-- [x] End-to-end transcription for `micro_machines_16khz_mono.wav` runs without crashing and produces non-empty text.
-- [x] The CLI prints transcript text to stdout and timing/profile information to stderr when `--stats` is set.
-- [x] Unsupported paths fail clearly: missing model files, missing audio, unsupported audio format, incompatible config, and conflicting timestamp flags.
-- [x] README documents current Whisper support, exact smoke-test command, fixture sources, and known limitations.
+- [x] `cargo fmt --check` passes.
+- [x] `cargo check` passes.
+- [x] Shared audio unit tests pass without requiring a microphone.
+- [x] `puppygrad audio list-input-devices` prints available input devices and marks the default device.
+- [x] `puppygrad audio record --seconds 3 --out /tmp/puppygrad-mic.wav` records a playable WAV from the default microphone.
+- [x] `puppygrad audio record --input-device N --seconds 3 --out /tmp/puppygrad-mic.wav` records from a selected device.
+- [x] `puppygrad audio inspect /tmp/puppygrad-mic.wav` reports sample rate, channel count, duration, and sample count.
+- [x] `puppygrad whisper --mic --chunk-seconds 5 --size tiny.en --language en --no-timestamps` records from the default mic and prints a transcript chunk.
+- [x] `puppygrad whisper --mic --input-device N --chunk-seconds 5 --stream-raw-tokens` prints raw token events with prompt/control tags and generated tokens.
+- [x] Existing Whisper file mode still works with `--audio tests/data/audio/jfk_16khz_mono.wav`.
+- [x] README documents the audio commands, mic mode, and current limitations.

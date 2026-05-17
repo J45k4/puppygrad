@@ -8,6 +8,27 @@ pub trait TokenDecoder {
     }
 }
 
+pub trait RawTokenDecoder {
+    type Error;
+
+    fn raw_token(&self, token_id: usize) -> Result<String, Self::Error>;
+}
+
+pub fn escape_raw_token(token: &str) -> String {
+    let mut escaped = String::with_capacity(token.len());
+    for ch in token.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:x}}}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IncrementalTextStreamer {
     decoded: String,
@@ -114,5 +135,12 @@ mod tests {
         assert!(!is_incremental_decode_safe(""));
         assert!(!is_incremental_decode_safe("\u{fffd}"));
         assert!(!is_incremental_decode_safe("a\u{fffd}"));
+    }
+
+    #[test]
+    fn escapes_raw_tokens_for_line_streams() {
+        assert_eq!(escape_raw_token("<|en|>"), "<|en|>");
+        assert_eq!(escape_raw_token("ĠI"), "ĠI");
+        assert_eq!(escape_raw_token("a\tb\nc"), "a\\tb\\nc");
     }
 }

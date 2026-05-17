@@ -20,7 +20,7 @@ use crate::models::generation::{
 use crate::models::safetensors::{
     read_safetensors_file, tensor_f32 as safetensor_f32, SafeTensorLoadError, TensorStore,
 };
-use crate::models::streaming::{IncrementalTextStreamer, TokenDecoder};
+use crate::models::streaming::{IncrementalTextStreamer, RawTokenDecoder, TokenDecoder};
 use crate::runtime::thread_pool::ThreadPool;
 
 use super::{
@@ -309,6 +309,18 @@ impl TokenDecoder for Gpt2Tokenizer {
     }
 }
 
+impl RawTokenDecoder for Gpt2Tokenizer {
+    type Error = Gpt2Error;
+
+    fn raw_token(&self, token_id: usize) -> Result<String> {
+        let token_id = u32::try_from(token_id)
+            .map_err(|_| Gpt2Error::InvalidInput("token id does not fit in u32".to_string()))?;
+        self.tokenizer
+            .id_to_token(token_id)
+            .ok_or_else(|| Gpt2Error::InvalidInput(format!("unknown token id {token_id}")))
+    }
+}
+
 #[derive(Clone)]
 pub struct Gpt2Runtime {
     pub model: Gpt2Model,
@@ -531,6 +543,94 @@ impl Gpt2Runtime {
         );
 
         Ok((streamer.decoded().to_string(), stats))
+    }
+
+    pub fn stream_token_ids_with_stats<F, E>(
+        &self,
+        prompt: &str,
+        generation: &Gpt2GenerationConfig,
+        mut on_token: F,
+    ) -> std::result::Result<(Vec<usize>, Gpt2GenerationStats), E>
+    where
+        F: FnMut(usize) -> std::result::Result<(), E>,
+        E: From<Gpt2Error>,
+    {
+        generation.validate()?;
+        if let Some(eos_token_id) = generation.eos_token_id {
+            if eos_token_id >= self.model.config.vocab_size {
+                return Err(Gpt2Error::InvalidConfig(format!(
+                    "generation eos_token_id {eos_token_id} is outside vocab_size {}",
+                    self.model.config.vocab_size
+                ))
+                .into());
+            }
+        }
+
+        let mut operation_profile = Gpt2OperationProfile::default();
+
+        let tokenize_start = Instant::now();
+        let input_ids = self.tokenizer.encode(prompt)?;
+        let tokenize_time = tokenize_start.elapsed();
+        operation_profile.tokenization += tokenize_time;
+
+        let mut output_ids = input_ids.clone();
+        let mut cache = self.model.new_kv_cache()?;
+        let first_token_start = Instant::now();
+        let prefill_start = Instant::now();
+        let mut logits =
+            self.model
+                .prefill_profiled(&input_ids, &mut cache, &mut operation_profile)?;
+        let prefill_time = prefill_start.elapsed();
+
+        let decode_start = Instant::now();
+        let mut first_token_time = None;
+        let mut generated_tokens = 0;
+        let mut sampler = LogitsSampler::new(generation.seed);
+
+        for _ in 0..generation.max_new_tokens {
+            if output_ids.len() >= self.model.config.n_positions {
+                break;
+            }
+
+            let token_id = sampler
+                .select_next_token(&logits, &output_ids, &generation.common)
+                .map_err(gpt2_sampling_error)?;
+            if generation.eos_token_id == Some(token_id) {
+                break;
+            }
+
+            output_ids.push(token_id);
+            on_token(token_id)?;
+            generated_tokens += 1;
+            if first_token_time.is_none() {
+                first_token_time = Some(first_token_start.elapsed());
+            }
+            let needs_next_logits = generated_tokens < generation.max_new_tokens
+                && output_ids.len() < self.model.config.n_positions;
+            if needs_next_logits {
+                logits = self.model.forward_one_profiled(
+                    token_id,
+                    &mut cache,
+                    &mut operation_profile,
+                )?;
+            }
+        }
+
+        let decode_time = decode_start.elapsed();
+        let stats = Gpt2GenerationStats::new(
+            GenerationStats {
+                prompt_tokens: input_ids.len(),
+                generated_tokens,
+                tokenize_time,
+                prefill_time,
+                decode_time,
+                total_generation_time: prefill_time + decode_time,
+                first_token_time,
+            },
+            operation_profile,
+        );
+
+        Ok((output_ids, stats))
     }
 }
 

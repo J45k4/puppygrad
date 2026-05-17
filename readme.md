@@ -26,6 +26,43 @@ Shared model runtime code is intentionally limited to pieces that already have c
 
 See `docs/model-runtime.md` for shared autoregressive runtime notes and examples.
 
+## Audio utilities
+
+Puppygrad includes a shared audio CLI for microphone discovery, fixed-duration recording, and PCM WAV inspection. These commands do not load Whisper assets.
+
+List input devices:
+
+```bash
+./target/release/puppygrad audio list-input-devices
+```
+
+The output is tab-separated as `index`, `name`, and an optional `default` marker. Device indices are intended for quick CLI selection and can change after reconnects, OS updates, or reboots.
+
+Record a 3-second WAV from the OS default input device:
+
+```bash
+./target/release/puppygrad audio record \
+  --seconds 3 \
+  --out /tmp/puppygrad-mic.wav
+```
+
+Record from a selected input device:
+
+```bash
+./target/release/puppygrad audio record \
+  --input-device 0 \
+  --seconds 3 \
+  --out /tmp/puppygrad-mic.wav
+```
+
+Inspect a WAV file:
+
+```bash
+./target/release/puppygrad audio inspect /tmp/puppygrad-mic.wav
+```
+
+`audio inspect` reports the sample rate, channel count, duration, sample count, and PCM WAV format summary. `audio record` writes mono 16-bit PCM WAV while preserving the input device sample rate.
+
 ### Whisper native runtime status
 
 The `whisper` command currently supports asset preparation and the native audio preprocessing path. It downloads or checks these Hugging Face files: `config.json`, `tokenizer.json`, `preprocessor_config.json`, and `model.safetensors`.
@@ -60,6 +97,31 @@ Use `--audio -` to read 16 kHz PCM WAV bytes from stdin, for example `cat clip.w
 
 For segment metadata instead of plain text, pass `--output json`. `--output srt` and `--output vtt` emit segment-window subtitle timestamps by default; with `--timestamps`, Whisper timestamp tokens are decoded into segment timings. Audio longer than one 30-second Whisper window is split into consecutive windows; by default later segments may include previous segment text in the prompt. Pass `--no-condition-on-previous-text` to disable that. Use `--no-speech-threshold` to skip segments when the model's no-speech probability is high enough.
 
+Pass `--stream-raw-tokens` to stream raw decoder token events instead of the final transcript. Rows are tab-separated as `segment`, `phase`, `token_id`, `raw_token`; `phase=prompt` includes Whisper control tags such as `<|startoftranscript|>` and `phase=generated` includes model-produced tokens.
+
+Whisper can also record a microphone chunk and transcribe it:
+
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --chunk-seconds 5 \
+  --size tiny.en \
+  --language en \
+  --no-timestamps
+```
+
+Use `--input-device N` with `--mic` to select a device by the index shown by `audio list-input-devices`. `--audio` and `--mic` are mutually exclusive. Microphone input is downmixed and linearly resampled to Whisper's 16 kHz mono input before log-mel preprocessing. Raw-token streaming also works for mic chunks:
+
+Mic mode uses a bounded parallel CPU default and caps each chunk to 2 generated tokens by default to keep live smoke tests responsive. Pass `--threads N` and `--max-new-tokens N` to override those defaults.
+
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --input-device 0 \
+  --chunk-seconds 5 \
+  --stream-raw-tokens
+```
+
 The native CPU path defaults to one worker thread for reproducibility. Pass `--threads N` to parallelize Whisper dense projections, convolution projections, final logits, and attention heads. Size presets provide default chunk sizes for `tiny.en` through `turbo`; `--print-config` includes the resolved Rust CPU tuning. `--quantized-weights` uses experimental row-wise int8 logits weights while keeping the hidden-state path in f32. `--backend gpu` is currently a typed hook that fails clearly until Whisper GPU kernels are implemented.
 
 Whisper timing sweeps are available through:
@@ -83,7 +145,7 @@ Whisper timing sweeps are available through:
   --runs 2
 ```
 
-Known limitations: the command currently uses a straightforward CPU reference path with full-sequence decoder passes and no active KV-cache reuse, so long clips decode slowly. Quantization currently covers the logits projection only, and GPU execution is still TODO. By default the audio loader accepts PCM WAV; building with `--features audio-formats` also enables FLAC decoding. Arbitrary sample-rate inputs are decoded but still rejected by the Whisper command unless they are 16 kHz, so convert audio to 16 kHz mono PCM WAV for the default path.
+Known limitations: the command currently uses a straightforward CPU reference path with full-sequence decoder passes and no active KV-cache reuse, so long clips decode slowly. Microphone mode records and transcribes one chunk at a time; overlap, rolling context, and polished VAD are deferred. CPU Whisper latency can be high on larger checkpoints. Quantization currently covers the logits projection only, and GPU execution is still TODO. By default the file audio loader accepts PCM WAV; building with `--features audio-formats` also enables FLAC decoding. Arbitrary sample-rate file inputs are decoded but still rejected by the Whisper file path unless they are 16 kHz, so convert files to 16 kHz mono PCM WAV for the default path.
 
 The current supported Whisper size presets are `tiny.en`, `tiny`, `base.en`, `base`, `small.en`, `small`, `medium.en`, `medium`, `large-v1`, `large-v2`, `large-v3`, and `turbo`. Presets are used for model ids, default local directory names, approximate size metadata, and fallback architecture shape expectations; downloaded `config.json` and `preprocessor_config.json` are loaded and validated as the source of truth at runtime.
 
@@ -148,6 +210,8 @@ Greedy decoding is the default. For less repetitive text, enable sampling and re
 When `models/gpt2/puppygrad-tune.json` exists, the `gpt2` command loads it automatically. Explicit CLI flags override the saved config. Use `--no-tuning` to ignore the saved file, or `--tuning-file path/to/tune.json` to load a different file.
 
 Pass `--stats` to print the full performance breakdown to stderr while streamed text stays on stdout. The current GPT-2 stats include model load time, tokenization time, prefill time, time to first token, decode time, average decode-token latency, and token/sec rates for prefill, decode, and total model tokens.
+
+Pass `--stream-raw-tokens` to stream GPT-2 token events instead of decoded text. Rows are tab-separated as `phase`, `token_id`, `raw_token`, with `phase=prompt` for prompt tokens and `phase=generated` for model-produced tokens.
 
 ### Run GPT-2 experiments
 

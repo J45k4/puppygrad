@@ -21,9 +21,10 @@ pub use model::{
     decoder_logits, decoder_logits_with_rust_config,
     decoder_logits_with_rust_config_and_quantized_logits, encode_audio,
     encode_audio_with_rust_config, generate_greedy, generate_greedy_with_rust_config,
-    generate_greedy_with_rust_config_and_quantized_logits, EncodedAudio, WhisperBackendConfig,
-    WhisperBackendName, WhisperDecoderKvCache, WhisperDecoderLayerKvCache, WhisperOperationProfile,
-    WhisperRustConfig,
+    generate_greedy_with_rust_config_and_quantized_logits,
+    generate_greedy_with_rust_config_and_quantized_logits_callback, EncodedAudio,
+    WhisperBackendConfig, WhisperBackendName, WhisperDecoderKvCache, WhisperDecoderLayerKvCache,
+    WhisperOperationProfile, WhisperRustConfig,
 };
 pub use preprocessor::{
     load_whisper_preprocessor_config, WhisperPreprocessorConfig, WHISPER_CHUNK_SECONDS,

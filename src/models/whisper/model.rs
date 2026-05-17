@@ -616,6 +616,39 @@ pub fn generate_greedy_with_rust_config_and_quantized_logits(
     pool: &ThreadPool,
     rust_config: &WhisperRustConfig,
 ) -> Result<Vec<usize>> {
+    generate_greedy_with_rust_config_and_quantized_logits_callback::<_, WhisperError>(
+        config,
+        weights,
+        quantized_output_projection,
+        encoded,
+        prompt,
+        generation,
+        timestamp_begin,
+        profile,
+        pool,
+        rust_config,
+        |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_greedy_with_rust_config_and_quantized_logits_callback<F, E>(
+    config: &WhisperConfig,
+    weights: &WhisperWeights,
+    quantized_output_projection: Option<&QuantizedRows>,
+    encoded: &EncodedAudio,
+    prompt: &[usize],
+    generation: &TextGenerationConfig,
+    timestamp_begin: Option<usize>,
+    profile: &mut WhisperOperationProfile,
+    pool: &ThreadPool,
+    rust_config: &WhisperRustConfig,
+    on_token: F,
+) -> std::result::Result<Vec<usize>, E>
+where
+    F: FnMut(usize) -> std::result::Result<(), E>,
+    E: From<WhisperError>,
+{
     let mut decoder = WhisperConditionalDecoder::new_with_rust_config(
         config,
         weights,
@@ -626,12 +659,12 @@ pub fn generate_greedy_with_rust_config_and_quantized_logits(
         pool,
         rust_config,
     )?;
-    autoregressive::generate_conditional::<_, _, WhisperError>(
+    autoregressive::generate_conditional::<_, _, E>(
         &mut decoder,
         encoded,
         prompt,
         generation.max_new_tokens,
-        |_| Ok(()),
+        on_token,
     )
 }
 

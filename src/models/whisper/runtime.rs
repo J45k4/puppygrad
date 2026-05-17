@@ -5,7 +5,8 @@ use crate::runtime::thread_pool::ThreadPool;
 
 use super::{
     decoder_logits_with_rust_config_and_quantized_logits, encode_audio_with_rust_config,
-    generate_greedy_with_rust_config_and_quantized_logits, load_whisper_config,
+    generate_greedy_with_rust_config_and_quantized_logits,
+    generate_greedy_with_rust_config_and_quantized_logits_callback, load_whisper_config,
     load_whisper_preprocessor_config, load_whisper_weights, prepare_whisper_assets, EncodedAudio,
     LogMelSpectrogram, Result, WhisperAssetPaths, WhisperBackendConfig, WhisperConfig,
     WhisperError, WhisperOperationProfile, WhisperPreprocessorConfig, WhisperRustConfig,
@@ -257,6 +258,37 @@ impl WhisperRuntime {
             profile,
             &self.thread_pool,
             &self.rust_config,
+        )
+    }
+
+    pub fn stream_greedy_tokens<F, E>(
+        &self,
+        encoded: &EncodedAudio,
+        prompt: &[usize],
+        generation: &crate::models::generation::TextGenerationConfig,
+        suppress_timestamps: bool,
+        profile: &mut WhisperOperationProfile,
+        on_token: F,
+    ) -> std::result::Result<Vec<usize>, E>
+    where
+        F: FnMut(usize) -> std::result::Result<(), E>,
+        E: From<WhisperError>,
+    {
+        let timestamp_begin = suppress_timestamps
+            .then_some(self.tokenizer.special_tokens().timestamp_begin)
+            .flatten();
+        generate_greedy_with_rust_config_and_quantized_logits_callback(
+            &self.config,
+            &self.weights,
+            self.quantized_output_projection.as_ref(),
+            encoded,
+            prompt,
+            generation,
+            timestamp_begin,
+            profile,
+            &self.thread_pool,
+            &self.rust_config,
+            on_token,
         )
     }
 }
