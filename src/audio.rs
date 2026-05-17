@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -56,6 +56,182 @@ pub struct InputDeviceInfo {
     pub is_default: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioDropPolicy {
+    Oldest,
+    Newest,
+    Block,
+}
+
+pub struct ContinuousInputStream {
+    queue: Arc<AudioChunkQueue>,
+    _stream: cpal::Stream,
+    sample_rate: usize,
+    channels: usize,
+}
+
+impl ContinuousInputStream {
+    pub fn sample_rate(&self) -> usize {
+        self.sample_rate
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn recv_timeout(&self, timeout: Duration) -> AudioResult<Option<Vec<f32>>> {
+        self.queue.pop_timeout(timeout)
+    }
+
+    pub fn dropped_chunks(&self) -> usize {
+        self.queue.dropped_chunks()
+    }
+
+    pub fn take_dropped_chunks(&self) -> usize {
+        self.queue.take_dropped_chunks()
+    }
+
+    pub fn queued_chunks(&self) -> usize {
+        self.queue.len()
+    }
+}
+
+pub fn start_input_device_stream(
+    device_index: Option<usize>,
+    max_queued_chunks: usize,
+    drop_policy: AudioDropPolicy,
+) -> AudioResult<ContinuousInputStream> {
+    if max_queued_chunks == 0 {
+        return Err(AudioError::Device(
+            "max queued chunks must be greater than zero".to_string(),
+        ));
+    }
+
+    let host = cpal::default_host();
+    let device = match device_index {
+        Some(index) => host
+            .input_devices()
+            .map_err(|err| AudioError::Device(format!("failed to enumerate input devices: {err}")))?
+            .nth(index)
+            .ok_or_else(|| AudioError::Device(format!("input device index {index} not found")))?,
+        None => host.default_input_device().ok_or_else(|| {
+            AudioError::Device("no default input device is available".to_string())
+        })?,
+    };
+
+    let config = device
+        .default_input_config()
+        .map_err(|err| AudioError::Device(format!("failed to read default input config: {err}")))?;
+    let sample_rate = config.sample_rate().0 as usize;
+    let channels = config.channels() as usize;
+    if channels == 0 {
+        return Err(AudioError::Device(
+            "selected input device reports zero channels".to_string(),
+        ));
+    }
+
+    let queue = Arc::new(AudioChunkQueue::new(max_queued_chunks, drop_policy));
+    let stream_config = config.config();
+    let err_fn = |err| eprintln!("audio input stream error: {err}");
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => build_queued_input_stream::<f32, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_f32,
+        )?,
+        cpal::SampleFormat::F64 => build_queued_input_stream::<f64, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_f64,
+        )?,
+        cpal::SampleFormat::I8 => build_queued_input_stream::<i8, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_i8,
+        )?,
+        cpal::SampleFormat::I16 => build_queued_input_stream::<i16, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_i16,
+        )?,
+        cpal::SampleFormat::I32 => build_queued_input_stream::<i32, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_i32,
+        )?,
+        cpal::SampleFormat::I64 => build_queued_input_stream::<i64, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_i64,
+        )?,
+        cpal::SampleFormat::U8 => build_queued_input_stream::<u8, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_u8,
+        )?,
+        cpal::SampleFormat::U16 => build_queued_input_stream::<u16, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_u16,
+        )?,
+        cpal::SampleFormat::U32 => build_queued_input_stream::<u32, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_u32,
+        )?,
+        cpal::SampleFormat::U64 => build_queued_input_stream::<u64, _, _>(
+            &device,
+            &stream_config,
+            channels,
+            queue.clone(),
+            err_fn,
+            convert_u64,
+        )?,
+        sample_format => {
+            return Err(AudioError::Unsupported(format!(
+                "input sample format {sample_format:?} is not supported"
+            )));
+        }
+    };
+
+    stream
+        .play()
+        .map_err(|err| AudioError::Device(format!("failed to start input stream: {err}")))?;
+    Ok(ContinuousInputStream {
+        queue,
+        _stream: stream,
+        sample_rate,
+        channels,
+    })
+}
+
 pub fn list_input_devices() -> AudioResult<Vec<InputDeviceInfo>> {
     let host = cpal::default_host();
     let default_name = host
@@ -79,6 +255,134 @@ pub fn list_input_devices() -> AudioResult<Vec<InputDeviceInfo>> {
         });
     }
     Ok(infos)
+}
+
+fn build_queued_input_stream<T, F, E>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    channels: usize,
+    queue: Arc<AudioChunkQueue>,
+    err_fn: E,
+    convert: F,
+) -> AudioResult<cpal::Stream>
+where
+    T: cpal::SizedSample,
+    F: Fn(T) -> f32 + Send + Copy + 'static,
+    E: FnMut(cpal::StreamError) + Send + 'static,
+{
+    device
+        .build_input_stream(
+            config,
+            move |data: &[T], _| {
+                let mut chunk = Vec::with_capacity(data.len() / channels);
+                for frame in data.chunks_exact(channels) {
+                    chunk.push(downmix_frame(frame.iter().copied().map(convert), channels));
+                }
+                if !chunk.is_empty() {
+                    queue.push(chunk);
+                }
+            },
+            err_fn,
+            None,
+        )
+        .map_err(|err| AudioError::Device(format!("failed to build input stream: {err}")))
+}
+
+#[derive(Debug)]
+struct AudioChunkQueue {
+    state: Mutex<AudioChunkQueueState>,
+    available: Condvar,
+    space: Condvar,
+    max_chunks: usize,
+    drop_policy: AudioDropPolicy,
+}
+
+#[derive(Debug, Default)]
+struct AudioChunkQueueState {
+    chunks: std::collections::VecDeque<Vec<f32>>,
+    dropped_chunks: usize,
+}
+
+impl AudioChunkQueue {
+    fn new(max_chunks: usize, drop_policy: AudioDropPolicy) -> Self {
+        Self {
+            state: Mutex::new(AudioChunkQueueState::default()),
+            available: Condvar::new(),
+            space: Condvar::new(),
+            max_chunks,
+            drop_policy,
+        }
+    }
+
+    fn push(&self, chunk: Vec<f32>) {
+        let mut state = self.state.lock().expect("audio queue mutex poisoned");
+        while state.chunks.len() >= self.max_chunks {
+            match self.drop_policy {
+                AudioDropPolicy::Oldest => {
+                    state.chunks.pop_front();
+                    state.dropped_chunks += 1;
+                    break;
+                }
+                AudioDropPolicy::Newest => {
+                    state.dropped_chunks += 1;
+                    return;
+                }
+                AudioDropPolicy::Block => {
+                    state = self.space.wait(state).expect("audio queue mutex poisoned");
+                }
+            }
+        }
+        state.chunks.push_back(chunk);
+        self.available.notify_one();
+    }
+
+    fn pop_timeout(&self, timeout: Duration) -> AudioResult<Option<Vec<f32>>> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().map_err(|_| {
+            AudioError::Device("audio queue mutex was poisoned while receiving".to_string())
+        })?;
+        while state.chunks.is_empty() {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let (next_state, timeout_result) = self
+                .available
+                .wait_timeout(state, deadline - now)
+                .map_err(|_| {
+                AudioError::Device("audio queue mutex was poisoned while waiting".to_string())
+            })?;
+            state = next_state;
+            if timeout_result.timed_out() && state.chunks.is_empty() {
+                return Ok(None);
+            }
+        }
+        let chunk = state.chunks.pop_front();
+        self.space.notify_one();
+        Ok(chunk)
+    }
+
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("audio queue mutex poisoned")
+            .chunks
+            .len()
+    }
+
+    fn dropped_chunks(&self) -> usize {
+        self.state
+            .lock()
+            .expect("audio queue mutex poisoned")
+            .dropped_chunks
+    }
+
+    fn take_dropped_chunks(&self) -> usize {
+        let mut state = self.state.lock().expect("audio queue mutex poisoned");
+        let dropped = state.dropped_chunks;
+        state.dropped_chunks = 0;
+        dropped
+    }
 }
 
 pub fn record_input_device(
@@ -639,5 +943,23 @@ mod tests {
         assert_eq!(loaded.channels, 1);
         assert_eq!(loaded.samples.len(), 3);
         assert!((loaded.samples[2] - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn audio_queue_drops_oldest_when_full() {
+        let queue = AudioChunkQueue::new(2, AudioDropPolicy::Oldest);
+        queue.push(vec![1.0]);
+        queue.push(vec![2.0]);
+        queue.push(vec![3.0]);
+
+        assert_eq!(queue.take_dropped_chunks(), 1);
+        assert_eq!(
+            queue.pop_timeout(Duration::from_millis(1)).unwrap(),
+            Some(vec![2.0])
+        );
+        assert_eq!(
+            queue.pop_timeout(Duration::from_millis(1)).unwrap(),
+            Some(vec![3.0])
+        );
     }
 }

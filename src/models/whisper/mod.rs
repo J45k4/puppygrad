@@ -5,6 +5,7 @@ mod error;
 mod features;
 mod model;
 mod preprocessor;
+mod realtime;
 mod runtime;
 mod tokenizer;
 mod weights;
@@ -29,6 +30,12 @@ pub use model::{
 pub use preprocessor::{
     load_whisper_preprocessor_config, WhisperPreprocessorConfig, WHISPER_CHUNK_SECONDS,
     WHISPER_HOP_LENGTH, WHISPER_N_FFT, WHISPER_N_FRAMES, WHISPER_N_SAMPLES, WHISPER_SAMPLE_RATE,
+};
+pub use realtime::{
+    is_silence, normalize_transcript, rms, seconds_to_samples, DecodeScheduler,
+    ImmediateDecodeScheduler, PartialCommitState, PartialObservation, RollingAudioBuffer,
+    TranscriptionDecodeBackend, TranscriptionDecodeResult, TranscriptionEvent, TranscriptionJob,
+    TranscriptionJobPurpose,
 };
 pub use runtime::WhisperRuntime;
 pub use tokenizer::{WhisperSpecialTokens, WhisperTask, WhisperTokenizer};

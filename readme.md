@@ -99,28 +99,83 @@ For segment metadata instead of plain text, pass `--output json`. `--output srt`
 
 Pass `--stream-raw-tokens` to stream raw decoder token events instead of the final transcript. Rows are tab-separated as `segment`, `phase`, `token_id`, `raw_token`; `phase=prompt` includes Whisper control tags such as `<|startoftranscript|>` and `phase=generated` includes model-produced tokens.
 
-Whisper can also record a microphone chunk and transcribe it:
+Whisper microphone mode listens continuously by default. Chunk mode records non-overlapping chunks and commits each decoded chunk as transcript text:
 
 ```bash
 ./target/release/puppygrad whisper \
   --mic \
-  --chunk-seconds 5 \
+  --chunk-seconds 4 \
   --size tiny.en \
-  --language en \
-  --no-timestamps
+  --language en
 ```
 
-Use `--input-device N` with `--mic` to select a device by the index shown by `audio list-input-devices`. `--audio` and `--mic` are mutually exclusive. Microphone input is downmixed and linearly resampled to Whisper's 16 kHz mono input before log-mel preprocessing. Raw-token streaming also works for mic chunks:
+Use `--once` to preserve the old single-chunk smoke-test behavior:
 
-Mic mode uses a bounded parallel CPU default and caps each chunk to 2 generated tokens by default to keep live smoke tests responsive. Pass `--threads N` and `--max-new-tokens N` to override those defaults.
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --once \
+  --chunk-seconds 4 \
+  --max-new-tokens 64
+```
+
+Rolling mode keeps a moving audio window and emits editable partial transcript events while speech is ongoing. It commits text after silence or after the same normalized partial repeats enough times:
+
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --mic-mode rolling \
+  --window-seconds 8 \
+  --partial-interval-ms 1000 \
+  --max-new-tokens 64
+```
+
+Use `--input-device N` with `--mic` to select a device by the index shown by `audio list-input-devices`. `--audio` and `--mic` are mutually exclusive. Microphone input is captured on a continuous CPAL stream, queued independently from decode, downmixed, and linearly resampled to Whisper's 16 kHz mono input before log-mel preprocessing. `--max-queued-chunks N` controls the bounded capture queue; `--drop-policy oldest|newest|block` chooses overflow behavior, with `oldest` as the default. Queue overflow warnings and realtime stats go to stderr.
+
+Rolling commit controls:
+
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --mic-mode rolling \
+  --commit-on-silence true \
+  --silence-ms 900 \
+  --silence-threshold 0.01
+```
+
+For downstream LLM input, prefer newline-delimited event JSON and consume only `commit` events as durable transcript turns. `partial` events are previews and may be replaced:
+
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --mic-mode rolling \
+  --output events-json \
+  --window-seconds 8 \
+  --partial-interval-ms 1000 \
+  --max-new-tokens 64
+```
+
+Text output remains human-friendly: committed text is printed normally, and rolling partial text is updated in place without duplicating the active partial. `--output events-json` writes newline-delimited events such as `partial`, `commit`, `silence`, `warning`, and `raw_token` to stdout so status logs can stay on stderr.
+
+Raw-token streaming works in chunk and rolling microphone modes:
 
 ```bash
 ./target/release/puppygrad whisper \
   --mic \
   --input-device 0 \
-  --chunk-seconds 5 \
+  --chunk-seconds 4 \
   --stream-raw-tokens
 ```
+
+```bash
+./target/release/puppygrad whisper \
+  --mic \
+  --mic-mode rolling \
+  --output events-json \
+  --stream-raw-tokens
+```
+
+Mic mode uses a bounded parallel CPU default. Pass `--threads N` and `--max-new-tokens N` to override the realtime defaults. A practical starting point for local LLM input is `--mic-mode rolling --window-seconds 8 --partial-interval-ms 1000 --max-new-tokens 64 --output events-json`.
 
 The native CPU path defaults to one worker thread for reproducibility. Pass `--threads N` to parallelize Whisper dense projections, convolution projections, final logits, and attention heads. Size presets provide default chunk sizes for `tiny.en` through `turbo`; `--print-config` includes the resolved Rust CPU tuning. `--quantized-weights` uses experimental row-wise int8 logits weights while keeping the hidden-state path in f32. `--backend gpu` is currently a typed hook that fails clearly until Whisper GPU kernels are implemented.
 
@@ -145,7 +200,7 @@ Whisper timing sweeps are available through:
   --runs 2
 ```
 
-Known limitations: the command currently uses a straightforward CPU reference path with full-sequence decoder passes and no active KV-cache reuse, so long clips decode slowly. Microphone mode records and transcribes one chunk at a time; overlap, rolling context, and polished VAD are deferred. CPU Whisper latency can be high on larger checkpoints. Quantization currently covers the logits projection only, and GPU execution is still TODO. By default the file audio loader accepts PCM WAV; building with `--features audio-formats` also enables FLAC decoding. Arbitrary sample-rate file inputs are decoded but still rejected by the Whisper file path unless they are 16 kHz, so convert files to 16 kHz mono PCM WAV for the default path.
+Known limitations: the command currently uses a straightforward CPU reference path with full-sequence decoder passes and no active KV-cache reuse, so long clips and rolling windows can decode slowly. Rolling mode has a cheap RMS silence gate plus Whisper no-speech probability support, but it is still a lightweight realtime heuristic rather than polished VAD. Log-mel and encoder-output reuse for overlapping rolling windows are future optimizations. A backend-neutral job/result path is in place so a future scheduler can add micro-batching, but current microphone decode still runs one window at a time because single-mic latency matters more than throughput. CPU Whisper latency can be high on larger checkpoints. Quantization currently covers the logits projection only, and GPU execution is still TODO. By default the file audio loader accepts PCM WAV; building with `--features audio-formats` also enables FLAC decoding. Arbitrary sample-rate file inputs are decoded but still rejected by the Whisper file path unless they are 16 kHz, so convert files to 16 kHz mono PCM WAV for the default path.
 
 The current supported Whisper size presets are `tiny.en`, `tiny`, `base.en`, `base`, `small.en`, `small`, `medium.en`, `medium`, `large-v1`, `large-v2`, `large-v3`, and `turbo`. Presets are used for model ids, default local directory names, approximate size metadata, and fallback architecture shape expectations; downloaded `config.json` and `preprocessor_config.json` are loaded and validated as the source of truth at runtime.
 

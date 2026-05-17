@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use puppygrad::audio::{
-    inspect_wav, list_input_devices, record_input_device, resample_linear, write_wav_pcm16,
+    inspect_wav, list_input_devices, record_input_device, resample_linear,
+    start_input_device_stream, write_wav_pcm16, AudioDropPolicy as RuntimeAudioDropPolicy,
     PcmAudio as SharedPcmAudio,
 };
 use puppygrad::engine::Tensor;
@@ -12,7 +13,9 @@ use puppygrad::models::gpt2::{
 };
 use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
 use puppygrad::models::whisper::{
-    default_whisper_dir, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
+    default_whisper_dir, is_silence, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
+    normalize_transcript, seconds_to_samples, PartialCommitState, PartialObservation,
+    RollingAudioBuffer, TranscriptionEvent, TranscriptionJob, TranscriptionJobPurpose,
     WhisperBackendConfig, WhisperOperationProfile, WhisperRuntime, WhisperRustConfig, WhisperSize,
     WhisperTask as RuntimeWhisperTask, WHISPER_SAMPLE_RATE,
 };
@@ -20,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -173,13 +178,49 @@ enum Command {
         #[arg(long)]
         mic: bool,
 
+        /// Record and transcribe one microphone chunk, preserving the old smoke-test behavior.
+        #[arg(long, requires = "mic")]
+        once: bool,
+
         /// Input device index for --mic. Indices come from `puppygrad audio list-input-devices`.
         #[arg(long, requires = "mic")]
         input_device: Option<usize>,
 
-        /// Seconds per microphone chunk.
-        #[arg(long, default_value_t = 5.0)]
+        /// Microphone decode mode.
+        #[arg(long, requires = "mic", value_enum, default_value_t = WhisperMicModeArg::Chunks)]
+        mic_mode: WhisperMicModeArg,
+
+        /// Seconds per microphone chunk in chunk mode.
+        #[arg(long, default_value_t = 4.0)]
         chunk_seconds: f32,
+
+        /// Rolling microphone window size in seconds.
+        #[arg(long, requires = "mic", default_value_t = 8.0)]
+        window_seconds: f32,
+
+        /// Rolling partial decode interval in milliseconds.
+        #[arg(long, requires = "mic", default_value_t = 1000)]
+        partial_interval_ms: u64,
+
+        /// Commit rolling partial text after silence.
+        #[arg(long, requires = "mic", default_value_t = true, action = clap::ArgAction::Set)]
+        commit_on_silence: bool,
+
+        /// Silence duration required before committing rolling text.
+        #[arg(long, requires = "mic", default_value_t = 900)]
+        silence_ms: u64,
+
+        /// RMS threshold used by the cheap microphone silence gate.
+        #[arg(long, requires = "mic", default_value_t = 0.01)]
+        silence_threshold: f32,
+
+        /// Captured-audio queue size before decode begins dropping or blocking chunks.
+        #[arg(long, requires = "mic", default_value_t = 2)]
+        max_queued_chunks: usize,
+
+        /// Queue overflow policy for continuous microphone capture.
+        #[arg(long, requires = "mic", value_enum, default_value_t = AudioDropPolicyArg::Oldest)]
+        drop_policy: AudioDropPolicyArg,
 
         /// Whisper checkpoint size.
         #[arg(long, value_enum, default_value_t = WhisperSize::TinyEn)]
@@ -689,8 +730,17 @@ fn main() -> Result<()> {
         Command::Whisper {
             audio,
             mic,
+            once,
             input_device,
+            mic_mode,
             chunk_seconds,
+            window_seconds,
+            partial_interval_ms,
+            commit_on_silence,
+            silence_ms,
+            silence_threshold,
+            max_queued_chunks,
+            drop_policy,
             size,
             model_dir,
             model_id,
@@ -715,8 +765,17 @@ fn main() -> Result<()> {
         } => run_whisper(RunWhisperArgs {
             audio,
             mic,
+            once,
             input_device,
+            mic_mode,
             chunk_seconds,
+            window_seconds,
+            partial_interval_ms,
+            commit_on_silence,
+            silence_ms,
+            silence_threshold,
+            max_queued_chunks,
+            drop_policy,
             size,
             model_dir,
             model_id,
@@ -931,8 +990,32 @@ enum WhisperTaskArg {
 enum WhisperOutputFormatArg {
     Text,
     Json,
+    EventsJson,
     Srt,
     Vtt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum WhisperMicModeArg {
+    Chunks,
+    Rolling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AudioDropPolicyArg {
+    Oldest,
+    Newest,
+    Block,
+}
+
+impl From<AudioDropPolicyArg> for RuntimeAudioDropPolicy {
+    fn from(value: AudioDropPolicyArg) -> Self {
+        match value {
+            AudioDropPolicyArg::Oldest => RuntimeAudioDropPolicy::Oldest,
+            AudioDropPolicyArg::Newest => RuntimeAudioDropPolicy::Newest,
+            AudioDropPolicyArg::Block => RuntimeAudioDropPolicy::Block,
+        }
+    }
 }
 
 impl From<WhisperTaskArg> for RuntimeWhisperTask {
@@ -1062,8 +1145,17 @@ struct RunQwenArgs {
 struct RunWhisperArgs {
     audio: Option<PathBuf>,
     mic: bool,
+    once: bool,
     input_device: Option<usize>,
+    mic_mode: WhisperMicModeArg,
     chunk_seconds: f32,
+    window_seconds: f32,
+    partial_interval_ms: u64,
+    commit_on_silence: bool,
+    silence_ms: u64,
+    silence_threshold: f32,
+    max_queued_chunks: usize,
+    drop_policy: AudioDropPolicyArg,
     size: WhisperSize,
     model_dir: Option<PathBuf>,
     model_id: Option<String>,
@@ -1234,6 +1326,7 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
 fn run_whisper(args: RunWhisperArgs) -> Result<()> {
     let model_dir = args
         .model_dir
+        .clone()
         .unwrap_or_else(|| default_whisper_dir(args.size));
     if args.download {
         eprintln!(
@@ -1288,37 +1381,21 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
         args.size,
     )?;
 
+    if args.mic {
+        return run_whisper_mic(&args, &runtime, prefix, load_time, no_timestamps);
+    }
+
     let audio_start = Instant::now();
-    let audio = if args.mic {
-        let duration = audio_duration(args.chunk_seconds, "chunk-seconds")?;
-        eprintln!(
-            "recording {} from {}",
-            format_duration(duration),
-            args.input_device
-                .map(|index| format!("input device {index}"))
-                .unwrap_or_else(|| "default input device".to_string())
-        );
-        let recorded = record_input_device(args.input_device, duration)?;
-        eprintln!(
-            "recorded {:.3}s at {} Hz; resampling to {WHISPER_SAMPLE_RATE} Hz mono for Whisper",
-            recorded.duration_seconds(),
-            recorded.sample_rate
-        );
-        let resampled = resample_linear(&recorded, WHISPER_SAMPLE_RATE)?;
-        whisper_audio_from_shared(resampled)
-    } else {
-        let audio_path = args.audio.as_ref().expect("checked above");
-        let audio = load_audio_arg(audio_path)?;
-        if audio.sample_rate != WHISPER_SAMPLE_RATE {
-            return Err(format!(
-                "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
-                audio_path.display(),
-                audio.sample_rate
-            )
-            .into());
-        }
-        audio
-    };
+    let audio_path = args.audio.as_ref().expect("checked above");
+    let audio = load_audio_arg(audio_path)?;
+    if audio.sample_rate != WHISPER_SAMPLE_RATE {
+        return Err(format!(
+            "{} has sample rate {} Hz; native Whisper currently requires {WHISPER_SAMPLE_RATE} Hz WAV input",
+            audio_path.display(),
+            audio.sample_rate
+        )
+        .into());
+    }
     let audio_time = audio_start.elapsed();
 
     let mut generation_template = args.generation.to_config_with_default(1);
@@ -1549,6 +1626,16 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
                 serde_json::to_writer_pretty(&mut stdout, &segments)?;
                 writeln!(stdout)?;
             }
+            WhisperOutputFormatArg::EventsJson => {
+                for segment in segments.iter().filter(|segment| !segment.text.is_empty()) {
+                    write_event(
+                        &mut stdout,
+                        &TranscriptionEvent::Commit {
+                            text: segment.text.clone(),
+                        },
+                    )?;
+                }
+            }
             WhisperOutputFormatArg::Srt => {
                 for (i, segment) in segments
                     .iter()
@@ -1642,6 +1729,637 @@ fn run_whisper(args: RunWhisperArgs) -> Result<()> {
     Ok(())
 }
 
+struct RealtimeDecodeOutput {
+    text: String,
+    generated_tokens: usize,
+    no_speech_probability: f32,
+    features_time: Duration,
+    encode_time: Duration,
+    prefill_time: Duration,
+    decode_time: Duration,
+}
+
+fn run_whisper_mic(
+    args: &RunWhisperArgs,
+    runtime: &WhisperRuntime,
+    prefix: Vec<usize>,
+    load_time: Duration,
+    no_timestamps: bool,
+) -> Result<()> {
+    validate_whisper_mic_args(args)?;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let signal_running = running.clone();
+    ctrlc::set_handler(move || {
+        signal_running.store(false, Ordering::SeqCst);
+    })?;
+
+    let mut generation_template = args.generation.to_config_with_default(64);
+    generation_template.eos_token_id = Some(runtime.tokenizer.special_tokens().eos);
+    generation_template.validate()?;
+
+    let mut stdout = std::io::stdout().lock();
+    let mut profile = WhisperOperationProfile::default();
+    let mut totals = RealtimeDecodeOutput {
+        text: String::new(),
+        generated_tokens: 0,
+        no_speech_probability: 0.0,
+        features_time: Duration::ZERO,
+        encode_time: Duration::ZERO,
+        prefill_time: Duration::ZERO,
+        decode_time: Duration::ZERO,
+    };
+
+    if args.once {
+        let duration = audio_duration(args.chunk_seconds, "chunk-seconds")?;
+        eprintln!(
+            "recording one {} chunk from {}",
+            format_duration(duration),
+            args.input_device
+                .map(|index| format!("input device {index}"))
+                .unwrap_or_else(|| "default input device".to_string())
+        );
+        let recorded = record_input_device(args.input_device, duration)?;
+        let resampled = resample_linear(&recorded, WHISPER_SAMPLE_RATE)?;
+        let output = decode_mic_samples(
+            runtime,
+            &prefix,
+            args,
+            &generation_template,
+            no_timestamps,
+            &mut profile,
+            &mut stdout,
+            0,
+            &resampled.samples,
+            0.0,
+            TranscriptionJobPurpose::Final,
+        )?;
+        emit_commit(&mut stdout, args, &output.text, &mut 0)?;
+        totals = output;
+        print_realtime_stats(args, load_time, &totals, &profile, 0, 0, Duration::ZERO);
+        return Ok(());
+    }
+
+    let stream = start_input_device_stream(
+        args.input_device,
+        args.max_queued_chunks,
+        args.drop_policy.into(),
+    )?;
+    eprintln!(
+        "listening continuously from {}; input {} Hz, {} channel(s), mode {:?}",
+        args.input_device
+            .map(|index| format!("input device {index}"))
+            .unwrap_or_else(|| "default input device".to_string()),
+        stream.sample_rate(),
+        stream.channels(),
+        args.mic_mode
+    );
+
+    match args.mic_mode {
+        WhisperMicModeArg::Chunks => run_whisper_mic_chunks(
+            args,
+            runtime,
+            &prefix,
+            &generation_template,
+            no_timestamps,
+            &running,
+            &stream,
+            &mut stdout,
+            &mut profile,
+            &mut totals,
+        )?,
+        WhisperMicModeArg::Rolling => run_whisper_mic_rolling(
+            args,
+            runtime,
+            &prefix,
+            &generation_template,
+            no_timestamps,
+            &running,
+            &stream,
+            &mut stdout,
+            &mut profile,
+            &mut totals,
+        )?,
+    }
+
+    print_realtime_stats(
+        args,
+        load_time,
+        &totals,
+        &profile,
+        stream.dropped_chunks(),
+        stream.queued_chunks(),
+        Duration::ZERO,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_whisper_mic_chunks<W: Write>(
+    args: &RunWhisperArgs,
+    runtime: &WhisperRuntime,
+    prefix: &[usize],
+    generation_template: &TextGenerationConfig,
+    no_timestamps: bool,
+    running: &AtomicBool,
+    stream: &puppygrad::audio::ContinuousInputStream,
+    stdout: &mut W,
+    profile: &mut WhisperOperationProfile,
+    totals: &mut RealtimeDecodeOutput,
+) -> Result<()> {
+    let target_native_samples = seconds_to_samples(stream.sample_rate(), args.chunk_seconds);
+    let mut segment_index = 0usize;
+    let mut collected = Vec::with_capacity(target_native_samples);
+    let mut window_start = 0.0f32;
+    while running.load(Ordering::SeqCst) {
+        match stream.recv_timeout(Duration::from_millis(200))? {
+            Some(chunk) => collected.extend(chunk),
+            None => continue,
+        }
+        emit_queue_warnings(stdout, args, stream)?;
+        while collected.len() >= target_native_samples {
+            let native = collected
+                .drain(..target_native_samples)
+                .collect::<Vec<f32>>();
+            let audio = SharedPcmAudio {
+                path: PathBuf::from("<microphone>"),
+                sample_rate: stream.sample_rate(),
+                channels: 1,
+                samples: native,
+            };
+            let resampled = resample_linear(&audio, WHISPER_SAMPLE_RATE)?;
+            let decode_start = Instant::now();
+            let output = decode_mic_samples(
+                runtime,
+                prefix,
+                args,
+                generation_template,
+                no_timestamps,
+                profile,
+                stdout,
+                segment_index,
+                &resampled.samples,
+                window_start,
+                TranscriptionJobPurpose::Final,
+            )?;
+            if decode_start.elapsed().as_secs_f32() > args.chunk_seconds {
+                emit_warning(
+                    stdout,
+                    args,
+                    "decode is falling behind realtime; captured audio may queue or drop",
+                )?;
+            }
+            if output.no_speech_probability < args.no_speech_threshold.unwrap_or(f32::INFINITY) {
+                emit_commit(stdout, args, &output.text, &mut 0)?;
+            } else {
+                emit_silence(stdout, args)?;
+            }
+            add_realtime_totals(totals, &output);
+            segment_index += 1;
+            window_start += args.chunk_seconds;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_whisper_mic_rolling<W: Write>(
+    args: &RunWhisperArgs,
+    runtime: &WhisperRuntime,
+    prefix: &[usize],
+    generation_template: &TextGenerationConfig,
+    no_timestamps: bool,
+    running: &AtomicBool,
+    stream: &puppygrad::audio::ContinuousInputStream,
+    stdout: &mut W,
+    profile: &mut WhisperOperationProfile,
+    totals: &mut RealtimeDecodeOutput,
+) -> Result<()> {
+    let mut rolling = RollingAudioBuffer::new(WHISPER_SAMPLE_RATE, args.window_seconds);
+    let mut partial_state = PartialCommitState::new(3);
+    let mut last_decode = Instant::now();
+    let partial_interval = Duration::from_millis(args.partial_interval_ms);
+    let silence_duration = Duration::from_millis(args.silence_ms);
+    let mut last_voice = Instant::now();
+    let mut segment_index = 0usize;
+    let mut visible_partial_width = 0usize;
+    let mut last_committed_normalized = String::new();
+
+    while running.load(Ordering::SeqCst) {
+        if let Some(chunk) = stream.recv_timeout(Duration::from_millis(100))? {
+            let audio = SharedPcmAudio {
+                path: PathBuf::from("<microphone>"),
+                sample_rate: stream.sample_rate(),
+                channels: 1,
+                samples: chunk,
+            };
+            let resampled = resample_linear(&audio, WHISPER_SAMPLE_RATE)?;
+            let silent = is_silence(&resampled.samples, args.silence_threshold);
+            if !silent {
+                last_voice = Instant::now();
+            }
+            rolling.append(&resampled.samples);
+        }
+        emit_queue_warnings(stdout, args, stream)?;
+
+        if args.commit_on_silence
+            && last_voice.elapsed() >= silence_duration
+            && rolling.duration_seconds() > 0.0
+        {
+            if let Some(text) = partial_state.commit_active() {
+                clear_visible_partial(stdout, args, &mut visible_partial_width)?;
+                emit_rolling_commit_once(
+                    stdout,
+                    args,
+                    &text,
+                    &mut visible_partial_width,
+                    &mut last_committed_normalized,
+                )?;
+            } else {
+                emit_silence(stdout, args)?;
+            }
+            rolling.clear();
+            last_voice = Instant::now();
+            continue;
+        }
+
+        if rolling.samples().is_empty() || last_decode.elapsed() < partial_interval {
+            continue;
+        }
+        last_decode = Instant::now();
+        if is_silence(rolling.samples(), args.silence_threshold) {
+            emit_silence(stdout, args)?;
+            continue;
+        }
+        let output = decode_mic_samples(
+            runtime,
+            prefix,
+            args,
+            generation_template,
+            no_timestamps,
+            profile,
+            stdout,
+            segment_index,
+            rolling.samples(),
+            rolling.window_start_seconds(),
+            TranscriptionJobPurpose::Partial,
+        )?;
+        add_realtime_totals(totals, &output);
+        segment_index += 1;
+        if args
+            .no_speech_threshold
+            .is_some_and(|threshold| output.no_speech_probability >= threshold)
+        {
+            emit_silence(stdout, args)?;
+            continue;
+        }
+        match partial_state.observe_partial(output.text.trim()) {
+            PartialObservation::Partial(text) => {
+                emit_partial(stdout, args, &text, &mut visible_partial_width)?;
+            }
+            PartialObservation::Commit(text) => {
+                clear_visible_partial(stdout, args, &mut visible_partial_width)?;
+                emit_rolling_commit_once(
+                    stdout,
+                    args,
+                    &text,
+                    &mut visible_partial_width,
+                    &mut last_committed_normalized,
+                )?;
+                rolling.clear();
+                partial_state.clear();
+            }
+            PartialObservation::Empty | PartialObservation::Duplicate => {}
+        }
+    }
+
+    if let Some(text) = partial_state.commit_active() {
+        clear_visible_partial(stdout, args, &mut visible_partial_width)?;
+        emit_rolling_commit_once(
+            stdout,
+            args,
+            &text,
+            &mut visible_partial_width,
+            &mut last_committed_normalized,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_mic_samples<W: Write>(
+    runtime: &WhisperRuntime,
+    prefix: &[usize],
+    args: &RunWhisperArgs,
+    generation_template: &TextGenerationConfig,
+    no_timestamps: bool,
+    profile: &mut WhisperOperationProfile,
+    stdout: &mut W,
+    segment_index: usize,
+    samples: &[f32],
+    window_start: f32,
+    purpose: TranscriptionJobPurpose,
+) -> Result<RealtimeDecodeOutput> {
+    let _job = TranscriptionJob {
+        id: segment_index as u64,
+        stream_id: 0,
+        window_start_seconds: window_start,
+        window_end_seconds: window_start + samples.len() as f32 / WHISPER_SAMPLE_RATE as f32,
+        samples: samples.to_vec(),
+        purpose,
+        max_new_tokens: generation_template.max_new_tokens,
+    };
+
+    let features_start = Instant::now();
+    let features = log_mel_spectrogram(samples, &runtime.preprocessor)?;
+    let features_time = features_start.elapsed();
+
+    let encode_start = Instant::now();
+    let encoded = runtime.encode_audio(&features, profile)?;
+    let encode_time = encode_start.elapsed();
+
+    let segment_prompt = prefix.to_vec();
+    let mut segment_generation = generation_template.clone();
+    let default_max_new_tokens = runtime
+        .config
+        .n_text_ctx
+        .saturating_sub(segment_prompt.len());
+    segment_generation.max_new_tokens = args
+        .generation
+        .max_new_tokens
+        .unwrap_or(64)
+        .min(default_max_new_tokens);
+    segment_generation.validate()?;
+
+    let prefill_start = Instant::now();
+    let first_logits = runtime.decoder_logits(&encoded, &segment_prompt, profile)?;
+    let prefill_time = prefill_start.elapsed();
+    let no_speech_probability = runtime
+        .tokenizer
+        .special_tokens()
+        .no_speech
+        .map(|token_id| logits_probability(&first_logits, token_id))
+        .unwrap_or(0.0);
+
+    let decode_start = Instant::now();
+    let output_tokens = if args.stream_raw_tokens {
+        for token_id in &segment_prompt {
+            emit_raw_token(stdout, args, "prompt", *token_id, &runtime.tokenizer)?;
+        }
+        stdout.flush()?;
+        runtime.stream_greedy_tokens(
+            &encoded,
+            &segment_prompt,
+            &segment_generation,
+            no_timestamps,
+            profile,
+            |token_id| {
+                emit_raw_token(stdout, args, "generated", token_id, &runtime.tokenizer)?;
+                stdout.flush()?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            },
+        )?
+    } else {
+        runtime.generate_greedy(
+            &encoded,
+            &segment_prompt,
+            &segment_generation,
+            no_timestamps,
+            profile,
+        )?
+    };
+    let decode_time = decode_start.elapsed();
+    let generated = &output_tokens[segment_prompt.len()..];
+    let text = runtime.tokenizer.decode(generated)?.trim().to_string();
+
+    Ok(RealtimeDecodeOutput {
+        text,
+        generated_tokens: generated.len(),
+        no_speech_probability,
+        features_time,
+        encode_time,
+        prefill_time,
+        decode_time,
+    })
+}
+
+fn validate_whisper_mic_args(args: &RunWhisperArgs) -> Result<()> {
+    audio_duration(args.chunk_seconds, "chunk-seconds")?;
+    audio_duration(args.window_seconds, "window-seconds")?;
+    if args.partial_interval_ms == 0 {
+        return Err("--partial-interval-ms must be greater than zero".into());
+    }
+    if args.silence_ms == 0 {
+        return Err("--silence-ms must be greater than zero".into());
+    }
+    if !args.silence_threshold.is_finite() || args.silence_threshold < 0.0 {
+        return Err("--silence-threshold must be a finite non-negative number".into());
+    }
+    if args.max_queued_chunks == 0 {
+        return Err("--max-queued-chunks must be greater than zero".into());
+    }
+    Ok(())
+}
+
+fn add_realtime_totals(total: &mut RealtimeDecodeOutput, next: &RealtimeDecodeOutput) {
+    total.generated_tokens += next.generated_tokens;
+    total.features_time += next.features_time;
+    total.encode_time += next.encode_time;
+    total.prefill_time += next.prefill_time;
+    total.decode_time += next.decode_time;
+    total.no_speech_probability = next.no_speech_probability;
+}
+
+fn emit_partial<W: Write>(
+    writer: &mut W,
+    args: &RunWhisperArgs,
+    text: &str,
+    visible_partial_width: &mut usize,
+) -> Result<()> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    if args.stream_raw_tokens && args.output != WhisperOutputFormatArg::EventsJson {
+        return Ok(());
+    }
+    match args.output {
+        WhisperOutputFormatArg::EventsJson => write_event(
+            writer,
+            &TranscriptionEvent::Partial {
+                text: text.to_string(),
+            },
+        ),
+        WhisperOutputFormatArg::Text => {
+            let clear = " ".repeat((*visible_partial_width).saturating_sub(text.len()));
+            write!(writer, "\r{text}{clear}")?;
+            writer.flush()?;
+            *visible_partial_width = text.len();
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn emit_commit<W: Write>(
+    writer: &mut W,
+    args: &RunWhisperArgs,
+    text: &str,
+    visible_partial_width: &mut usize,
+) -> Result<()> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    if args.stream_raw_tokens && args.output != WhisperOutputFormatArg::EventsJson {
+        return Ok(());
+    }
+    match args.output {
+        WhisperOutputFormatArg::EventsJson => write_event(
+            writer,
+            &TranscriptionEvent::Commit {
+                text: text.to_string(),
+            },
+        ),
+        WhisperOutputFormatArg::Text => {
+            if *visible_partial_width > 0 {
+                writeln!(writer)?;
+                *visible_partial_width = 0;
+            }
+            writeln!(writer, "{text}")?;
+            writer.flush()?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn emit_rolling_commit_once<W: Write>(
+    writer: &mut W,
+    args: &RunWhisperArgs,
+    text: &str,
+    visible_partial_width: &mut usize,
+    last_committed_normalized: &mut String,
+) -> Result<()> {
+    let normalized = normalize_transcript(text);
+    if normalized.is_empty() || normalized == *last_committed_normalized {
+        return Ok(());
+    }
+    emit_commit(writer, args, text, visible_partial_width)?;
+    *last_committed_normalized = normalized;
+    Ok(())
+}
+
+fn clear_visible_partial<W: Write>(
+    writer: &mut W,
+    args: &RunWhisperArgs,
+    visible_partial_width: &mut usize,
+) -> Result<()> {
+    if args.output == WhisperOutputFormatArg::Text && *visible_partial_width > 0 {
+        write!(writer, "\r{}\r", " ".repeat(*visible_partial_width))?;
+        writer.flush()?;
+        *visible_partial_width = 0;
+    }
+    Ok(())
+}
+
+fn emit_silence<W: Write>(writer: &mut W, args: &RunWhisperArgs) -> Result<()> {
+    if args.output == WhisperOutputFormatArg::EventsJson {
+        write_event(writer, &TranscriptionEvent::Silence)?;
+    }
+    Ok(())
+}
+
+fn emit_warning<W: Write>(writer: &mut W, args: &RunWhisperArgs, message: &str) -> Result<()> {
+    eprintln!("warning: {message}");
+    if args.output == WhisperOutputFormatArg::EventsJson {
+        write_event(
+            writer,
+            &TranscriptionEvent::Warning {
+                message: message.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_queue_warnings<W: Write>(
+    writer: &mut W,
+    args: &RunWhisperArgs,
+    stream: &puppygrad::audio::ContinuousInputStream,
+) -> Result<()> {
+    let dropped = stream.take_dropped_chunks();
+    if dropped > 0 {
+        emit_warning(
+            writer,
+            args,
+            &format!("audio capture queue overflowed; dropped {dropped} chunk(s)"),
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_raw_token<W, D>(
+    writer: &mut W,
+    args: &RunWhisperArgs,
+    phase: &str,
+    token_id: usize,
+    decoder: &D,
+) -> Result<()>
+where
+    W: Write,
+    D: RawTokenDecoder,
+    D::Error: std::error::Error + 'static,
+{
+    let token = decoder.raw_token(token_id)?;
+    if args.output == WhisperOutputFormatArg::EventsJson {
+        write_event(
+            writer,
+            &TranscriptionEvent::RawToken {
+                phase: phase.to_string(),
+                token_id,
+                token,
+            },
+        )
+    } else {
+        writeln!(writer, "{phase}\t{token_id}\t{}", escape_raw_token(&token))?;
+        Ok(())
+    }
+}
+
+fn write_event<W: Write>(writer: &mut W, event: &TranscriptionEvent) -> Result<()> {
+    serde_json::to_writer(&mut *writer, event)?;
+    writeln!(writer)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn print_realtime_stats(
+    args: &RunWhisperArgs,
+    load_time: Duration,
+    totals: &RealtimeDecodeOutput,
+    profile: &WhisperOperationProfile,
+    dropped_chunks: usize,
+    queue_depth: usize,
+    capture_lag: Duration,
+) {
+    if !args.stats {
+        return;
+    }
+    eprintln!("stats:");
+    eprintln!("  load: {}", format_duration(load_time));
+    eprintln!("  capture lag: {}", format_duration(capture_lag));
+    eprintln!("  queue depth: {queue_depth}");
+    eprintln!("  dropped chunks: {dropped_chunks}");
+    eprintln!("  log-mel: {}", format_duration(totals.features_time));
+    eprintln!("  encode: {}", format_duration(totals.encode_time));
+    eprintln!("  prefill: {}", format_duration(totals.prefill_time));
+    eprintln!(
+        "  decode: {} ({} generated tokens)",
+        format_duration(totals.decode_time),
+        totals.generated_tokens
+    );
+    eprintln!("  final logits: {}", format_duration(profile.final_logits));
+}
+
 fn write_raw_token_event<W, D>(
     writer: &mut W,
     segment_index: Option<usize>,
@@ -1674,15 +2392,6 @@ fn load_audio_arg(audio_path: &PathBuf) -> Result<puppygrad::models::whisper::Pc
         return Ok(load_wav_pcm_bytes(PathBuf::from("<stdin>"), &data)?);
     }
     Ok(load_wav_pcm(audio_path)?)
-}
-
-fn whisper_audio_from_shared(audio: SharedPcmAudio) -> puppygrad::models::whisper::PcmAudio {
-    puppygrad::models::whisper::PcmAudio {
-        path: audio.path,
-        sample_rate: audio.sample_rate,
-        channels: audio.channels,
-        samples: audio.samples,
-    }
 }
 
 fn audio_duration(seconds: f32, arg_name: &str) -> Result<Duration> {

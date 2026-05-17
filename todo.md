@@ -1,120 +1,142 @@
 # Puppygrad TODO
 
-## Shared Audio And Whisper Mic Support Plan
+## Realtime Rolling Whisper Plan
 
-### Phase 1: Audio Module Boundary
+Goal: make microphone transcription feel responsive enough for downstream LLM use. The runtime should continuously capture audio, emit editable partial transcripts, commit stable speech turns on silence or stability, and keep the decode pipeline shaped so batching can be added later.
 
-- [x] Add a shared audio module outside `src/models/whisper/`, for example `src/audio/` or `src/runtime/audio/`.
-- [x] Keep OS/device audio capture, device listing, sample conversion, resampling, and WAV writing in the shared audio module.
-- [x] Keep Whisper-specific log-mel preprocessing and model execution in `src/models/whisper/`.
-- [x] Define a shared `AudioError` / `AudioResult` type so CLI and models do not need to depend on Whisper errors for generic audio operations.
-- [x] Define a shared `PcmAudio` or compatible audio buffer type with sample rate, channel count/mono policy, and normalized `f32` samples.
+### Phase 1: Mic Mode Semantics
 
-### Phase 2: Audio CLI Namespace
+- [x] Change `puppygrad whisper --mic` from one-shot recording to continuous listening until Ctrl-C.
+- [x] Add `--once` to preserve the current single-chunk smoke-test behavior.
+- [x] Lower the mic default chunk/window behavior so the default feels interactive.
+- [x] Remove the surprising mic default of 2 generated tokens, or replace it with a documented realtime default such as 64.
+- [x] Keep file mode behavior unchanged for `--audio path.wav` and `--audio -`.
+- [x] Document that mic mode is continuous by default and `--once` is for tests.
 
-- [x] Add a top-level `audio` CLI command group.
-- [x] Add `puppygrad audio list-input-devices`.
-- [x] Add `puppygrad audio record --seconds N --out clip.wav`.
-- [x] Add `puppygrad audio record --input-device N --seconds N --out clip.wav`.
-- [x] Add `puppygrad audio inspect path.wav` for sample rate, channel count, duration, sample count, and format summary.
-- [x] Make shared audio commands independent from Whisper assets or model loading.
+### Phase 2: Capture Pipeline
 
-### Phase 3: Microphone Device Discovery
+- [x] Replace blocking `record_input_device(duration)` usage in Whisper mic mode with a continuous capture stream.
+- [x] Keep audio capture independent from Whisper decode speed.
+- [x] Push captured mono/resampled audio into a bounded buffer or chunk queue.
+- [x] Add a clear queue overflow policy: warn and drop oldest chunk first.
+- [x] Ensure Ctrl-C / shutdown closes the audio stream cleanly.
+- [x] Keep `audio record --seconds N` as a blocking fixed-duration utility command.
 
-- [x] Add `cpal` or another deliberate cross-platform audio input dependency.
-- [x] Enumerate input devices with stable display output.
-- [x] Mark the OS default input device in `audio list-input-devices`.
-- [x] Support default-device capture when no explicit input device is passed.
-- [x] Support optional input-device index for quick CLI selection.
-- [x] Document that device indices can change after reconnects/reboots.
-- [x] Consider name matching later, for example `--input-device-name "MacBook"`.
+### Phase 3: Rolling Decode Mode
 
-### Phase 4: Microphone Capture
+- [x] Add mic decode modes:
+  - `--mic-mode chunks` for simple non-overlapping chunks.
+  - `--mic-mode rolling` for responsive partial transcription.
+- [x] Make `rolling` the preferred mode for realtime LLM use once stable.
+- [x] Add `--window-seconds N` for the rolling audio window, default around 6-8 seconds.
+- [x] Add `--partial-interval-ms N`, default around 750-1000 ms.
+- [x] Keep `--chunk-seconds N` for simple chunk mode, default around 3-4 seconds.
+- [x] Validate that window/interval/chunk values are positive and sane.
 
-- [x] Implement blocking capture for a fixed duration.
-- [x] Convert supported input sample formats to normalized `f32`.
-- [x] Downmix multi-channel input to mono.
-- [x] Preserve the original device sample rate in the captured buffer.
-- [x] Add backpressure/buffer overflow handling with clear errors.
-- [x] Make `audio record` write a valid PCM WAV file.
-- [x] Add a short manual smoke-test recipe for recording and inspecting a clip.
+### Phase 4: Partial And Commit Events
 
-### Phase 5: Resampling And Audio Normalization
+- [x] Introduce a transcription event type:
+  - `Partial { text }`
+  - `Commit { text }`
+  - `RawToken { phase, token_id, token }`
+  - `Silence`
+  - `Warning { message }`
+- [x] In rolling mode, repeatedly decode the current rolling window and emit `Partial` when text changes.
+- [x] Keep only one visible partial active in terminal text mode.
+- [x] Commit text on silence, stable repeated decode, or explicit window boundary.
+- [x] After commit, advance or clear the rolling buffer so committed text is not repeatedly re-emitted.
+- [x] Keep committed text suitable for downstream LLM input.
 
-- [x] Add a built-in linear resampler for the MVP, or choose a dedicated resampling crate if quality is worth the dependency.
-- [x] Convert arbitrary mic sample rates such as 44.1 kHz and 48 kHz to Whisper's 16 kHz mono input.
-- [x] Add unit tests for downmixing.
-- [x] Add unit tests for sample format conversion.
-- [x] Add unit tests for resampler output length and basic waveform shape.
-- [x] Reuse the same normalization path for `audio record`, `audio inspect`, and Whisper mic input where practical.
+### Phase 5: Silence And Stability
 
-### Phase 6: Whisper Input Modes
+- [x] Add a cheap RMS silence gate before invoking Whisper.
+- [x] Reuse Whisper no-speech probability when available.
+- [x] Add `--commit-on-silence`, enabled by default in rolling mic mode.
+- [x] Add `--silence-ms N`, default around 700-1200 ms.
+- [x] Add `--silence-threshold N` for RMS gate tuning.
+- [x] Add stable-text commit heuristic: if normalized partial text is unchanged for N decodes, commit it.
+- [x] Avoid committing empty or whitespace-only text.
 
-- [x] Add `--mic` to `puppygrad whisper`.
-- [x] Make `--audio` and `--mic` mutually exclusive.
-- [x] Add `--input-device N` for `puppygrad whisper --mic`.
-- [x] Keep existing file and stdin modes:
-  - `puppygrad whisper --audio clip.wav`
-  - `puppygrad whisper --audio -`
-- [x] Ensure model/backend/generation options continue to work with both file and mic input.
-- [x] Fail clearly if microphone capture is requested on a platform/device setup that is unavailable.
+### Phase 6: Output Formats For Realtime
 
-### Phase 7: Live Chunking
+- [x] Keep plain text output as human-friendly terminal output.
+- [x] Add an event output format for machines, likely newline-delimited JSON:
+  - `--output events-json`
+- [x] Make raw-token streaming work inside both chunk and rolling mic modes.
+- [x] In terminal text mode, print committed text normally and update partial text without duplicating it.
+- [x] Keep stats/status/warnings on stderr.
+- [x] Ensure downstream tools can read committed transcript events from stdout without parsing status logs.
 
-- [x] Add `--chunk-seconds N` for mic mode.
-- [x] Default mic chunks to a short value such as 5 seconds.
-- [x] Convert each captured chunk to 16 kHz mono before Whisper preprocessing.
-- [x] Run existing Whisper log-mel, encoder, and decoder paths per chunk.
-- [x] Print chunk-level transcripts as each chunk finishes.
-- [x] Track chunk start/end wall-clock times for future JSON/SRT/VTT support.
-- [x] Defer overlap and rolling-context behavior until the basic mic path works.
+### Phase 7: Batching-Ready Job Model
 
-### Phase 8: Streaming Output
+- [x] Define a backend-neutral transcription job:
+  - stream id
+  - window start/end time
+  - samples at 16 kHz mono
+  - purpose: partial or final
+  - generation settings
+- [x] Define a decode result:
+  - job id
+  - decoded text
+  - generated token ids
+  - no-speech probability
+  - timing/profile data
+- [x] Route both chunk mode and rolling mode through the same job/result path.
+- [x] Keep the first backend implementation as `decode_one(job)`.
+- [x] Design the trait boundary so a future backend can add `decode_batch(&[job])`.
+- [x] Avoid CLI-specific logic inside the model decode path.
 
-- [x] Reuse `--stream-raw-tokens` for mic chunks.
-- [x] Emit raw prompt/control tokens and generated tokens for each mic chunk.
-- [x] Keep transcript text output as the default when raw streaming is disabled.
-- [x] Add text streaming later if useful, separate from raw-token streaming.
-- [x] Make stdout/stderr behavior consistent: transcripts/tokens on stdout, stats/status on stderr.
+### Phase 8: Performance And Latency Controls
 
-### Phase 9: Silence And Usability
+- [x] Track capture lag, queue depth, decode time, and end-to-end partial latency.
+- [x] Print realtime stats when `--stats` is enabled.
+- [x] Add warning when decode falls behind realtime.
+- [x] Add `--max-queued-chunks N`, default small such as 2.
+- [x] Add `--drop-policy oldest|newest|block`, default `oldest`.
+- [x] Reuse log-mel frames for overlapping rolling windows when practical.
+- [x] Keep encoder-output reuse as a later optimization after correctness.
 
-- [x] Reuse Whisper no-speech probability for optional silence skipping.
-- [x] Add `--no-speech-threshold` support for mic chunks.
-- [x] Consider a simple RMS gate before running Whisper on silent chunks.
-- [x] Avoid printing empty transcript lines by default.
-- [x] Add clear status output for recording start/stop only on stderr.
+### Phase 9: Future Batching
+
+- [x] Add a decode scheduler interface that can choose between immediate decode and micro-batching.
+- [x] Add `--micro-batch-size N` later, default 1.
+- [x] Add `--micro-batch-timeout-ms N` later to cap batching latency.
+- [x] Support batching across multiple pending rolling windows if decode falls behind.
+- [x] Support batching across multiple streams/users later.
+- [x] Keep batching optional because single-mic realtime latency matters more than throughput.
 
 ### Phase 10: Tests And Manual Verification
 
-- [x] Keep file-based Whisper tests as deterministic correctness tests.
-- [x] Unit test shared audio conversion/downmix/resampling without requiring a real microphone.
-- [x] Add `audio inspect` tests using existing 16 kHz WAV fixtures.
-- [x] Add manual test notes for `audio list-input-devices`.
-- [x] Add manual test notes for `audio record --seconds 3 --out /tmp/puppygrad-mic.wav`.
-- [x] Add manual test notes for `whisper --mic --chunk-seconds 5 --stream-raw-tokens`.
-- [x] Avoid making CI depend on an actual microphone.
+- [x] Unit test rolling buffer append/slice/advance behavior.
+- [x] Unit test RMS silence detection.
+- [x] Unit test partial-to-commit state transitions.
+- [x] Unit test duplicate partial suppression.
+- [x] Unit test job/result scheduler plumbing without microphone access.
+- [x] Keep microphone tests as manual smoke tests.
+- [x] Verify `--once` still records one chunk and exits.
+- [x] Verify default `--mic` continues until interrupted.
+- [x] Verify raw-token streaming still prints prompt/control and generated tokens.
 
 ### Phase 11: Documentation
 
-- [x] Document `puppygrad audio list-input-devices`.
-- [x] Document `puppygrad audio record`.
-- [x] Document `puppygrad audio inspect`.
-- [x] Document `puppygrad whisper --mic`.
-- [x] Document default-device behavior and optional input-device index.
-- [x] Document that mic audio is resampled/downmixed to 16 kHz mono for Whisper.
-- [x] Document known limitations: chunk-level output first, no overlap/VAD polish initially, CPU Whisper latency.
+- [x] Update README to describe continuous mic mode.
+- [x] Document `--once`.
+- [x] Document `--mic-mode chunks|rolling`.
+- [x] Document `--window-seconds`, `--partial-interval-ms`, and `--chunk-seconds`.
+- [x] Document partial versus committed transcript behavior.
+- [x] Document recommended settings for LLM input.
+- [x] Document current CPU latency limitations and the future batching path.
 
 ## Completion Criteria
 
 - [x] `cargo fmt --check` passes.
 - [x] `cargo check` passes.
-- [x] Shared audio unit tests pass without requiring a microphone.
-- [x] `puppygrad audio list-input-devices` prints available input devices and marks the default device.
-- [x] `puppygrad audio record --seconds 3 --out /tmp/puppygrad-mic.wav` records a playable WAV from the default microphone.
-- [x] `puppygrad audio record --input-device N --seconds 3 --out /tmp/puppygrad-mic.wav` records from a selected device.
-- [x] `puppygrad audio inspect /tmp/puppygrad-mic.wav` reports sample rate, channel count, duration, and sample count.
-- [x] `puppygrad whisper --mic --chunk-seconds 5 --size tiny.en --language en --no-timestamps` records from the default mic and prints a transcript chunk.
-- [x] `puppygrad whisper --mic --input-device N --chunk-seconds 5 --stream-raw-tokens` prints raw token events with prompt/control tags and generated tokens.
-- [x] Existing Whisper file mode still works with `--audio tests/data/audio/jfk_16khz_mono.wav`.
-- [x] README documents the audio commands, mic mode, and current limitations.
+- [x] Realtime pipeline unit tests pass without requiring a microphone.
+- [x] `puppygrad whisper --mic --once --chunk-seconds 4 --max-new-tokens 64` records one chunk, transcribes it, and exits.
+- [x] `puppygrad whisper --mic --chunk-seconds 4 --max-new-tokens 64` records and transcribes chunks continuously until Ctrl-C.
+- [x] `puppygrad whisper --mic --mic-mode rolling --window-seconds 8 --partial-interval-ms 1000` emits partial updates while speech is ongoing.
+- [x] Rolling mode emits committed text after silence and does not repeatedly resend the same committed text.
+- [x] `--output events-json` emits machine-readable partial/commit events on stdout.
+- [x] `--stream-raw-tokens` works in mic chunk mode and rolling mode.
+- [x] Existing file transcription still works with `--audio tests/data/audio/jfk_16khz_mono.wav`.
+- [x] README documents realtime mic usage, commit semantics, and limitations.
