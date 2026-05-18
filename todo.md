@@ -1,142 +1,170 @@
 # Puppygrad TODO
 
-## Realtime Rolling Whisper Plan
+## ResNet Vision Runtime Plan
 
-Goal: make microphone transcription feel responsive enough for downstream LLM use. The runtime should continuously capture audio, emit editable partial transcripts, commit stable speech turns on silence or stability, and keep the decode pipeline shaped so batching can be added later.
+Goal: implement a native ResNet image classifier first, while extracting reusable vision and CNN pieces that can later support CLIP, ViT, YOLO, OCR, and diffusion image tooling.
 
-### Phase 1: Mic Mode Semantics
+### Phase 1: Reusable Vision Module
 
-- [x] Change `puppygrad whisper --mic` from one-shot recording to continuous listening until Ctrl-C.
-- [x] Add `--once` to preserve the current single-chunk smoke-test behavior.
-- [x] Lower the mic default chunk/window behavior so the default feels interactive.
-- [x] Remove the surprising mic default of 2 generated tokens, or replace it with a documented realtime default such as 64.
-- [x] Keep file mode behavior unchanged for `--audio path.wav` and `--audio -`.
-- [x] Document that mic mode is continuous by default and `--once` is for tests.
+- [ ] Add a shared vision/image module outside `src/models/resnet/`, for example `src/vision/`.
+- [ ] Add image loading for common RGB files using a deliberate image decoding dependency.
+- [ ] Convert decoded images to normalized `f32` RGB buffers.
+- [ ] Add layout helpers for HWC, CHW, and NCHW-style tensors.
+- [ ] Add resize helper for shortest-side resize.
+- [ ] Add center-crop helper.
+- [ ] Add per-channel normalization helper with mean/std.
+- [ ] Keep preprocessing reusable for ResNet, CLIP, ViT, YOLO, and future image models.
 
-### Phase 2: Capture Pipeline
+### Phase 2: ResNet Model Boundary
 
-- [x] Replace blocking `record_input_device(duration)` usage in Whisper mic mode with a continuous capture stream.
-- [x] Keep audio capture independent from Whisper decode speed.
-- [x] Push captured mono/resampled audio into a bounded buffer or chunk queue.
-- [x] Add a clear queue overflow policy: warn and drop oldest chunk first.
-- [x] Ensure Ctrl-C / shutdown closes the audio stream cleanly.
-- [x] Keep `audio record --seconds N` as a blocking fixed-duration utility command.
+- [ ] Add `src/models/resnet/` with `mod.rs`, `config.rs`, `weights.rs`, `model.rs`, `rust.rs`, `runtime.rs`, and any small helper files needed.
+- [ ] Keep architecture/config/data structs in `model.rs`; put the Rust CPU backend implementation and kernels in `rust.rs`.
+- [ ] Add `ResNetVariant` with `resnet18` as the first supported variant.
+- [ ] Add `ResNetConfig` for architecture settings:
+  - input channels
+  - number of classes
+  - stem kernel/stride/padding
+  - block type
+  - stage block counts
+  - stage channels
+  - stage strides
+  - BatchNorm epsilon
+  - preprocessing resize/crop/mean/std
+- [ ] Hardcode the first target as ImageNet ResNet-18.
+- [ ] Keep the config shape broad enough for ResNet-34/50 later without implementing those variants immediately.
 
-### Phase 3: Rolling Decode Mode
+### Phase 3: CNN Kernels
 
-- [x] Add mic decode modes:
-  - `--mic-mode chunks` for simple non-overlapping chunks.
-  - `--mic-mode rolling` for responsive partial transcription.
-- [x] Make `rolling` the preferred mode for realtime LLM use once stable.
-- [x] Add `--window-seconds N` for the rolling audio window, default around 6-8 seconds.
-- [x] Add `--partial-interval-ms N`, default around 750-1000 ms.
-- [x] Keep `--chunk-seconds N` for simple chunk mode, default around 3-4 seconds.
-- [x] Validate that window/interval/chunk values are positive and sane.
+- [ ] Add a reference `conv2d` kernel for NCHW input and OIHW weights.
+- [ ] Put the first ResNet CPU implementation in `src/models/resnet/rust.rs`.
+- [ ] Support stride and padding.
+- [ ] Support `1x1`, `3x3`, and `7x7` convolutions.
+- [ ] Add ReLU.
+- [ ] Add max-pool 2D.
+- [ ] Add global average pool.
+- [ ] Add residual elementwise add.
+- [ ] Add linear classifier op or reuse an existing dense kernel.
+- [ ] Add top-k helper for classification output.
+- [ ] Keep these kernels in shared CPU/vision code when they are not ResNet-specific.
 
-### Phase 4: Partial And Commit Events
+### Phase 4: BatchNorm Folding
 
-- [x] Introduce a transcription event type:
-  - `Partial { text }`
-  - `Commit { text }`
-  - `RawToken { phase, token_id, token }`
-  - `Silence`
-  - `Warning { message }`
-- [x] In rolling mode, repeatedly decode the current rolling window and emit `Partial` when text changes.
-- [x] Keep only one visible partial active in terminal text mode.
-- [x] Commit text on silence, stable repeated decode, or explicit window boundary.
-- [x] After commit, advance or clear the rolling buffer so committed text is not repeatedly re-emitted.
-- [x] Keep committed text suitable for downstream LLM input.
+- [ ] Load Conv + BatchNorm state and fold BatchNorm into Conv at weight-load time.
+- [ ] Implement the inference folding formula:
+  - `scale = gamma / sqrt(running_var + eps)`
+  - `folded_weight[out] = conv_weight[out] * scale`
+  - `folded_bias[out] = beta + (conv_bias[out] - running_mean) * scale`
+- [ ] Support conv layers with no original bias.
+- [ ] Fold downsample projection BatchNorm too.
+- [ ] Store runtime weights as only folded conv weights/biases plus final FC weights/biases.
+- [ ] Add unit tests for BatchNorm folding against small known tensors.
 
-### Phase 5: Silence And Stability
+### Phase 5: Weight Loading And Assets
 
-- [x] Add a cheap RMS silence gate before invoking Whisper.
-- [x] Reuse Whisper no-speech probability when available.
-- [x] Add `--commit-on-silence`, enabled by default in rolling mic mode.
-- [x] Add `--silence-ms N`, default around 700-1200 ms.
-- [x] Add `--silence-threshold N` for RMS gate tuning.
-- [x] Add stable-text commit heuristic: if normalized partial text is unchanged for N decodes, commit it.
-- [x] Avoid committing empty or whitespace-only text.
+- [ ] Choose the first weight format path: prefer Hugging Face safetensors if available, otherwise add a documented conversion path from PyTorch weights to safetensors.
+- [ ] Add asset preparation for config/weights/labels under a default directory such as `models/resnet18`.
+- [ ] Load PyTorch-style keys:
+  - `conv1.weight`
+  - `bn1.*`
+  - `layerN.B.convM.weight`
+  - `layerN.B.bnM.*`
+  - `layerN.B.downsample.0.weight`
+  - `layerN.B.downsample.1.*`
+  - `fc.weight`
+  - `fc.bias`
+- [ ] Validate every tensor shape against `ResNetConfig`.
+- [ ] Load ImageNet class labels.
+- [ ] Add clear errors for missing/extra/mis-shaped tensors.
 
-### Phase 6: Output Formats For Realtime
+### Phase 6: ResNet-18 Forward Pass
 
-- [x] Keep plain text output as human-friendly terminal output.
-- [x] Add an event output format for machines, likely newline-delimited JSON:
-  - `--output events-json`
-- [x] Make raw-token streaming work inside both chunk and rolling mic modes.
-- [x] In terminal text mode, print committed text normally and update partial text without duplicating it.
-- [x] Keep stats/status/warnings on stderr.
-- [x] Ensure downstream tools can read committed transcript events from stdout without parsing status logs.
+- [ ] Implement the stem:
+  - folded `conv1`
+  - ReLU
+  - max pool
+- [ ] Implement ResNet basic block:
+  - conv3x3
+  - ReLU
+  - conv3x3
+  - optional downsample skip
+  - residual add
+  - ReLU
+- [ ] Implement stages:
+  - layer1: 2 blocks, 64 channels
+  - layer2: 2 blocks, 128 channels, first block stride 2
+  - layer3: 2 blocks, 256 channels, first block stride 2
+  - layer4: 2 blocks, 512 channels, first block stride 2
+- [ ] Implement global average pool.
+- [ ] Implement final FC classifier.
+- [ ] Return logits as `[1000]`.
 
-### Phase 7: Batching-Ready Job Model
+### Phase 7: CLI
 
-- [x] Define a backend-neutral transcription job:
-  - stream id
-  - window start/end time
-  - samples at 16 kHz mono
-  - purpose: partial or final
-  - generation settings
-- [x] Define a decode result:
-  - job id
-  - decoded text
-  - generated token ids
-  - no-speech probability
-  - timing/profile data
-- [x] Route both chunk mode and rolling mode through the same job/result path.
-- [x] Keep the first backend implementation as `decode_one(job)`.
-- [x] Design the trait boundary so a future backend can add `decode_batch(&[job])`.
-- [x] Avoid CLI-specific logic inside the model decode path.
+- [ ] Add `puppygrad resnet`.
+- [ ] Add `--image path`.
+- [ ] Add `--variant resnet18`, defaulting to ResNet-18.
+- [ ] Add `--model-dir`, defaulting to `models/resnet18`.
+- [ ] Add `--download` if assets can be fetched directly.
+- [ ] Add `--labels path` override.
+- [ ] Add `--top-k N`, defaulting to 5.
+- [ ] Add `--threads N` after the reference path works.
+- [ ] Print label, probability/logit, and class index.
 
-### Phase 8: Performance And Latency Controls
+### Phase 8: Correctness Checks
 
-- [x] Track capture lag, queue depth, decode time, and end-to-end partial latency.
-- [x] Print realtime stats when `--stats` is enabled.
-- [x] Add warning when decode falls behind realtime.
-- [x] Add `--max-queued-chunks N`, default small such as 2.
-- [x] Add `--drop-policy oldest|newest|block`, default `oldest`.
-- [x] Reuse log-mel frames for overlapping rolling windows when practical.
-- [x] Keep encoder-output reuse as a later optimization after correctness.
+- [ ] Add a small synthetic convolution test.
+- [ ] Add pooling tests.
+- [ ] Add image preprocessing tests for output shape and normalization.
+- [ ] Add ResNet shape tests after each major stage.
+- [ ] Compare folded Conv+BN output against unfused Conv+BN on a tiny tensor.
+- [ ] Compare final logits or top-k results against PyTorch/torchvision for one fixture image.
+- [ ] Add at least one small image fixture with documented source/provenance.
 
-### Phase 9: Future Batching
+### Phase 9: Performance Work
 
-- [x] Add a decode scheduler interface that can choose between immediate decode and micro-batching.
-- [x] Add `--micro-batch-size N` later, default 1.
-- [x] Add `--micro-batch-timeout-ms N` later to cap batching latency.
-- [x] Support batching across multiple pending rolling windows if decode falls behind.
-- [x] Support batching across multiple streams/users later.
-- [x] Keep batching optional because single-mic realtime latency matters more than throughput.
+- [ ] Start with a straightforward CPU reference implementation.
+- [ ] Add profiling buckets:
+  - image preprocessing
+  - conv stem
+  - layer1
+  - layer2
+  - layer3
+  - layer4
+  - global pool
+  - classifier
+- [ ] Parallelize output channels or spatial tiles for large convolutions.
+- [ ] Reuse scratch buffers to avoid excessive allocation.
+- [ ] Add a simple runtime tuning config only after correctness is stable.
+- [ ] Keep GPU/backend hooks out of the first pass unless the CPU path is already correct.
 
-### Phase 10: Tests And Manual Verification
+### Phase 10: Reuse For Future Vision Models
 
-- [x] Unit test rolling buffer append/slice/advance behavior.
-- [x] Unit test RMS silence detection.
-- [x] Unit test partial-to-commit state transitions.
-- [x] Unit test duplicate partial suppression.
-- [x] Unit test job/result scheduler plumbing without microphone access.
-- [x] Keep microphone tests as manual smoke tests.
-- [x] Verify `--once` still records one chunk and exits.
-- [x] Verify default `--mic` continues until interrupted.
-- [x] Verify raw-token streaming still prints prompt/control and generated tokens.
+- [ ] Keep image loading/preprocessing separate from ResNet-specific code.
+- [ ] Keep Conv/ReLU/pool/add kernels reusable for YOLO and CNN backbones.
+- [ ] Keep top-k/label output reusable for ViT classifiers.
+- [ ] Note which pieces CLIP/ViT will reuse: image loading, resize/crop/normalize, labels/top-k patterns.
+- [ ] Note which pieces YOLO will reuse: image loading, resize/letterbox later, conv, activations, BatchNorm folding, postprocessing foundation.
+- [ ] Avoid over-generalizing transformer or detection abstractions until a second vision model needs them.
 
 ### Phase 11: Documentation
 
-- [x] Update README to describe continuous mic mode.
-- [x] Document `--once`.
-- [x] Document `--mic-mode chunks|rolling`.
-- [x] Document `--window-seconds`, `--partial-interval-ms`, and `--chunk-seconds`.
-- [x] Document partial versus committed transcript behavior.
-- [x] Document recommended settings for LLM input.
-- [x] Document current CPU latency limitations and the future batching path.
+- [ ] Add README section for ResNet.
+- [ ] Document supported variant and expected assets.
+- [ ] Document the basic run command:
+  - `puppygrad resnet --image image.jpg --top-k 5`
+- [ ] Document preprocessing semantics: resize, center crop, ImageNet mean/std, RGB.
+- [ ] Document known limitations: CPU reference path, ResNet-18 only, no detection yet.
+- [ ] Document which reusable vision pieces are now available for future CLIP/YOLO work.
 
 ## Completion Criteria
 
-- [x] `cargo fmt --check` passes.
-- [x] `cargo check` passes.
-- [x] Realtime pipeline unit tests pass without requiring a microphone.
-- [x] `puppygrad whisper --mic --once --chunk-seconds 4 --max-new-tokens 64` records one chunk, transcribes it, and exits.
-- [x] `puppygrad whisper --mic --chunk-seconds 4 --max-new-tokens 64` records and transcribes chunks continuously until Ctrl-C.
-- [x] `puppygrad whisper --mic --mic-mode rolling --window-seconds 8 --partial-interval-ms 1000` emits partial updates while speech is ongoing.
-- [x] Rolling mode emits committed text after silence and does not repeatedly resend the same committed text.
-- [x] `--output events-json` emits machine-readable partial/commit events on stdout.
-- [x] `--stream-raw-tokens` works in mic chunk mode and rolling mode.
-- [x] Existing file transcription still works with `--audio tests/data/audio/jfk_16khz_mono.wav`.
-- [x] README documents realtime mic usage, commit semantics, and limitations.
+- [ ] `cargo fmt --check` passes.
+- [ ] `cargo check` passes.
+- [ ] Focused ResNet/vision unit tests pass.
+- [ ] Image preprocessing converts an RGB image to `[3, 224, 224]` normalized CHW data.
+- [ ] Conv2D, pooling, residual add, and BatchNorm folding have deterministic unit tests.
+- [ ] ResNet-18 weights load with full shape validation.
+- [ ] `puppygrad resnet --image tests/data/images/example.jpg --top-k 5` prints five ImageNet classes.
+- [ ] ResNet-18 top-k output for at least one fixture image matches a trusted torchvision reference closely enough for a CPU f32 implementation.
+- [ ] Existing GPT-2 and Whisper commands still compile and run their smoke paths.
+- [ ] README documents ResNet usage and current limitations.
