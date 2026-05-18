@@ -1,9 +1,5 @@
 # Puppygrad
 
-Rust-first deep learning sandbox with:
-- an in-house tinygrad-inspired computation engine, and
-- native model runtime experiments built directly in Rust.
-
 ## Build
 
 ```bash
