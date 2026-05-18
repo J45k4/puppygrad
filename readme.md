@@ -328,20 +328,3 @@ The CLI still accepts local model paths for future native loading work:
 ```bash
 ./target/release/puppygrad matmul-check
 ```
-
-## Engine status
-
-Implemented:
-
-- Dynamic computation graph with reverse-mode autodiff.
-- Scalar + vector operations: `add`, `sub`, `mul`, `relu`, `tanh`, `sum`, `mean`.
-- 2D `matmul` forward and backward.
-- Scalar broadcast support in binary ops.
-- SGD parameter update helpers (`zero_grad`, `step`).
-
-Current limits:
-
-- CPU only.
-- No advanced broadcasting rules beyond scalar broadcast.
-- No kernel fusion or SIMD tuning yet.
-- The GPT-2 runtime is a reference implementation, not optimized tensor infrastructure.
