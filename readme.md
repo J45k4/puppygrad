@@ -14,7 +14,7 @@ Implemented:
 | --- | --- | --- | --- |
 | GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy/sampled decoding, token streaming, and a KV cache. |
 | Whisper | Working MVP | Rust reference | Prepares Hugging Face Whisper assets, loads typed model/preprocessor/tokenizer/weight metadata, decodes PCM WAV input, computes log-mel features, and runs greedy `tiny.en`/`tiny` transcription. |
-| ResNet | Working MVP | Rust reference | Loads torchvision-origin ResNet-18 safetensors, folds Conv+BatchNorm at load time, preprocesses RGB images, and prints ImageNet top-k classes. |
+| ResNet | Working MVP | Rust reference | Loads torchvision-origin ResNet-18 safetensors, folds Conv+BatchNorm at load time, preprocesses RGB images or camera frames, and prints ImageNet top-k classes. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -49,6 +49,69 @@ Preprocessing decodes common RGB image files, resizes the shortest side to 256 p
 The runtime includes reusable vision pieces under `src/vision/`: image loading, HWC/CHW/NCHW layout helpers, resize, center crop, normalization, Conv2D, ReLU, pooling, residual add, linear classifier, softmax, and top-k helpers. CLIP and ViT can reuse the image loading/resize/crop/normalize path and classifier top-k patterns. YOLO can reuse image loading, the CNN kernels, activations, BatchNorm folding patterns, and later add letterbox and detection postprocessing.
 
 Known limitations: CPU reference path only, ResNet-18 only, scalar convolution kernels, no GPU/backend dispatch, no object detection, and `--threads` is accepted for CLI compatibility but not used by the current ResNet path.
+
+### Video utilities and camera frames
+
+Puppygrad includes shared camera/video capture utilities under `src/video/`. The first backend is `nokhwa` with native input and decoding features because it gives a small cross-platform camera MVP and can list devices and decode frames to RGB without committing the model code to a macOS-only AVFoundation API. If macOS camera behavior needs tighter control later, an AVFoundation-specific backend can be added behind the same video module boundary.
+
+List video devices:
+
+```bash
+./target/release/puppygrad video list-devices
+```
+
+Capture a single frame from the default camera. The output extension selects the image format supported by the `image` crate:
+
+```bash
+./target/release/puppygrad video capture-frame \
+  --out /tmp/puppygrad-frame.jpg
+```
+
+Capture from a selected camera and request a capture mode when the backend supports it:
+
+```bash
+./target/release/puppygrad video capture-frame \
+  --device 0 \
+  --width 1280 \
+  --height 720 \
+  --fps 30 \
+  --out /tmp/puppygrad-frame.jpg
+```
+
+Run a basic streaming smoke test until Ctrl-C:
+
+```bash
+./target/release/puppygrad video stream \
+  --fps 1 \
+  --max-queued-frames 2 \
+  --drop-policy oldest
+```
+
+The video stream path keeps a bounded frame queue and reports capture FPS, processing FPS, queue depth, and dropped frame count to stderr. Overflow policies are `oldest`, `newest`, and `block`; `oldest` is the default for realtime vision so slow processing favors recent frames. Use `--output events-json` to emit newline-delimited frame events on stdout while status remains on stderr.
+
+On macOS, the first camera access may trigger a system permission dialog for the terminal or IDE process running Puppygrad. If access is denied, grant camera permission in System Settings, then restart the terminal process before trying again.
+
+ResNet can classify a camera frame without writing it to disk:
+
+```bash
+./target/release/puppygrad resnet \
+  --camera \
+  --top-k 5
+```
+
+Continuous camera classification:
+
+```bash
+./target/release/puppygrad resnet \
+  --camera \
+  --stream \
+  --fps 1 \
+  --top-k 3
+```
+
+Use `--camera --device N` to select a camera. `--image` and `--camera` are mutually exclusive. Camera frames are converted to RGB8 and then reused by the same resize, center-crop, CHW conversion, and ImageNet normalization path as file images, keeping file-image and frame preprocessing numerically consistent.
+
+ResNet output is whole-frame ImageNet classification: it predicts labels for the entire captured frame. It does not find objects, draw boxes, or perform YOLO-style detection. Current limitations are backend-dependent camera mode support, CPU inference speed, ResNet-18 only, no GPU dispatch, and no boxes/detection yet.
 
 ## Audio utilities
 

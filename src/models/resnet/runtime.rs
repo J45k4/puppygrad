@@ -6,8 +6,12 @@ use crate::models::assets::{
     check_required_files, download_huggingface_file, download_huggingface_files, AssetError,
     HuggingFaceAsset,
 };
+use crate::video::{VideoError, VideoFrame};
 use crate::vision::cnn::{softmax, top_k};
-use crate::vision::{load_rgb8, preprocess_rgb8_to_normalized_chw, ChwImage, VisionError};
+use crate::vision::{
+    load_rgb8, preprocess_rgb8_to_normalized_chw, preprocess_video_frame_to_normalized_chw,
+    ChwImage, VisionError,
+};
 use image::imageops::FilterType;
 use serde_json::Value;
 use std::error;
@@ -28,6 +32,7 @@ const RESNET18_ASSETS: [HuggingFaceAsset; 2] = [
 pub enum ResNetRuntimeError {
     Asset(AssetError),
     Vision(VisionError),
+    Video(VideoError),
     Weights(ResNetWeightError),
     ReadLabels {
         path: String,
@@ -48,6 +53,7 @@ impl fmt::Display for ResNetRuntimeError {
         match self {
             ResNetRuntimeError::Asset(source) => write!(f, "{source}"),
             ResNetRuntimeError::Vision(source) => write!(f, "{source}"),
+            ResNetRuntimeError::Video(source) => write!(f, "{source}"),
             ResNetRuntimeError::Weights(source) => write!(f, "{source}"),
             ResNetRuntimeError::ReadLabels { path, source } => {
                 write!(f, "failed to read labels {path}: {source}")
@@ -73,6 +79,12 @@ impl From<AssetError> for ResNetRuntimeError {
 impl From<VisionError> for ResNetRuntimeError {
     fn from(value: VisionError) -> Self {
         Self::Vision(value)
+    }
+}
+
+impl From<VideoError> for ResNetRuntimeError {
+    fn from(value: VideoError) -> Self {
+        Self::Video(value)
     }
 }
 
@@ -106,12 +118,30 @@ impl ResNetRuntime {
 
     pub fn logits_for_image(&self, image_path: &Path) -> Result<Vec<f32>> {
         let image = preprocess_resnet_image(image_path, &self.config)?;
-        Ok(self.model.logits(&image.data, image.height, image.width))
+        Ok(self.logits_for_chw(&image))
     }
 
     pub fn classify_image(&self, image_path: &Path, k: usize) -> Result<Vec<ResNetClassification>> {
         let logits = self.logits_for_image(image_path)?;
-        Ok(classifications_from_logits(&logits, &self.labels, k))
+        Ok(self.classify_logits(&logits, k))
+    }
+
+    pub fn logits_for_chw(&self, image: &ChwImage) -> Vec<f32> {
+        self.model.logits(&image.data, image.height, image.width)
+    }
+
+    pub fn classify_logits(&self, logits: &[f32], k: usize) -> Vec<ResNetClassification> {
+        classifications_from_logits(logits, &self.labels, k)
+    }
+
+    pub fn classify_video_frame(
+        &self,
+        frame: &VideoFrame,
+        k: usize,
+    ) -> Result<Vec<ResNetClassification>> {
+        let image = preprocess_resnet_video_frame(frame, &self.config)?;
+        let logits = self.logits_for_chw(&image);
+        Ok(self.classify_logits(&logits, k))
     }
 }
 
@@ -139,6 +169,20 @@ pub fn preprocess_resnet_image(image_path: &Path, config: &ResNetConfig) -> Resu
     let image = load_rgb8(image_path)?;
     Ok(preprocess_rgb8_to_normalized_chw(
         &image,
+        config.resize_short_side,
+        config.crop_size,
+        config.mean,
+        config.std,
+        FilterType::Triangle,
+    )?)
+}
+
+pub fn preprocess_resnet_video_frame(
+    frame: &VideoFrame,
+    config: &ResNetConfig,
+) -> Result<ChwImage> {
+    Ok(preprocess_video_frame_to_normalized_chw(
+        frame,
         config.resize_short_side,
         config.crop_size,
         config.mean,

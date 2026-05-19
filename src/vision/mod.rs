@@ -31,6 +31,9 @@ pub enum VisionError {
         path: String,
         source: ImageError,
     },
+    VideoFrame {
+        message: String,
+    },
     InvalidCrop {
         image_width: usize,
         image_height: usize,
@@ -48,6 +51,7 @@ impl fmt::Display for VisionError {
             VisionError::DecodeImage { path, source } => {
                 write!(f, "failed to decode image {path}: {source}")
             }
+            VisionError::VideoFrame { message } => write!(f, "failed to convert video frame: {message}"),
             VisionError::InvalidCrop {
                 image_width,
                 image_height,
@@ -186,6 +190,21 @@ pub fn preprocess_rgb8_to_normalized_chw(
     Ok(chw)
 }
 
+pub fn preprocess_video_frame_to_normalized_chw(
+    frame: &crate::video::VideoFrame,
+    resize_short_side: u32,
+    crop_size: u32,
+    mean: [f32; 3],
+    std: [f32; 3],
+    filter: FilterType,
+) -> Result<ChwImage> {
+    let image =
+        crate::video::video_frame_to_rgb8(frame).map_err(|source| VisionError::VideoFrame {
+            message: source.to_string(),
+        })?;
+    preprocess_rgb8_to_normalized_chw(&image, resize_short_side, crop_size, mean, std, filter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +246,46 @@ mod tests {
         let chw = hwc_to_chw(&image);
         assert_eq!(chw.data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         assert_eq!(chw_to_nchw(&chw), chw.data);
+    }
+
+    #[test]
+    fn video_frame_preprocessing_matches_rgb_image_preprocessing() -> Result<()> {
+        let mut bytes = Vec::new();
+        let mut image = RgbImage::new(300, 260);
+        for y in 0..260 {
+            for x in 0..300 {
+                let pixel = Rgb([(x % 256) as u8, (y % 256) as u8, 128]);
+                image.put_pixel(x, y, pixel);
+                bytes.extend_from_slice(&pixel.0);
+            }
+        }
+        let frame = crate::video::VideoFrame {
+            width: 300,
+            height: 260,
+            pixel_format: crate::video::VideoPixelFormat::Rgb8,
+            timestamp_millis: 1,
+            capture_latency_millis: 0,
+            bytes,
+        };
+
+        let from_image = preprocess_rgb8_to_normalized_chw(
+            &image,
+            256,
+            224,
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+            FilterType::Triangle,
+        )?;
+        let from_frame = preprocess_video_frame_to_normalized_chw(
+            &frame,
+            256,
+            224,
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+            FilterType::Triangle,
+        )?;
+
+        assert_eq!(from_frame, from_image);
+        Ok(())
     }
 }

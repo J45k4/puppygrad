@@ -11,7 +11,10 @@ use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
-use puppygrad::models::resnet::{default_resnet18_dir, download_resnet18_assets, ResNetRuntime};
+use puppygrad::models::resnet::{
+    default_resnet18_dir, download_resnet18_assets, preprocess_resnet_video_frame,
+    ResNetClassification, ResNetRuntime,
+};
 use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
 use puppygrad::models::whisper::{
     default_whisper_dir, is_silence, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
@@ -20,12 +23,18 @@ use puppygrad::models::whisper::{
     WhisperBackendConfig, WhisperOperationProfile, WhisperRuntime, WhisperRustConfig, WhisperSize,
     WhisperTask as RuntimeWhisperTask, WHISPER_SAMPLE_RATE,
 };
+use puppygrad::video::{
+    capture_frame, decode_next_frame, list_video_devices, open_camera, save_video_frame,
+    VideoCaptureOptions, VideoDropPolicy as RuntimeVideoDropPolicy, VideoFrame, VideoFrameQueue,
+    VideoResult,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -43,6 +52,12 @@ enum Command {
     Audio {
         #[command(subcommand)]
         cmd: AudioCommand,
+    },
+
+    /// Shared video utilities for camera discovery and RGB frame capture.
+    Video {
+        #[command(subcommand)]
+        cmd: VideoCommand,
     },
 
     /// Run GPT-2 small through puppygrad's native reference model.
@@ -138,8 +153,44 @@ enum Command {
     /// Run an ImageNet ResNet classifier through puppygrad's native reference model.
     Resnet {
         /// RGB image path to classify.
-        #[arg(long)]
-        image: PathBuf,
+        #[arg(long, conflicts_with = "camera")]
+        image: Option<PathBuf>,
+
+        /// Capture frames from a camera and classify the whole frame.
+        #[arg(long, conflicts_with = "image")]
+        camera: bool,
+
+        /// Camera device index from `video list-devices`; omitted means default.
+        #[arg(long, requires = "camera")]
+        device: Option<usize>,
+
+        /// Continuously classify camera frames until Ctrl-C.
+        #[arg(long, requires = "camera")]
+        stream: bool,
+
+        /// Requested camera capture FPS.
+        #[arg(long, requires = "camera", default_value_t = 1)]
+        fps: u32,
+
+        /// Requested camera frame width.
+        #[arg(long, requires = "camera")]
+        width: Option<u32>,
+
+        /// Requested camera frame height.
+        #[arg(long, requires = "camera")]
+        height: Option<u32>,
+
+        /// Captured-frame queue size before processing begins dropping or blocking frames.
+        #[arg(long, requires = "camera", default_value_t = 2)]
+        max_queued_frames: usize,
+
+        /// Queue overflow policy for continuous camera capture.
+        #[arg(long, requires = "camera", value_enum, default_value_t = VideoDropPolicyArg::Oldest)]
+        drop_policy: VideoDropPolicyArg,
+
+        /// Classification output format.
+        #[arg(long, value_enum, default_value_t = VideoOutputFormatArg::Human)]
+        output: VideoOutputFormatArg,
 
         /// ResNet variant.
         #[arg(long, value_enum, default_value_t = ResNetVariantArg::Resnet18)]
@@ -393,6 +444,70 @@ enum AudioCommand {
     Inspect {
         /// WAV path to inspect.
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum VideoCommand {
+    /// List available camera devices.
+    ListDevices,
+
+    /// Capture one RGB frame from a camera and save it as PNG or JPEG.
+    CaptureFrame {
+        /// Camera device index from `video list-devices`; omitted means default.
+        #[arg(long)]
+        device: Option<usize>,
+
+        /// Output image path. The extension selects the image format.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Requested camera frame width.
+        #[arg(long)]
+        width: Option<u32>,
+
+        /// Requested camera frame height.
+        #[arg(long)]
+        height: Option<u32>,
+
+        /// Requested camera capture FPS.
+        #[arg(long)]
+        fps: Option<u32>,
+    },
+
+    /// Capture frames continuously until Ctrl-C and print frame status.
+    Stream {
+        /// Camera device index from `video list-devices`; omitted means default.
+        #[arg(long)]
+        device: Option<usize>,
+
+        /// Requested camera capture FPS.
+        #[arg(long, default_value_t = 1)]
+        fps: u32,
+
+        /// Requested camera frame width.
+        #[arg(long)]
+        width: Option<u32>,
+
+        /// Requested camera frame height.
+        #[arg(long)]
+        height: Option<u32>,
+
+        /// Captured-frame queue size before processing begins dropping or blocking frames.
+        #[arg(long, default_value_t = 2)]
+        max_queued_frames: usize,
+
+        /// Queue overflow policy.
+        #[arg(long, value_enum, default_value_t = VideoDropPolicyArg::Oldest)]
+        drop_policy: VideoDropPolicyArg,
+
+        /// Print periodic stats to stderr.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        stats: bool,
+
+        /// Stream output format.
+        #[arg(long, value_enum, default_value_t = VideoOutputFormatArg::Human)]
+        output: VideoOutputFormatArg,
     },
 }
 
@@ -691,6 +806,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Command::Audio { cmd } => run_audio(cmd),
+        Command::Video { cmd } => run_video(cmd),
         Command::Gpt2 {
             model_dir,
             model_id,
@@ -742,6 +858,15 @@ fn main() -> Result<()> {
         }),
         Command::Resnet {
             image,
+            camera,
+            device,
+            stream,
+            fps,
+            width,
+            height,
+            max_queued_frames,
+            drop_policy,
+            output,
             variant,
             model_dir,
             download,
@@ -750,6 +875,15 @@ fn main() -> Result<()> {
             threads,
         } => run_resnet(RunResNetArgs {
             image,
+            camera,
+            device,
+            stream,
+            fps,
+            width,
+            height,
+            max_queued_frames,
+            drop_policy,
+            output,
             variant,
             model_dir,
             download,
@@ -1050,9 +1184,32 @@ enum WhisperOutputFormatArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum VideoOutputFormatArg {
+    Human,
+    EventsJson,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum WhisperMicModeArg {
     Chunks,
     Rolling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum VideoDropPolicyArg {
+    Oldest,
+    Newest,
+    Block,
+}
+
+impl From<VideoDropPolicyArg> for RuntimeVideoDropPolicy {
+    fn from(value: VideoDropPolicyArg) -> Self {
+        match value {
+            VideoDropPolicyArg::Oldest => RuntimeVideoDropPolicy::Oldest,
+            VideoDropPolicyArg::Newest => RuntimeVideoDropPolicy::Newest,
+            VideoDropPolicyArg::Block => RuntimeVideoDropPolicy::Block,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1100,7 +1257,16 @@ struct RunGpt2Args {
 }
 
 struct RunResNetArgs {
-    image: PathBuf,
+    image: Option<PathBuf>,
+    camera: bool,
+    device: Option<usize>,
+    stream: bool,
+    fps: u32,
+    width: Option<u32>,
+    height: Option<u32>,
+    max_queued_frames: usize,
+    drop_policy: VideoDropPolicyArg,
+    output: VideoOutputFormatArg,
     variant: ResNetVariantArg,
     model_dir: Option<PathBuf>,
     download: bool,
@@ -1248,6 +1414,185 @@ struct WhisperSegmentOutput {
     start: f32,
     end: f32,
     text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VideoFrameEvent {
+    event: &'static str,
+    frame_index: u64,
+    timestamp_millis: u128,
+    capture_latency_ms: u128,
+    width: u32,
+    height: u32,
+    queue_depth: usize,
+    dropped_frames: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResNetLabelEvent {
+    class_index: usize,
+    label: String,
+    probability: f32,
+    logit: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct ResNetFrameEvent {
+    event: &'static str,
+    frame_index: u64,
+    timestamp_millis: u128,
+    labels: Vec<ResNetLabelEvent>,
+    capture_latency_ms: u128,
+    preprocessing_latency_ms: u128,
+    inference_latency_ms: u128,
+    output_latency_ms: u128,
+    processing_latency_ms: u128,
+}
+
+struct ResNetTimedClassification {
+    classifications: Vec<ResNetClassification>,
+    preprocessing_latency: Duration,
+    inference_latency: Duration,
+    output_latency: Duration,
+    processing_latency: Duration,
+}
+
+struct VideoCaptureLoop {
+    queue: Arc<Mutex<VideoFrameQueue>>,
+    captured_frames: Arc<AtomicU64>,
+    handle: JoinHandle<VideoResult<()>>,
+}
+
+fn run_video(cmd: VideoCommand) -> Result<()> {
+    match cmd {
+        VideoCommand::ListDevices => {
+            let devices = list_video_devices()?;
+            if devices.is_empty() {
+                println!("no video devices found");
+                return Ok(());
+            }
+            for device in devices {
+                let default = if device.is_default { "\tdefault" } else { "" };
+                println!(
+                    "{}\t{}\t{}{}",
+                    device.index, device.display_name, device.backend, default
+                );
+            }
+            Ok(())
+        }
+        VideoCommand::CaptureFrame {
+            device,
+            out,
+            width,
+            height,
+            fps,
+        } => {
+            require_resolution_pair(width, height)?;
+            let frame = capture_frame(video_capture_options(device, width, height, fps))?;
+            save_video_frame(&frame, &out)?;
+            eprintln!(
+                "captured {}x{} RGB frame from camera {} to {}",
+                frame.width,
+                frame.height,
+                device
+                    .map(|index| index.to_string())
+                    .unwrap_or_else(|| "default".to_string()),
+                out.display()
+            );
+            Ok(())
+        }
+        VideoCommand::Stream {
+            device,
+            fps,
+            width,
+            height,
+            max_queued_frames,
+            drop_policy,
+            stats,
+            output,
+        } => run_video_stream(
+            device,
+            fps,
+            width,
+            height,
+            max_queued_frames,
+            drop_policy,
+            stats,
+            output,
+        ),
+    }
+}
+
+fn run_video_stream(
+    device: Option<usize>,
+    fps: u32,
+    width: Option<u32>,
+    height: Option<u32>,
+    max_queued_frames: usize,
+    drop_policy: VideoDropPolicyArg,
+    stats: bool,
+    output: VideoOutputFormatArg,
+) -> Result<()> {
+    validate_video_stream_args(fps, max_queued_frames, width, height)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let ctrlc_running = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        ctrlc_running.store(false, Ordering::SeqCst);
+    })?;
+
+    let capture = spawn_video_capture_loop(
+        video_capture_options(device, width, height, Some(fps)),
+        fps,
+        max_queued_frames,
+        drop_policy.into(),
+        Arc::clone(&running),
+    )?;
+    let mut stdout = std::io::stdout().lock();
+    let mut frame_index = 0_u64;
+    let mut processed = 0_u64;
+    let start = Instant::now();
+    let mut last_stats = start;
+
+    while running.load(Ordering::SeqCst) {
+        if let Some(frame) = pop_video_frame(&capture.queue) {
+            frame_index += 1;
+            processed += 1;
+            write_video_frame_status(
+                &mut stdout,
+                output,
+                frame_index,
+                &frame,
+                queue_depth(&capture.queue),
+                dropped_video_frames(&capture.queue),
+            )?;
+        } else {
+            if capture.handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        if stats && last_stats.elapsed() >= Duration::from_secs(1) {
+            print_video_stream_stats(
+                start,
+                capture.captured_frames.load(Ordering::SeqCst),
+                processed,
+                &capture.queue,
+            );
+            last_stats = Instant::now();
+        }
+    }
+    running.store(false, Ordering::SeqCst);
+    join_video_capture_loop(capture.handle)?;
+    if stats {
+        print_video_stream_stats(
+            start,
+            capture.captured_frames.load(Ordering::SeqCst),
+            processed,
+            &capture.queue,
+        );
+    }
+    Ok(())
 }
 
 fn run_audio(cmd: AudioCommand) -> Result<()> {
@@ -1399,7 +1744,12 @@ fn run_resnet(args: RunResNetArgs) -> Result<()> {
     if args.top_k == 0 {
         return Err("--top-k must be greater than 0".into());
     }
-    let model_dir = args.model_dir.unwrap_or_else(default_resnet18_dir);
+    if args.camera {
+        validate_video_stream_args(args.fps, args.max_queued_frames, args.width, args.height)?;
+    } else if args.image.is_none() {
+        return Err("resnet requires either --image PATH or --camera".into());
+    }
+    let model_dir = args.model_dir.clone().unwrap_or_else(default_resnet18_dir);
     if args.download {
         eprintln!(
             "downloading missing ResNet-18 assets into {}",
@@ -1410,15 +1760,389 @@ fn run_resnet(args: RunResNetArgs) -> Result<()> {
 
     eprintln!("loading ResNet-18 from {}", model_dir.display());
     let runtime = ResNetRuntime::from_dir(&model_dir, args.labels.as_deref())?;
-    let classifications = runtime.classify_image(&args.image, args.top_k)?;
+    if args.camera {
+        return run_resnet_camera(args, runtime);
+    }
+
+    let image = args.image.as_ref().expect("validated image path");
+    let classifications = runtime.classify_image(image, args.top_k)?;
     let mut stdout = std::io::stdout().lock();
+    write_resnet_human_classifications(&mut stdout, &classifications)?;
+    Ok(())
+}
+
+fn run_resnet_camera(args: RunResNetArgs, runtime: ResNetRuntime) -> Result<()> {
+    if args.stream {
+        run_resnet_camera_stream(args, runtime)
+    } else {
+        require_resolution_pair(args.width, args.height)?;
+        let frame = capture_frame(video_capture_options(
+            args.device,
+            args.width,
+            args.height,
+            Some(args.fps),
+        ))?;
+        let timed = classify_resnet_video_frame_with_timing(&runtime, &frame, args.top_k)?;
+        let mut stdout = std::io::stdout().lock();
+        match args.output {
+            VideoOutputFormatArg::Human => {
+                writeln!(
+                    stdout,
+                    "# ResNet-18 whole-frame classification from camera frame {}x{}",
+                    frame.width, frame.height
+                )?;
+                write_resnet_human_classifications(&mut stdout, &timed.classifications)
+            }
+            VideoOutputFormatArg::EventsJson => {
+                write_json_line(&mut stdout, &resnet_frame_event(1, &frame, &timed))
+            }
+        }
+    }
+}
+
+fn run_resnet_camera_stream(args: RunResNetArgs, runtime: ResNetRuntime) -> Result<()> {
+    let running = Arc::new(AtomicBool::new(true));
+    let ctrlc_running = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        ctrlc_running.store(false, Ordering::SeqCst);
+        std::process::exit(130);
+    })?;
+
+    let capture = spawn_video_capture_loop(
+        video_capture_options(args.device, args.width, args.height, Some(args.fps)),
+        args.fps,
+        args.max_queued_frames,
+        args.drop_policy.into(),
+        Arc::clone(&running),
+    )?;
+    let mut stdout = std::io::stdout().lock();
+    let mut frame_index = 0_u64;
+    let mut processed = 0_u64;
+    let start = Instant::now();
+    let mut last_stats = start;
+    let frame_interval = Duration::from_secs_f64(1.0 / args.fps as f64);
+
+    while running.load(Ordering::SeqCst) {
+        if let Some(frame) = pop_video_frame(&capture.queue) {
+            frame_index += 1;
+            let timed = classify_resnet_video_frame_with_timing(&runtime, &frame, args.top_k)?;
+            processed += 1;
+            match args.output {
+                VideoOutputFormatArg::Human => {
+                    writeln!(
+                        stdout,
+                        "frame {}\t{} ms\t{}x{}\tResNet-18 whole-frame classification",
+                        frame_index, frame.timestamp_millis, frame.width, frame.height
+                    )?;
+                    write_resnet_human_classifications(&mut stdout, &timed.classifications)?;
+                }
+                VideoOutputFormatArg::EventsJson => write_json_line(
+                    &mut stdout,
+                    &resnet_frame_event(frame_index, &frame, &timed),
+                )?,
+            }
+            if timed.processing_latency > frame_interval {
+                eprintln!(
+                    "warning: ResNet processing took {:.3}s, slower than requested {:.3}s frame interval",
+                    timed.processing_latency.as_secs_f32(),
+                    frame_interval.as_secs_f32()
+                );
+            }
+        } else {
+            if capture.handle.is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        if last_stats.elapsed() >= Duration::from_secs(1) {
+            print_video_stream_stats(
+                start,
+                capture.captured_frames.load(Ordering::SeqCst),
+                processed,
+                &capture.queue,
+            );
+            last_stats = Instant::now();
+        }
+    }
+    running.store(false, Ordering::SeqCst);
+    join_video_capture_loop(capture.handle)?;
+    print_video_stream_stats(
+        start,
+        capture.captured_frames.load(Ordering::SeqCst),
+        processed,
+        &capture.queue,
+    );
+    Ok(())
+}
+
+fn video_capture_options(
+    device_index: Option<usize>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
+) -> VideoCaptureOptions {
+    VideoCaptureOptions {
+        device_index,
+        width,
+        height,
+        fps,
+        timeout: Duration::from_secs(5),
+    }
+}
+
+fn require_resolution_pair(width: Option<u32>, height: Option<u32>) -> Result<()> {
+    if width.is_some() != height.is_some() {
+        return Err("--width and --height must be provided together".into());
+    }
+    Ok(())
+}
+
+fn validate_video_stream_args(
+    fps: u32,
+    max_queued_frames: usize,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<()> {
+    if fps == 0 {
+        return Err("--fps must be greater than 0".into());
+    }
+    if max_queued_frames == 0 {
+        return Err("--max-queued-frames must be greater than 0".into());
+    }
+    require_resolution_pair(width, height)
+}
+
+fn spawn_video_capture_loop(
+    options: VideoCaptureOptions,
+    fps: u32,
+    max_queued_frames: usize,
+    drop_policy: RuntimeVideoDropPolicy,
+    running: Arc<AtomicBool>,
+) -> Result<VideoCaptureLoop> {
+    let queue = Arc::new(Mutex::new(VideoFrameQueue::new(
+        max_queued_frames,
+        drop_policy,
+    )));
+    let captured_frames = Arc::new(AtomicU64::new(0));
+    let queue_for_thread = Arc::clone(&queue);
+    let captured_for_thread = Arc::clone(&captured_frames);
+    let running_for_thread = Arc::clone(&running);
+    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let handle = thread::spawn(move || {
+        let mut camera = match open_camera(options) {
+            Ok(camera) => camera,
+            Err(error) => {
+                running_for_thread.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        if let Err(error) = camera.open_stream() {
+            running_for_thread.store(false, Ordering::SeqCst);
+            return Err(puppygrad::video::VideoError::Backend {
+                operation: "open stream",
+                message: error.to_string(),
+            });
+        }
+        while running_for_thread.load(Ordering::SeqCst) {
+            let loop_start = Instant::now();
+            let frame = match decode_next_frame(&mut camera, options.timeout) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    running_for_thread.store(false, Ordering::SeqCst);
+                    return Err(error);
+                }
+            };
+            captured_for_thread.fetch_add(1, Ordering::SeqCst);
+            match drop_policy {
+                RuntimeVideoDropPolicy::Block => {
+                    let mut pending = Some(frame);
+                    while running_for_thread.load(Ordering::SeqCst) {
+                        let inserted = {
+                            let mut queue = queue_for_thread.lock().expect("video queue poisoned");
+                            if queue.is_full() {
+                                false
+                            } else {
+                                queue.push(pending.take().expect("pending frame"))
+                            }
+                        };
+                        if inserted {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                RuntimeVideoDropPolicy::Oldest | RuntimeVideoDropPolicy::Newest => {
+                    queue_for_thread
+                        .lock()
+                        .expect("video queue poisoned")
+                        .push(frame);
+                }
+            }
+            sleep_until_next_frame(loop_start, frame_interval);
+        }
+        Ok(())
+    });
+    Ok(VideoCaptureLoop {
+        queue,
+        captured_frames,
+        handle,
+    })
+}
+
+fn sleep_until_next_frame(loop_start: Instant, frame_interval: Duration) {
+    if let Some(remaining) = frame_interval.checked_sub(loop_start.elapsed()) {
+        std::thread::sleep(remaining);
+    }
+}
+
+fn pop_video_frame(queue: &Arc<Mutex<VideoFrameQueue>>) -> Option<VideoFrame> {
+    queue.lock().expect("video queue poisoned").pop()
+}
+
+fn queue_depth(queue: &Arc<Mutex<VideoFrameQueue>>) -> usize {
+    queue.lock().expect("video queue poisoned").depth()
+}
+
+fn dropped_video_frames(queue: &Arc<Mutex<VideoFrameQueue>>) -> u64 {
+    queue.lock().expect("video queue poisoned").dropped_frames()
+}
+
+fn join_video_capture_loop(handle: JoinHandle<VideoResult<()>>) -> Result<()> {
+    match handle.join() {
+        Ok(result) => Ok(result?),
+        Err(_) => Err("video capture thread panicked".into()),
+    }
+}
+
+fn print_video_stream_stats(
+    start: Instant,
+    captured: u64,
+    processed: u64,
+    queue: &Arc<Mutex<VideoFrameQueue>>,
+) {
+    let elapsed = start.elapsed().as_secs_f64().max(0.001);
+    eprintln!(
+        "video stats: capture_fps={:.2} processing_fps={:.2} queue_depth={} dropped_frames={}",
+        captured as f64 / elapsed,
+        processed as f64 / elapsed,
+        queue_depth(queue),
+        dropped_video_frames(queue)
+    );
+}
+
+fn write_video_frame_status<W: Write>(
+    writer: &mut W,
+    output: VideoOutputFormatArg,
+    frame_index: u64,
+    frame: &VideoFrame,
+    queue_depth: usize,
+    dropped_frames: u64,
+) -> Result<()> {
+    match output {
+        VideoOutputFormatArg::Human => {
+            writeln!(
+                writer,
+                "frame {}\t{} ms\t{}x{}\tqueue_depth={}\tdropped_frames={}",
+                frame_index,
+                frame.timestamp_millis,
+                frame.width,
+                frame.height,
+                queue_depth,
+                dropped_frames
+            )?;
+            writer.flush()?;
+            Ok(())
+        }
+        VideoOutputFormatArg::EventsJson => write_json_line(
+            writer,
+            &VideoFrameEvent {
+                event: "video_frame",
+                frame_index,
+                timestamp_millis: frame.timestamp_millis,
+                capture_latency_ms: frame.capture_latency_millis,
+                width: frame.width,
+                height: frame.height,
+                queue_depth,
+                dropped_frames,
+            },
+        ),
+    }
+}
+
+fn write_resnet_human_classifications<W: Write>(
+    writer: &mut W,
+    classifications: &[ResNetClassification],
+) -> Result<()> {
     for item in classifications {
         writeln!(
-            stdout,
+            writer,
             "{}\t{:.6}\t{:.6}\t{}",
             item.class_index, item.probability, item.logit, item.label
         )?;
     }
+    writer.flush()?;
+    Ok(())
+}
+
+fn classify_resnet_video_frame_with_timing(
+    runtime: &ResNetRuntime,
+    frame: &VideoFrame,
+    top_k: usize,
+) -> Result<ResNetTimedClassification> {
+    let processing_start = Instant::now();
+    let preprocessing_start = Instant::now();
+    let image = preprocess_resnet_video_frame(frame, &runtime.config)?;
+    let preprocessing_latency = preprocessing_start.elapsed();
+
+    let inference_start = Instant::now();
+    let logits = runtime.logits_for_chw(&image);
+    let inference_latency = inference_start.elapsed();
+
+    let output_start = Instant::now();
+    let classifications = runtime.classify_logits(&logits, top_k);
+    let output_latency = output_start.elapsed();
+
+    Ok(ResNetTimedClassification {
+        classifications,
+        preprocessing_latency,
+        inference_latency,
+        output_latency,
+        processing_latency: processing_start.elapsed(),
+    })
+}
+
+fn resnet_frame_event(
+    frame_index: u64,
+    frame: &VideoFrame,
+    timed: &ResNetTimedClassification,
+) -> ResNetFrameEvent {
+    ResNetFrameEvent {
+        event: "resnet_classification",
+        frame_index,
+        timestamp_millis: frame.timestamp_millis,
+        labels: timed
+            .classifications
+            .iter()
+            .map(|item| ResNetLabelEvent {
+                class_index: item.class_index,
+                label: item.label.clone(),
+                probability: item.probability,
+                logit: item.logit,
+            })
+            .collect(),
+        capture_latency_ms: frame.capture_latency_millis,
+        preprocessing_latency_ms: timed.preprocessing_latency.as_millis(),
+        inference_latency_ms: timed.inference_latency.as_millis(),
+        output_latency_ms: timed.output_latency.as_millis(),
+        processing_latency_ms: timed.processing_latency.as_millis(),
+    }
+}
+
+fn write_json_line<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writeln!(writer)?;
+    writer.flush()?;
     Ok(())
 }
 

@@ -1,170 +1,138 @@
 # Puppygrad TODO
 
-## ResNet Vision Runtime Plan
+## Realtime Video Capture And Vision Plan
 
-Goal: implement a native ResNet image classifier first, while extracting reusable vision and CNN pieces that can later support CLIP, ViT, YOLO, OCR, and diffusion image tooling.
+Goal: add shared camera/video capture utilities, then wire captured frames into the existing still-image vision path. ResNet remains the first model target for frame classification, while the video layer should stay reusable for CLIP, YOLO, OCR, and future multimodal pipelines.
 
-### Phase 1: Reusable Vision Module
+### Phase 1: Video Module Boundary
 
-- [ ] Add a shared vision/image module outside `src/models/resnet/`, for example `src/vision/`.
-- [ ] Add image loading for common RGB files using a deliberate image decoding dependency.
-- [ ] Convert decoded images to normalized `f32` RGB buffers.
-- [ ] Add layout helpers for HWC, CHW, and NCHW-style tensors.
-- [ ] Add resize helper for shortest-side resize.
-- [ ] Add center-crop helper.
-- [ ] Add per-channel normalization helper with mean/std.
-- [ ] Keep preprocessing reusable for ResNet, CLIP, ViT, YOLO, and future image models.
+- [x] Add a shared video module outside `src/models/`, for example `src/video/`.
+- [x] Define a `VideoError` / `VideoResult` type.
+- [x] Define a shared `VideoDeviceInfo` type with index, display name, backend, and default marker if available.
+- [x] Define a shared `VideoFrame` type with width, height, pixel format, timestamp, and RGB/RGBA bytes.
+- [x] Keep camera/device logic out of `src/models/resnet/`.
+- [x] Keep still-image preprocessing in `src/vision/` reusable for both image files and video frames.
 
-### Phase 2: ResNet Model Boundary
+### Phase 2: Camera Backend Choice
 
-- [ ] Add `src/models/resnet/` with `mod.rs`, `config.rs`, `weights.rs`, `model.rs`, `rust.rs`, `runtime.rs`, and any small helper files needed.
-- [ ] Keep architecture/config/data structs in `model.rs`; put the Rust CPU backend implementation and kernels in `rust.rs`.
-- [ ] Add `ResNetVariant` with `resnet18` as the first supported variant.
-- [ ] Add `ResNetConfig` for architecture settings:
-  - input channels
-  - number of classes
-  - stem kernel/stride/padding
-  - block type
-  - stage block counts
-  - stage channels
-  - stage strides
-  - BatchNorm epsilon
-  - preprocessing resize/crop/mean/std
-- [ ] Hardcode the first target as ImageNet ResNet-18.
-- [ ] Keep the config shape broad enough for ResNet-34/50 later without implementing those variants immediately.
+- [x] Choose an initial camera backend:
+  - `nokhwa` for cross-platform MVP if it works well enough.
+  - platform-specific AVFoundation later if macOS behavior needs tighter control.
+- [x] Add the dependency deliberately and document why it was chosen.
+- [x] Verify the backend can list cameras on macOS.
+- [x] Verify the backend can capture RGB frames or convert frames to RGB.
+- [x] Keep dependency features minimal.
 
-### Phase 3: CNN Kernels
+### Phase 3: Video CLI Namespace
 
-- [ ] Add a reference `conv2d` kernel for NCHW input and OIHW weights.
-- [ ] Put the first ResNet CPU implementation in `src/models/resnet/rust.rs`.
-- [ ] Support stride and padding.
-- [ ] Support `1x1`, `3x3`, and `7x7` convolutions.
-- [ ] Add ReLU.
-- [ ] Add max-pool 2D.
-- [ ] Add global average pool.
-- [ ] Add residual elementwise add.
-- [ ] Add linear classifier op or reuse an existing dense kernel.
-- [ ] Add top-k helper for classification output.
-- [ ] Keep these kernels in shared CPU/vision code when they are not ResNet-specific.
+- [x] Add a top-level `video` CLI command group.
+- [x] Add `puppygrad video list-devices`.
+- [x] Add `puppygrad video capture-frame --out frame.jpg`.
+- [x] Add `puppygrad video capture-frame --device N --out frame.jpg`.
+- [x] Add `puppygrad video stream --fps N` as a basic frame counter/status smoke test.
+- [x] Keep video utility commands independent from ResNet or other model assets.
 
-### Phase 4: BatchNorm Folding
+### Phase 4: Frame Capture
 
-- [ ] Load Conv + BatchNorm state and fold BatchNorm into Conv at weight-load time.
-- [ ] Implement the inference folding formula:
-  - `scale = gamma / sqrt(running_var + eps)`
-  - `folded_weight[out] = conv_weight[out] * scale`
-  - `folded_bias[out] = beta + (conv_bias[out] - running_mean) * scale`
-- [ ] Support conv layers with no original bias.
-- [ ] Fold downsample projection BatchNorm too.
-- [ ] Store runtime weights as only folded conv weights/biases plus final FC weights/biases.
-- [ ] Add unit tests for BatchNorm folding against small known tensors.
+- [x] Implement one-shot frame capture from the default camera.
+- [x] Support optional camera index selection.
+- [x] Support requested resolution if the backend allows it.
+- [x] Support requested FPS if the backend allows it.
+- [x] Convert captured frames to RGB8.
+- [x] Save captured frames to PNG or JPEG through existing image tooling.
+- [x] Add clear errors for camera permission denial, missing device, unsupported format, and capture timeout.
 
-### Phase 5: Weight Loading And Assets
+### Phase 5: Continuous Video Stream
 
-- [ ] Choose the first weight format path: prefer Hugging Face safetensors if available, otherwise add a documented conversion path from PyTorch weights to safetensors.
-- [ ] Add asset preparation for config/weights/labels under a default directory such as `models/resnet18`.
-- [ ] Load PyTorch-style keys:
-  - `conv1.weight`
-  - `bn1.*`
-  - `layerN.B.convM.weight`
-  - `layerN.B.bnM.*`
-  - `layerN.B.downsample.0.weight`
-  - `layerN.B.downsample.1.*`
-  - `fc.weight`
-  - `fc.bias`
-- [ ] Validate every tensor shape against `ResNetConfig`.
-- [ ] Load ImageNet class labels.
-- [ ] Add clear errors for missing/extra/mis-shaped tensors.
+- [x] Implement continuous frame capture until Ctrl-C.
+- [x] Add a bounded frame queue independent from model inference speed.
+- [x] Add queue overflow policy:
+  - drop oldest
+  - drop newest
+  - block
+- [x] Default to dropping old frames for realtime vision.
+- [x] Track capture FPS, processing FPS, queue depth, and dropped frame count.
+- [x] Print stream stats to stderr when requested.
 
-### Phase 6: ResNet-18 Forward Pass
+### Phase 6: Vision Preprocessing From Frames
 
-- [ ] Implement the stem:
-  - folded `conv1`
-  - ReLU
-  - max pool
-- [ ] Implement ResNet basic block:
-  - conv3x3
-  - ReLU
-  - conv3x3
-  - optional downsample skip
-  - residual add
-  - ReLU
-- [ ] Implement stages:
-  - layer1: 2 blocks, 64 channels
-  - layer2: 2 blocks, 128 channels, first block stride 2
-  - layer3: 2 blocks, 256 channels, first block stride 2
-  - layer4: 2 blocks, 512 channels, first block stride 2
-- [ ] Implement global average pool.
-- [ ] Implement final FC classifier.
-- [ ] Return logits as `[1000]`.
+- [x] Add a conversion path from `VideoFrame` to the existing `src/vision/` RGB image type.
+- [x] Reuse resize, center crop, CHW conversion, and normalization for frame classification.
+- [x] Avoid writing frames to disk for model inference.
+- [x] Keep file-image and camera-frame preprocessing numerically consistent.
+- [x] Add tests for frame-to-RGB and RGB-to-CHW conversion without requiring a camera.
 
-### Phase 7: CLI
+### Phase 7: ResNet On Camera Frames
 
-- [ ] Add `puppygrad resnet`.
-- [ ] Add `--image path`.
-- [ ] Add `--variant resnet18`, defaulting to ResNet-18.
-- [ ] Add `--model-dir`, defaulting to `models/resnet18`.
-- [ ] Add `--download` if assets can be fetched directly.
-- [ ] Add `--labels path` override.
-- [ ] Add `--top-k N`, defaulting to 5.
-- [ ] Add `--threads N` after the reference path works.
-- [ ] Print label, probability/logit, and class index.
+- [x] Add a command for classifying a captured frame:
+  - `puppygrad resnet --camera`
+- [x] Add optional camera selection:
+  - `puppygrad resnet --camera --device N`
+- [x] Make `--image` and `--camera` mutually exclusive.
+- [x] Add continuous frame classification:
+  - `puppygrad resnet --camera --stream --fps 1`
+- [x] Reuse the existing ResNet runtime and preprocessing config.
+- [x] Print top-k labels per processed frame.
+- [x] Keep ResNet output clearly described as whole-frame classification, not object detection.
 
-### Phase 8: Correctness Checks
+### Phase 8: Machine-Readable Video Events
 
-- [ ] Add a small synthetic convolution test.
-- [ ] Add pooling tests.
-- [ ] Add image preprocessing tests for output shape and normalization.
-- [ ] Add ResNet shape tests after each major stage.
-- [ ] Compare folded Conv+BN output against unfused Conv+BN on a tiny tensor.
-- [ ] Compare final logits or top-k results against PyTorch/torchvision for one fixture image.
-- [ ] Add at least one small image fixture with documented source/provenance.
+- [x] Add an event output format for video/model streams, likely newline-delimited JSON.
+- [x] Emit frame classification events with timestamp, frame index, labels, scores, and processing latency.
+- [x] Keep status/warnings on stderr.
+- [x] Make stdout suitable for piping into future agents or logging tools.
+- [x] Preserve human-readable output as the default.
 
-### Phase 9: Performance Work
+### Phase 9: Performance And Latency
 
-- [ ] Start with a straightforward CPU reference implementation.
-- [ ] Add profiling buckets:
-  - image preprocessing
-  - conv stem
-  - layer1
-  - layer2
-  - layer3
-  - layer4
-  - global pool
-  - classifier
-- [ ] Parallelize output channels or spatial tiles for large convolutions.
-- [ ] Reuse scratch buffers to avoid excessive allocation.
-- [ ] Add a simple runtime tuning config only after correctness is stable.
-- [ ] Keep GPU/backend hooks out of the first pass unless the CPU path is already correct.
+- [x] Start with low FPS defaults such as 1 FPS for ResNet CPU classification.
+- [x] Add `--fps N` to control capture/processing rate.
+- [x] Add `--max-queued-frames N`, default small such as 2.
+- [x] Add `--drop-policy oldest|newest|block`, default `oldest`.
+- [ ] Reuse ResNet preprocessing buffers where practical.
+- [x] Add per-stage timing for capture, preprocessing, inference, and output.
+- [x] Warn when model inference falls behind requested FPS.
 
-### Phase 10: Reuse For Future Vision Models
+### Phase 10: Future Vision Models
 
-- [ ] Keep image loading/preprocessing separate from ResNet-specific code.
-- [ ] Keep Conv/ReLU/pool/add kernels reusable for YOLO and CNN backbones.
-- [ ] Keep top-k/label output reusable for ViT classifiers.
-- [ ] Note which pieces CLIP/ViT will reuse: image loading, resize/crop/normalize, labels/top-k patterns.
-- [ ] Note which pieces YOLO will reuse: image loading, resize/letterbox later, conv, activations, BatchNorm folding, postprocessing foundation.
-- [ ] Avoid over-generalizing transformer or detection abstractions until a second vision model needs them.
+- [x] Keep the video module model-agnostic so CLIP can classify/score frames later.
+- [x] Keep the video module compatible with YOLO frame detection later.
+- [ ] Add a future `puppygrad yolo --camera --stream` path after detection exists.
+- [ ] Add optional frame sampling policy for expensive models.
+- [x] Add optional recording/snapshot utilities if needed.
+- [x] Avoid adding detection-specific APIs until YOLO or another detector is implemented.
 
-### Phase 11: Documentation
+### Phase 11: Tests And Manual Verification
 
-- [ ] Add README section for ResNet.
-- [ ] Document supported variant and expected assets.
-- [ ] Document the basic run command:
-  - `puppygrad resnet --image image.jpg --top-k 5`
-- [ ] Document preprocessing semantics: resize, center crop, ImageNet mean/std, RGB.
-- [ ] Document known limitations: CPU reference path, ResNet-18 only, no detection yet.
-- [ ] Document which reusable vision pieces are now available for future CLIP/YOLO work.
+- [x] Unit test frame conversion without requiring a real camera.
+- [x] Unit test queue overflow policies.
+- [x] Keep actual camera tests as manual smoke tests.
+- [x] Verify `puppygrad video list-devices` on macOS.
+- [x] Verify `puppygrad video capture-frame --out /tmp/puppygrad-frame.jpg`.
+- [x] Verify `puppygrad video stream --fps 1` runs until Ctrl-C.
+- [x] Verify `puppygrad resnet --camera --stream --fps 1 --top-k 3` classifies frames if ResNet assets are present.
+- [x] Verify existing image-file ResNet path still works.
+
+### Phase 12: Documentation
+
+- [x] Document `puppygrad video list-devices`.
+- [x] Document `puppygrad video capture-frame`.
+- [x] Document `puppygrad video stream`.
+- [x] Document camera permission requirements on macOS.
+- [x] Document `puppygrad resnet --camera`.
+- [x] Document the difference between ResNet whole-frame classification and YOLO-style object detection.
+- [x] Document known limitations: camera backend support, CPU speed, no boxes/detection yet.
 
 ## Completion Criteria
 
-- [ ] `cargo fmt --check` passes.
-- [ ] `cargo check` passes.
-- [ ] Focused ResNet/vision unit tests pass.
-- [ ] Image preprocessing converts an RGB image to `[3, 224, 224]` normalized CHW data.
-- [ ] Conv2D, pooling, residual add, and BatchNorm folding have deterministic unit tests.
-- [ ] ResNet-18 weights load with full shape validation.
-- [ ] `puppygrad resnet --image tests/data/images/example.jpg --top-k 5` prints five ImageNet classes.
-- [ ] ResNet-18 top-k output for at least one fixture image matches a trusted torchvision reference closely enough for a CPU f32 implementation.
-- [ ] Existing GPT-2 and Whisper commands still compile and run their smoke paths.
-- [ ] README documents ResNet usage and current limitations.
+- [x] `cargo fmt --check` passes.
+- [x] `cargo check` passes.
+- [x] Video module unit tests pass without requiring a camera.
+- [x] `puppygrad video list-devices` prints available cameras.
+- [x] `puppygrad video capture-frame --out /tmp/puppygrad-frame.jpg` writes a valid image from the default camera.
+- [x] `puppygrad video capture-frame --device N --out /tmp/puppygrad-frame.jpg` works for a selected camera.
+- [x] `puppygrad video stream --fps 1` captures frames continuously until Ctrl-C and reports stats.
+- [x] `puppygrad resnet --camera --stream --fps 1 --top-k 3` classifies frames continuously when ResNet assets are available.
+- [x] Existing `puppygrad resnet --image ...` still works.
+- [x] Existing GPT-2 and Whisper commands still compile and run their smoke paths.
+- [x] README documents video utilities, camera ResNet usage, and limitations.
