@@ -11,11 +11,16 @@ use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
+use puppygrad::models::piper::{
+    default_piper_dir, load_piper_voice_config_from_dir, phoneme_ids as piper_phoneme_ids,
+    split_phoneme_phrases, text_to_phonemes,
+};
 use puppygrad::models::resnet::{
     default_resnet18_dir, download_resnet18_assets, preprocess_resnet_video_frame,
     ResNetClassification, ResNetRuntime,
 };
 use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
+use puppygrad::models::vits::{debug_synthesize_phoneme_ids, VitsSynthesisScales};
 use puppygrad::models::whisper::{
     default_whisper_dir, is_silence, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
     normalize_transcript, seconds_to_samples, PartialCommitState, PartialObservation,
@@ -215,6 +220,41 @@ enum Command {
         /// Reserved worker-thread count for the future optimized CPU path.
         #[arg(long)]
         threads: Option<usize>,
+    },
+
+    /// Run Piper text-to-speech support paths.
+    Piper {
+        /// Local Piper voice directory containing config.json or model.onnx.json.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Comma-separated phoneme ids. This debug path does not require eSpeak.
+        #[arg(long, conflicts_with = "text")]
+        phoneme_ids: Option<String>,
+
+        /// Text input. Currently supported for Piper text-mode voices only.
+        #[arg(long, conflicts_with = "phoneme_ids")]
+        text: Option<String>,
+
+        /// Output WAV path.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Override Piper noise scale metadata for future native inference.
+        #[arg(long)]
+        noise_scale: Option<f32>,
+
+        /// Override duration/length scale.
+        #[arg(long)]
+        length_scale: Option<f32>,
+
+        /// Override Piper duration noise metadata for future native inference.
+        #[arg(long)]
+        noise_w: Option<f32>,
+
+        /// Speaker id for multi-speaker voices.
+        #[arg(long)]
+        speaker_id: Option<usize>,
     },
 
     /// Placeholder for the future in-house Qwen runtime.
@@ -891,6 +931,25 @@ fn main() -> Result<()> {
             top_k,
             threads,
         }),
+        Command::Piper {
+            model_dir,
+            phoneme_ids,
+            text,
+            out,
+            noise_scale,
+            length_scale,
+            noise_w,
+            speaker_id,
+        } => run_piper(RunPiperArgs {
+            model_dir,
+            phoneme_ids,
+            text,
+            out,
+            noise_scale,
+            length_scale,
+            noise_w,
+            speaker_id,
+        }),
         Command::Qwen {
             model_dir,
             model_id,
@@ -1273,6 +1332,17 @@ struct RunResNetArgs {
     labels: Option<PathBuf>,
     top_k: usize,
     threads: Option<usize>,
+}
+
+struct RunPiperArgs {
+    model_dir: Option<PathBuf>,
+    phoneme_ids: Option<String>,
+    text: Option<String>,
+    out: PathBuf,
+    noise_scale: Option<f32>,
+    length_scale: Option<f32>,
+    noise_w: Option<f32>,
+    speaker_id: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1768,6 +1838,80 @@ fn run_resnet(args: RunResNetArgs) -> Result<()> {
     let classifications = runtime.classify_image(image, args.top_k)?;
     let mut stdout = std::io::stdout().lock();
     write_resnet_human_classifications(&mut stdout, &classifications)?;
+    Ok(())
+}
+
+fn run_piper(args: RunPiperArgs) -> Result<()> {
+    let model_dir = args.model_dir.unwrap_or_else(default_piper_dir);
+    let config = load_piper_voice_config_from_dir(&model_dir)?;
+    if let Some(speaker_id) = args.speaker_id {
+        if speaker_id >= config.num_speakers {
+            return Err(format!(
+                "speaker id {speaker_id} is out of range for {} speaker(s)",
+                config.num_speakers
+            )
+            .into());
+        }
+    }
+
+    let scales = VitsSynthesisScales {
+        noise_scale: args.noise_scale.unwrap_or(config.inference.noise_scale),
+        length_scale: args.length_scale.unwrap_or(config.inference.length_scale),
+        noise_w: args.noise_w.unwrap_or(config.inference.noise_w),
+    };
+
+    let start = Instant::now();
+    let (samples, phoneme_id_count) = if let Some(ids) = args.phoneme_ids.as_deref() {
+        let phoneme_ids = parse_usize_csv(ids, "phoneme-ids")?;
+        let samples = debug_synthesize_phoneme_ids(
+            &phoneme_ids,
+            config.audio.sample_rate,
+            scales,
+            args.speaker_id,
+        )?;
+        (samples, phoneme_ids.len())
+    } else if let Some(text) = args.text.as_deref() {
+        let phonemes = text_to_phonemes(&config, text)?;
+        let phrases = split_phoneme_phrases(&config, &phonemes)?;
+        let mut samples = Vec::new();
+        let mut phoneme_id_count = 0;
+        for phrase in phrases {
+            let ids = piper_phoneme_ids(&config, &phrase.phonemes)?;
+            phoneme_id_count += ids.len();
+            samples.extend(debug_synthesize_phoneme_ids(
+                &ids,
+                config.audio.sample_rate,
+                scales,
+                args.speaker_id,
+            )?);
+            let silence_samples = (phrase.trailing_silence_seconds
+                * config.audio.sample_rate as f32)
+                .round() as usize;
+            samples.extend(std::iter::repeat(0.0).take(silence_samples));
+        }
+        (samples, phoneme_id_count)
+    } else {
+        return Err("pass either --phoneme-ids or --text".into());
+    };
+
+    let audio = SharedPcmAudio {
+        path: args.out.clone(),
+        sample_rate: config.audio.sample_rate,
+        channels: 1,
+        samples,
+    };
+    write_wav_pcm16(&args.out, &audio)?;
+
+    eprintln!(
+        "wrote {} ({:.3}s audio from {} phoneme id(s) in {})",
+        args.out.display(),
+        audio.duration_seconds(),
+        phoneme_id_count,
+        format_duration(start.elapsed())
+    );
+    eprintln!(
+        "warning: Piper command currently uses debug waveform synthesis; native VITS checkpoint inference is still tracked in todo.md"
+    );
     Ok(())
 }
 
@@ -4774,6 +4918,20 @@ fn parse_usize_list(name: &str, values: &str) -> Result<Vec<usize>> {
     }
     if parsed.contains(&0) {
         return Err(format!("--{name} values must be > 0").into());
+    }
+    Ok(parsed)
+}
+
+fn parse_usize_csv(values: &str, name: &str) -> Result<Vec<usize>> {
+    let parsed: std::result::Result<Vec<_>, _> = values
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<usize>)
+        .collect();
+    let parsed = parsed.map_err(|err| format!("invalid --{name} list: {err}"))?;
+    if parsed.is_empty() {
+        return Err(format!("--{name} must contain at least one value").into());
     }
     Ok(parsed)
 }

@@ -15,6 +15,7 @@ Implemented:
 | GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy/sampled decoding, token streaming, and a KV cache. |
 | Whisper | Working MVP | Rust reference | Prepares Hugging Face Whisper assets, loads typed model/preprocessor/tokenizer/weight metadata, decodes PCM WAV input, computes log-mel features, and runs greedy `tiny.en`/`tiny` transcription. |
 | ResNet | Working MVP | Rust reference | Loads torchvision-origin ResNet-18 safetensors, folds Conv+BatchNorm at load time, preprocesses RGB images or camera frames, and prints ImageNet top-k classes. |
+| Piper/VITS | In progress | Rust reference pieces | Piper parses voice configs and maps text-mode phonemes to ids; VITS owns architecture-oriented 1D CPU kernels and debug WAV synthesis. Full VITS checkpoint inference is not complete yet. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -22,6 +23,30 @@ Model assets are stored under the project-root `models/` directory, which is ign
 Shared model runtime code is intentionally limited to pieces that already have clear cross-model shape: generation CLI args and sampling config, token streaming, generation stats, asset/config loading, safetensors access, CPU math kernels, and minimal autoregressive/KV-cache traits. Full transformer block extraction is deferred until a second native model exists, so GPT-2 learned-position blocks and future RoPE-based Qwen/Llama blocks do not get forced through the wrong abstraction.
 
 See `docs/model-runtime.md` for shared autoregressive runtime notes and examples.
+
+### Piper VITS runtime status
+
+The `piper` command currently provides validation and debug synthesis paths while the native VITS graph is being implemented. Piper-specific code lives under `src/models/piper/`; reusable architecture pieces live under `src/models/vits/`. Piper voice directories use `model.onnx` plus either `config.json` or `model.onnx.json`. Puppygrad has a small direct ONNX initializer loader for extracting weights; it does not use a protobuf library and does not execute ONNX graphs.
+
+Generate a debug WAV from phoneme ids:
+
+```bash
+./target/release/puppygrad piper \
+  --model-dir ./models/piper \
+  --phoneme-ids 1,2,3 \
+  --out /tmp/piper-debug.wav
+```
+
+For text-mode Piper voices, text can be mapped through the config's codepoint phoneme id map:
+
+```bash
+./target/release/puppygrad piper \
+  --model-dir ./models/piper \
+  --text "hello" \
+  --out /tmp/piper-debug.wav
+```
+
+Known limitations: output is a diagnostic waveform, not real speech; eSpeak phonemization is intentionally behind a separate boundary and not linked yet; ONNX Runtime parity and real voice synthesis remain TODO items. Review each voice's license before adding or redistributing assets.
 
 ### ResNet native runtime status
 
