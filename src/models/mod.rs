@@ -5,6 +5,7 @@ pub mod config;
 pub mod cpu;
 pub mod generation;
 pub mod gpt2;
+pub mod resnet;
 pub mod safetensors;
 pub mod streaming;
 pub mod whisper;

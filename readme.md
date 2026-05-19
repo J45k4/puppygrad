@@ -14,6 +14,7 @@ Implemented:
 | --- | --- | --- | --- |
 | GPT-2 | Working | Rust reference | Loads Hugging Face `config.json`, `tokenizer.json`, and `model.safetensors`; uses greedy/sampled decoding, token streaming, and a KV cache. |
 | Whisper | Working MVP | Rust reference | Prepares Hugging Face Whisper assets, loads typed model/preprocessor/tokenizer/weight metadata, decodes PCM WAV input, computes log-mel features, and runs greedy `tiny.en`/`tiny` transcription. |
+| ResNet | Working MVP | Rust reference | Loads torchvision-origin ResNet-18 safetensors, folds Conv+BatchNorm at load time, preprocesses RGB images, and prints ImageNet top-k classes. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -21,6 +22,33 @@ Model assets are stored under the project-root `models/` directory, which is ign
 Shared model runtime code is intentionally limited to pieces that already have clear cross-model shape: generation CLI args and sampling config, token streaming, generation stats, asset/config loading, safetensors access, CPU math kernels, and minimal autoregressive/KV-cache traits. Full transformer block extraction is deferred until a second native model exists, so GPT-2 learned-position blocks and future RoPE-based Qwen/Llama blocks do not get forced through the wrong abstraction.
 
 See `docs/model-runtime.md` for shared autoregressive runtime notes and examples.
+
+### ResNet native runtime status
+
+The `resnet` command currently supports ImageNet ResNet-18 through the Rust CPU reference path. The default asset directory is `models/resnet18`; `--download` fetches `timm/resnet18.tv_in1k` safetensors plus ImageNet labels. The checkpoint uses PyTorch-style keys such as `conv1.weight`, `bn1.*`, `layerN.B.convM.weight`, downsample projection keys, and `fc.*`.
+
+Prepare assets and classify an image:
+
+```bash
+./target/release/puppygrad resnet \
+  --download \
+  --image tests/data/images/example.jpg \
+  --top-k 5
+```
+
+After assets are present, `--download` is optional:
+
+```bash
+./target/release/puppygrad resnet \
+  --image image.jpg \
+  --top-k 5
+```
+
+Preprocessing decodes common RGB image files, resizes the shortest side to 256 pixels with bilinear filtering, center-crops to 224 x 224, converts to normalized CHW `[3, 224, 224]` data, and applies ImageNet mean/std normalization: mean `[0.485, 0.456, 0.406]`, std `[0.229, 0.224, 0.225]`.
+
+The runtime includes reusable vision pieces under `src/vision/`: image loading, HWC/CHW/NCHW layout helpers, resize, center crop, normalization, Conv2D, ReLU, pooling, residual add, linear classifier, softmax, and top-k helpers. CLIP and ViT can reuse the image loading/resize/crop/normalize path and classifier top-k patterns. YOLO can reuse image loading, the CNN kernels, activations, BatchNorm folding patterns, and later add letterbox and detection postprocessing.
+
+Known limitations: CPU reference path only, ResNet-18 only, scalar convolution kernels, no GPU/backend dispatch, no object detection, and `--threads` is accepted for CLI compatibility but not used by the current ResNet path.
 
 ## Audio utilities
 

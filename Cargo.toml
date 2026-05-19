@@ -11,6 +11,7 @@ clap = { version = "4", features = ["derive"] }
 claxon = { version = "0.4", optional = true }
 cpal = "0.15"
 ctrlc = "3"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }

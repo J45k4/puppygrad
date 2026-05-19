@@ -11,6 +11,7 @@ use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
+use puppygrad::models::resnet::{default_resnet18_dir, download_resnet18_assets, ResNetRuntime};
 use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
 use puppygrad::models::whisper::{
     default_whisper_dir, is_silence, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
@@ -132,6 +133,37 @@ enum Command {
         /// Stream raw tokenizer tokens as TSV rows instead of decoded text.
         #[arg(long)]
         stream_raw_tokens: bool,
+    },
+
+    /// Run an ImageNet ResNet classifier through puppygrad's native reference model.
+    Resnet {
+        /// RGB image path to classify.
+        #[arg(long)]
+        image: PathBuf,
+
+        /// ResNet variant.
+        #[arg(long, value_enum, default_value_t = ResNetVariantArg::Resnet18)]
+        variant: ResNetVariantArg,
+
+        /// Local directory containing model.safetensors and labels.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Download missing ResNet-18 assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Label file override. Supports ImageNet id2label JSON or one label per line.
+        #[arg(long)]
+        labels: Option<PathBuf>,
+
+        /// Number of classes to print.
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+
+        /// Reserved worker-thread count for the future optimized CPU path.
+        #[arg(long)]
+        threads: Option<usize>,
     },
 
     /// Placeholder for the future in-house Qwen runtime.
@@ -708,6 +740,23 @@ fn main() -> Result<()> {
             stats,
             stream_raw_tokens,
         }),
+        Command::Resnet {
+            image,
+            variant,
+            model_dir,
+            download,
+            labels,
+            top_k,
+            threads,
+        } => run_resnet(RunResNetArgs {
+            image,
+            variant,
+            model_dir,
+            download,
+            labels,
+            top_k,
+            threads,
+        }),
         Command::Qwen {
             model_dir,
             model_id,
@@ -968,6 +1017,11 @@ enum Gpt2BackendArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ResNetVariantArg {
+    Resnet18,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum WhisperBackendArg {
     Rust,
     Gpu,
@@ -1043,6 +1097,16 @@ struct RunGpt2Args {
     tuning: RustTuning,
     stats: bool,
     stream_raw_tokens: bool,
+}
+
+struct RunResNetArgs {
+    image: PathBuf,
+    variant: ResNetVariantArg,
+    model_dir: Option<PathBuf>,
+    download: bool,
+    labels: Option<PathBuf>,
+    top_k: usize,
+    threads: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1319,6 +1383,41 @@ fn run_gpt2(args: RunGpt2Args) -> Result<()> {
         print_gpt2_stats(load_time, &generation_stats);
     } else {
         print_gpt2_speed(&generation_stats);
+    }
+    Ok(())
+}
+
+fn run_resnet(args: RunResNetArgs) -> Result<()> {
+    match args.variant {
+        ResNetVariantArg::Resnet18 => {}
+    }
+    if let Some(threads) = args.threads {
+        eprintln!(
+            "--threads {threads} is accepted but the current ResNet CPU path is single-threaded"
+        );
+    }
+    if args.top_k == 0 {
+        return Err("--top-k must be greater than 0".into());
+    }
+    let model_dir = args.model_dir.unwrap_or_else(default_resnet18_dir);
+    if args.download {
+        eprintln!(
+            "downloading missing ResNet-18 assets into {}",
+            model_dir.display()
+        );
+        download_resnet18_assets(&model_dir)?;
+    }
+
+    eprintln!("loading ResNet-18 from {}", model_dir.display());
+    let runtime = ResNetRuntime::from_dir(&model_dir, args.labels.as_deref())?;
+    let classifications = runtime.classify_image(&args.image, args.top_k)?;
+    let mut stdout = std::io::stdout().lock();
+    for item in classifications {
+        writeln!(
+            stdout,
+            "{}\t{:.6}\t{:.6}\t{}",
+            item.class_index, item.probability, item.logit, item.label
+        )?;
     }
     Ok(())
 }
