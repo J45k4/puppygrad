@@ -21,6 +21,42 @@ impl Default for VitsSynthesisScales {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    pub fn new(seed: u64) -> Self {
+        let state = if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        };
+        Self { state }
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        (x >> 32) as u32
+    }
+
+    pub fn next_f32_open01(&mut self) -> f32 {
+        let value = self.next_u32();
+        ((value as f32) + 0.5) / ((u32::MAX as f32) + 1.0)
+    }
+
+    pub fn standard_normal(&mut self) -> f32 {
+        let u1 = self.next_f32_open01().max(f32::MIN_POSITIVE);
+        let u2 = self.next_f32_open01();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
+    }
+}
+
 pub fn infer_frame_count(log_durations: &[f32], length_scale: f32) -> usize {
     log_durations
         .iter()
@@ -276,6 +312,18 @@ mod tests {
         let out = weights.infer(&[1.0, 2.0], 2).unwrap();
 
         assert_eq!(out, vec![0.25, 0.25]);
+    }
+
+    #[test]
+    fn deterministic_rng_replays_same_normal_sequence() {
+        let mut a = DeterministicRng::new(42);
+        let mut b = DeterministicRng::new(42);
+
+        let seq_a = (0..8).map(|_| a.standard_normal()).collect::<Vec<_>>();
+        let seq_b = (0..8).map(|_| b.standard_normal()).collect::<Vec<_>>();
+
+        assert_eq!(seq_a, seq_b);
+        assert!(seq_a.iter().all(|value| value.is_finite()));
     }
 
     #[test]

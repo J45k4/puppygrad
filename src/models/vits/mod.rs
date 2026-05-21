@@ -1,6 +1,7 @@
 mod error;
 mod kernels;
 mod model;
+mod weights;
 
 pub use error::{Result, VitsError};
 pub use kernels::{
@@ -10,5 +11,13 @@ pub use kernels::{
 };
 pub use model::{
     debug_synthesize_phoneme_ids, duration_path, expand_by_durations, infer_frame_count,
-    log_durations_to_durations, DeterministicDurationPredictorWeights, VitsSynthesisScales,
+    log_durations_to_durations, DeterministicDurationPredictorWeights, DeterministicRng,
+    VitsSynthesisScales,
+};
+pub use weights::{
+    ConvWeights, DdsConvLayerWeights, DdsConvWeights, DenseTensor, DurationFlowWeights,
+    GeneratorResBlockWeights, GeneratorWeights, LayerNormWeights, ResidualCouplingBlockWeights,
+    ResidualCouplingFlowWeights, StochasticDurationPredictorWeights,
+    TextEncoderAttentionLayerWeights, TextEncoderFfnLayerWeights, TextEncoderWeights,
+    VitsWeightConfig, VitsWeights, WavenetWeights,
 };

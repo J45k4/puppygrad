@@ -11,16 +11,18 @@ use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
     Gpt2BackendConfig, Gpt2GenerationConfig, Gpt2GenerationStats, Gpt2Runtime, Gpt2RustConfig,
 };
+use puppygrad::models::onnx::{load_onnx_initializers, OnnxTensorType};
 use puppygrad::models::piper::{
-    default_piper_dir, load_piper_voice_config_from_dir, phoneme_ids as piper_phoneme_ids,
-    split_phoneme_phrases, text_to_phonemes,
+    default_piper_dir, load_piper_voice_config_from_dir, PiperPhonemeType, PIPER_ONNX_MODEL,
 };
 use puppygrad::models::resnet::{
     default_resnet18_dir, download_resnet18_assets, preprocess_resnet_video_frame,
     ResNetClassification, ResNetRuntime,
 };
 use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
-use puppygrad::models::vits::{debug_synthesize_phoneme_ids, VitsSynthesisScales};
+use puppygrad::models::vits::{
+    DeterministicRng, VitsSynthesisScales, VitsWeightConfig, VitsWeights,
+};
 use puppygrad::models::whisper::{
     default_whisper_dir, is_silence, load_wav_pcm, load_wav_pcm_bytes, log_mel_spectrogram,
     normalize_transcript, seconds_to_samples, PartialCommitState, PartialObservation,
@@ -35,12 +37,13 @@ use puppygrad::video::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -232,7 +235,7 @@ enum Command {
         #[arg(long, conflicts_with = "text")]
         phoneme_ids: Option<String>,
 
-        /// Text input. Currently supported for Piper text-mode voices only.
+        /// Text input. eSpeak voices use the platform TTS fallback until eSpeak phonemization is linked.
         #[arg(long, conflicts_with = "phoneme_ids")]
         text: Option<String>,
 
@@ -255,6 +258,16 @@ enum Command {
         /// Speaker id for multi-speaker voices.
         #[arg(long)]
         speaker_id: Option<usize>,
+
+        /// Deterministic inference seed.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
+
+    /// Debug ONNX model contents used by native model loaders.
+    Onnx {
+        #[command(subcommand)]
+        cmd: OnnxCommand,
     },
 
     /// Placeholder for the future in-house Qwen runtime.
@@ -484,6 +497,20 @@ enum AudioCommand {
     Inspect {
         /// WAV path to inspect.
         path: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OnnxCommand {
+    /// Print initializer names, dtypes, shapes, element counts, and byte sizes.
+    Initializers {
+        /// ONNX model path.
+        #[arg(long)]
+        model: PathBuf,
+
+        /// Optional TSV manifest path to write with the same initializer rows.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
     },
 }
 
@@ -940,6 +967,7 @@ fn main() -> Result<()> {
             length_scale,
             noise_w,
             speaker_id,
+            seed,
         } => run_piper(RunPiperArgs {
             model_dir,
             phoneme_ids,
@@ -949,7 +977,9 @@ fn main() -> Result<()> {
             length_scale,
             noise_w,
             speaker_id,
+            seed,
         }),
+        Command::Onnx { cmd } => run_onnx(cmd),
         Command::Qwen {
             model_dir,
             model_id,
@@ -1343,6 +1373,16 @@ struct RunPiperArgs {
     length_scale: Option<f32>,
     noise_w: Option<f32>,
     speaker_id: Option<usize>,
+    seed: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct OnnxInitializerManifestRow {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    elements: usize,
+    storage_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1841,6 +1881,83 @@ fn run_resnet(args: RunResNetArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_onnx(cmd: OnnxCommand) -> Result<()> {
+    match cmd {
+        OnnxCommand::Initializers {
+            model,
+            manifest_out,
+        } => {
+            let store = load_onnx_initializers(&model)?;
+            let mut rows = Vec::with_capacity(store.len());
+            for tensor in store.iter() {
+                rows.push(OnnxInitializerManifestRow {
+                    name: tensor.name.clone(),
+                    dtype: onnx_dtype_name(tensor.data_type),
+                    shape: tensor.dims.clone(),
+                    elements: tensor.numel(),
+                    storage_bytes: tensor.storage_bytes(),
+                });
+            }
+
+            let manifest = onnx_initializer_manifest_tsv(&rows);
+            print!("{manifest}");
+            if let Some(path) = manifest_out {
+                fs::write(&path, manifest)?;
+                eprintln!("wrote initializer manifest to {}", path.display());
+            }
+
+            let dtype_summary = store
+                .dtype_summary()
+                .into_iter()
+                .map(|(dtype, count)| format!("{dtype}:{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "parsed {} initializer(s); dtype summary [{}]; total storage {:.2} MiB",
+                store.len(),
+                dtype_summary,
+                store.total_storage_bytes() as f64 / (1024.0 * 1024.0)
+            );
+            Ok(())
+        }
+    }
+}
+
+fn onnx_initializer_manifest_tsv(rows: &[OnnxInitializerManifestRow]) -> String {
+    let mut out = String::from("name\tdtype\tshape\telements\tstorage_bytes\n");
+    for row in rows {
+        out.push_str(&row.name);
+        out.push('\t');
+        out.push_str(&row.dtype);
+        out.push('\t');
+        out.push_str(&format_shape(&row.shape));
+        out.push('\t');
+        out.push_str(&row.elements.to_string());
+        out.push('\t');
+        out.push_str(&row.storage_bytes.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+fn onnx_dtype_name(dtype: OnnxTensorType) -> String {
+    match dtype {
+        OnnxTensorType::Float32 => "FLOAT".to_string(),
+        OnnxTensorType::Int32 => "INT32".to_string(),
+        OnnxTensorType::Int64 => "INT64".to_string(),
+        OnnxTensorType::Other(value) => format!("OTHER({value})"),
+    }
+}
+
+fn format_shape(shape: &[usize]) -> String {
+    let dims = shape
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{dims}]")
+}
+
 fn run_piper(args: RunPiperArgs) -> Result<()> {
     let model_dir = args.model_dir.unwrap_or_else(default_piper_dir);
     let config = load_piper_voice_config_from_dir(&model_dir)?;
@@ -1854,6 +1971,41 @@ fn run_piper(args: RunPiperArgs) -> Result<()> {
         }
     }
 
+    if let Some(text) = args.text.as_deref() {
+        let start = Instant::now();
+        synthesize_text_with_platform_tts(text, &args.out)?;
+        let bytes = fs::metadata(&args.out)?.len();
+        let engine = match config.phoneme_type {
+            PiperPhonemeType::Espeak => "macOS say fallback for eSpeak text",
+            PiperPhonemeType::Text => "macOS say fallback for text",
+        };
+        eprintln!(
+            "wrote {} ({} bytes, {engine}; native --text is not used yet, seed/model scales ignored, in {})",
+            args.out.display(),
+            bytes,
+            format_duration(start.elapsed())
+        );
+        return Ok(());
+    }
+
+    let weights_start = Instant::now();
+    let weights = VitsWeights::from_onnx_file(
+        &model_dir.join(PIPER_ONNX_MODEL),
+        VitsWeightConfig {
+            num_symbols: config.num_symbols,
+            num_speakers: config.num_speakers,
+        },
+    )?;
+    eprintln!(
+        "loaded Piper VITS weights: hidden={}, encoder_layers={}, duration_flows={}, residual_flow_blocks={}, upsample_layers={} in {}",
+        weights.hidden_channels,
+        weights.text_encoder.attention_layers.len(),
+        weights.duration_predictor.flows.len(),
+        weights.residual_coupling_flow.blocks.len(),
+        weights.generator.upsample_layers.len(),
+        format_duration(weights_start.elapsed())
+    );
+
     let scales = VitsSynthesisScales {
         noise_scale: args.noise_scale.unwrap_or(config.inference.noise_scale),
         length_scale: args.length_scale.unwrap_or(config.inference.length_scale),
@@ -1861,35 +2013,13 @@ fn run_piper(args: RunPiperArgs) -> Result<()> {
     };
 
     let start = Instant::now();
-    let (samples, phoneme_id_count) = if let Some(ids) = args.phoneme_ids.as_deref() {
+    let mut rng = DeterministicRng::new(args.seed);
+    let (samples, phoneme_id_count, acoustic_frames) = if let Some(ids) =
+        args.phoneme_ids.as_deref()
+    {
         let phoneme_ids = parse_usize_csv(ids, "phoneme-ids")?;
-        let samples = debug_synthesize_phoneme_ids(
-            &phoneme_ids,
-            config.audio.sample_rate,
-            scales,
-            args.speaker_id,
-        )?;
-        (samples, phoneme_ids.len())
-    } else if let Some(text) = args.text.as_deref() {
-        let phonemes = text_to_phonemes(&config, text)?;
-        let phrases = split_phoneme_phrases(&config, &phonemes)?;
-        let mut samples = Vec::new();
-        let mut phoneme_id_count = 0;
-        for phrase in phrases {
-            let ids = piper_phoneme_ids(&config, &phrase.phonemes)?;
-            phoneme_id_count += ids.len();
-            samples.extend(debug_synthesize_phoneme_ids(
-                &ids,
-                config.audio.sample_rate,
-                scales,
-                args.speaker_id,
-            )?);
-            let silence_samples = (phrase.trailing_silence_seconds
-                * config.audio.sample_rate as f32)
-                .round() as usize;
-            samples.extend(std::iter::repeat(0.0).take(silence_samples));
-        }
-        (samples, phoneme_id_count)
+        let output = weights.infer_phoneme_ids(&phoneme_ids, scales, args.speaker_id, &mut rng)?;
+        (output.samples, phoneme_ids.len(), output.acoustic_frames)
     } else {
         return Err("pass either --phoneme-ids or --text".into());
     };
@@ -1903,16 +2033,90 @@ fn run_piper(args: RunPiperArgs) -> Result<()> {
     write_wav_pcm16(&args.out, &audio)?;
 
     eprintln!(
-        "wrote {} ({:.3}s audio from {} phoneme id(s) in {})",
+        "wrote {} ({:.3}s audio from {} phoneme id(s), {} acoustic frame(s), seed {} in {})",
         args.out.display(),
         audio.duration_seconds(),
         phoneme_id_count,
+        acoustic_frames,
+        args.seed,
         format_duration(start.elapsed())
     );
-    eprintln!(
-        "warning: Piper command currently uses debug waveform synthesis; native VITS checkpoint inference is still tracked in todo.md"
-    );
     Ok(())
+}
+
+fn synthesize_text_with_platform_tts(text: &str, out: &Path) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err("--text must not be empty".into());
+    }
+
+    let say = Path::new("/usr/bin/say");
+    if !say.is_file() {
+        return Err(
+            "native Piper --text is not ready yet and /usr/bin/say is unavailable; pass --phoneme-ids with real phoneme ids"
+                .into(),
+        );
+    }
+
+    let afconvert = Path::new("/usr/bin/afconvert");
+    if !afconvert.is_file() {
+        return Err(
+            "native Piper --text is not ready yet and /usr/bin/afconvert is unavailable for WAV conversion; pass --phoneme-ids with real phoneme ids"
+                .into(),
+        );
+    }
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let tmp_aiff = temporary_sidecar_path(out, "aiff");
+    let say_status = ProcessCommand::new(say)
+        .arg("-o")
+        .arg(&tmp_aiff)
+        .arg(text)
+        .status()?;
+    if !say_status.success() {
+        remove_file_if_present(&tmp_aiff)?;
+        return Err(format!("macOS say failed with status {say_status}").into());
+    }
+
+    let convert_status = ProcessCommand::new(afconvert)
+        .arg("-f")
+        .arg("WAVE")
+        .arg("-d")
+        .arg("LEI16")
+        .arg(&tmp_aiff)
+        .arg(out)
+        .status()?;
+    remove_file_if_present(&tmp_aiff)?;
+    if !convert_status.success() {
+        return Err(format!("afconvert failed with status {convert_status}").into());
+    }
+
+    Ok(())
+}
+
+fn temporary_sidecar_path(out: &Path, extension: &str) -> PathBuf {
+    let file_name = out
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "piper-out".into());
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    out.with_file_name(format!(".{file_name}.{pid}.{nanos}.{extension}"))
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn run_resnet_camera(args: RunResNetArgs, runtime: ResNetRuntime) -> Result<()> {

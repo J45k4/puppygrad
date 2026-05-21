@@ -7,6 +7,7 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnnxTensorType {
     Float32,
+    Int32,
     Int64,
     Other(i32),
 }
@@ -15,6 +16,7 @@ impl OnnxTensorType {
     fn from_i32(value: i32) -> Self {
         match value {
             1 => Self::Float32,
+            6 => Self::Int32,
             7 => Self::Int64,
             other => Self::Other(other),
         }
@@ -28,6 +30,7 @@ pub struct OnnxTensor {
     pub data_type: OnnxTensorType,
     pub raw_data: Vec<u8>,
     pub float_data: Vec<f32>,
+    pub int32_data: Vec<i32>,
     pub int64_data: Vec<i64>,
 }
 
@@ -41,6 +44,7 @@ impl OnnxTensor {
             return self.raw_data.len();
         }
         self.float_data.len() * std::mem::size_of::<f32>()
+            + self.int32_data.len() * std::mem::size_of::<i32>()
             + self.int64_data.len() * std::mem::size_of::<i64>()
     }
 
@@ -68,6 +72,61 @@ impl OnnxTensor {
         }
         Ok(self.float_data.clone())
     }
+
+    pub fn i32_values(&self) -> Result<Vec<i32>> {
+        if self.data_type != OnnxTensorType::Int32 {
+            return Err(OnnxLoadError::WrongDtype {
+                name: self.name.clone(),
+                actual: self.data_type,
+                expected: OnnxTensorType::Int32,
+            });
+        }
+        if !self.raw_data.is_empty() {
+            if !self.raw_data.len().is_multiple_of(4) {
+                return Err(OnnxLoadError::MisalignedRawData {
+                    name: self.name.clone(),
+                    dtype: self.data_type,
+                    byte_len: self.raw_data.len(),
+                });
+            }
+            return Ok(self
+                .raw_data
+                .chunks_exact(4)
+                .map(|bytes| i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect());
+        }
+        Ok(self.int32_data.clone())
+    }
+
+    pub fn i64_values(&self) -> Result<Vec<i64>> {
+        if self.data_type != OnnxTensorType::Int64 {
+            return Err(OnnxLoadError::WrongDtype {
+                name: self.name.clone(),
+                actual: self.data_type,
+                expected: OnnxTensorType::Int64,
+            });
+        }
+        if !self.raw_data.is_empty() {
+            if !self.raw_data.len().is_multiple_of(8) {
+                return Err(OnnxLoadError::MisalignedRawData {
+                    name: self.name.clone(),
+                    dtype: self.data_type,
+                    byte_len: self.raw_data.len(),
+                });
+            }
+            return Ok(self
+                .raw_data
+                .chunks_exact(8)
+                .map(|bytes| {
+                    i64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])
+                })
+                .collect());
+        }
+        Ok(self.int64_data.clone())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +135,15 @@ pub struct OnnxInitializerStore {
 }
 
 impl OnnxInitializerStore {
+    pub fn from_tensors(tensors: impl IntoIterator<Item = OnnxTensor>) -> Self {
+        Self {
+            tensors: tensors
+                .into_iter()
+                .map(|tensor| (tensor.name.clone(), tensor))
+                .collect(),
+        }
+    }
+
     pub fn from_model_bytes(bytes: &[u8]) -> Result<Self> {
         let mut parser = ProtoParser::new(bytes);
         let mut tensors = BTreeMap::new();
@@ -124,6 +192,55 @@ impl OnnxInitializerStore {
             });
         }
         tensor.f32_values()
+    }
+
+    pub fn required_i64(&self, name: &str, expected_shape: &[usize]) -> Result<Vec<i64>> {
+        let tensor = self.required(name)?;
+        if tensor.dims != expected_shape {
+            return Err(OnnxLoadError::WrongShape {
+                name: name.to_string(),
+                actual: tensor.dims.clone(),
+                expected: expected_shape.to_vec(),
+            });
+        }
+        tensor.i64_values()
+    }
+
+    pub fn required_i32(&self, name: &str, expected_shape: &[usize]) -> Result<Vec<i32>> {
+        let tensor = self.required(name)?;
+        if tensor.dims != expected_shape {
+            return Err(OnnxLoadError::WrongShape {
+                name: name.to_string(),
+                actual: tensor.dims.clone(),
+                expected: expected_shape.to_vec(),
+            });
+        }
+        tensor.i32_values()
+    }
+
+    pub fn dtype_summary(&self) -> BTreeMap<String, usize> {
+        let mut summary = BTreeMap::new();
+        for tensor in self.iter() {
+            *summary
+                .entry(tensor.data_type.label().to_string())
+                .or_insert(0) += 1;
+        }
+        summary
+    }
+
+    pub fn total_storage_bytes(&self) -> usize {
+        self.iter().map(OnnxTensor::storage_bytes).sum()
+    }
+}
+
+impl OnnxTensorType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Float32 => "FLOAT",
+            Self::Int32 => "INT32",
+            Self::Int64 => "INT64",
+            Self::Other(_) => "OTHER",
+        }
     }
 }
 
@@ -238,6 +355,7 @@ fn parse_tensor(bytes: &[u8]) -> Result<OnnxTensor> {
         raw_data: Vec::new(),
         float_data: Vec::new(),
         int64_data: Vec::new(),
+        int32_data: Vec::new(),
     };
 
     while !parser.is_done() {
@@ -272,15 +390,22 @@ fn parse_tensor(bytes: &[u8]) -> Result<OnnxTensor> {
                         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
                 );
             }
-            (7, WIRE_VARINT) => tensor
-                .int64_data
-                .push(varint_to_i64(parser.read_varint()?)?),
-            (7, WIRE_LEN) => {
+            (5, WIRE_VARINT) => tensor
+                .int32_data
+                .push(varint_to_signed_i32(parser.read_varint()?)),
+            (5, WIRE_LEN) => {
                 let mut packed = ProtoParser::new(parser.read_len()?);
                 while !packed.is_done() {
                     tensor
-                        .int64_data
-                        .push(varint_to_i64(packed.read_varint()?)?);
+                        .int32_data
+                        .push(varint_to_signed_i32(packed.read_varint()?));
+                }
+            }
+            (7, WIRE_VARINT) => tensor.int64_data.push(varint_to_i64(parser.read_varint()?)),
+            (7, WIRE_LEN) => {
+                let mut packed = ProtoParser::new(parser.read_len()?);
+                while !packed.is_done() {
+                    tensor.int64_data.push(varint_to_i64(packed.read_varint()?));
                 }
             }
             (8, WIRE_LEN) => tensor.name = read_utf8(parser.read_len()?)?,
@@ -303,9 +428,12 @@ fn varint_to_i32(value: u64) -> Result<i32> {
         .map_err(|_| OnnxLoadError::InvalidWire(format!("varint {value} overflows i32")))
 }
 
-fn varint_to_i64(value: u64) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| OnnxLoadError::InvalidWire(format!("varint {value} overflows i64")))
+fn varint_to_signed_i32(value: u64) -> i32 {
+    value as i32
+}
+
+fn varint_to_i64(value: u64) -> i64 {
+    value as i64
 }
 
 fn varint_to_usize(value: u64) -> Result<usize> {
@@ -490,6 +618,72 @@ mod tests {
         let err = store.required_f32("ids", &[1]).unwrap_err();
 
         assert!(matches!(err, OnnxLoadError::WrongDtype { .. }));
+    }
+
+    #[test]
+    fn loads_i64_initializer_from_raw_data() {
+        let tensor = message([
+            field_varints(1, &[3]),
+            field_varint(2, 7),
+            field_len(8, b"shape".to_vec()),
+            field_len(
+                9,
+                [4i64, -2, i64::MAX]
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect(),
+            ),
+        ]);
+        let graph = message([field_len(5, tensor)]);
+        let model = message([field_len(7, graph)]);
+        let store = OnnxInitializerStore::from_model_bytes(&model).unwrap();
+
+        assert_eq!(
+            store.required_i64("shape", &[3]).unwrap(),
+            vec![4, -2, i64::MAX]
+        );
+    }
+
+    #[test]
+    fn decodes_signed_i64_varint_fields() {
+        let tensor = message([
+            field_varint(1, 2),
+            field_varint(2, 7),
+            field_len(8, b"ids".to_vec()),
+            field_varint(7, 1),
+            field_varint(7, (-1i64) as u64),
+        ]);
+        let graph = message([field_len(5, tensor)]);
+        let model = message([field_len(7, graph)]);
+        let store = OnnxInitializerStore::from_model_bytes(&model).unwrap();
+
+        assert_eq!(store.required_i64("ids", &[2]).unwrap(), vec![1, -1]);
+    }
+
+    #[test]
+    fn loads_i32_initializer_from_raw_and_signed_fields() {
+        let raw_tensor = message([
+            field_varint(1, 2),
+            field_varint(2, 6),
+            field_len(8, b"i32_raw".to_vec()),
+            field_len(
+                9,
+                [12i32, -7].into_iter().flat_map(i32::to_le_bytes).collect(),
+            ),
+        ]);
+        let field_tensor = message([
+            field_varint(1, 2),
+            field_varint(2, 6),
+            field_len(8, b"i32_field".to_vec()),
+            field_varint(5, 3),
+            field_varint(5, (-3i32) as u64),
+        ]);
+        let graph = message([field_len(5, raw_tensor), field_len(5, field_tensor)]);
+        let model = message([field_len(7, graph)]);
+        let store = OnnxInitializerStore::from_model_bytes(&model).unwrap();
+
+        assert_eq!(store.required_i32("i32_raw", &[2]).unwrap(), vec![12, -7]);
+        assert_eq!(store.required_i32("i32_field", &[2]).unwrap(), vec![3, -3]);
     }
 
     fn message<const N: usize>(fields: [Vec<u8>; N]) -> Vec<u8> {
