@@ -64,6 +64,9 @@ fn main() -> Result<()> {
     if let Some(temperature) = args.coarse_temperature {
         options.coarse_sampling.temperature = temperature;
     }
+    if let Some(top_k) = args.coarse_top_k {
+        options.coarse_sampling.top_k = Some(top_k);
+    }
 
     if args.mode == "coarse-first-logits" {
         print_coarse_first_logits(&fixture, &paths, &config, &generation_config)?;
@@ -326,6 +329,7 @@ struct Args {
     out: PathBuf,
     threads: usize,
     coarse_temperature: Option<f32>,
+    coarse_top_k: Option<usize>,
     reference_logits: Option<PathBuf>,
 }
 
@@ -337,6 +341,7 @@ impl Args {
         let mut out = None;
         let mut threads = 8usize;
         let mut coarse_temperature = None;
+        let mut coarse_top_k = None;
         let mut reference_logits = None;
 
         let mut args = env::args().skip(1);
@@ -376,6 +381,18 @@ impl Args {
                         ))
                     })?);
                 }
+                "--coarse-top-k" => {
+                    let value = args.next().ok_or_else(|| {
+                        puppygrad::models::bark::BarkError::InvalidInput(
+                            "--coarse-top-k requires a value".to_string(),
+                        )
+                    })?;
+                    coarse_top_k = Some(value.parse().map_err(|err| {
+                        puppygrad::models::bark::BarkError::InvalidInput(format!(
+                            "invalid --coarse-top-k value {value}: {err}"
+                        ))
+                    })?);
+                }
                 "--reference-logits" => reference_logits = args.next().map(PathBuf::from),
                 "--help" | "-h" => {
                     eprintln!(
@@ -406,6 +423,7 @@ impl Args {
             })?,
             threads,
             coarse_temperature,
+            coarse_top_k,
             reference_logits,
         })
     }
@@ -419,6 +437,8 @@ struct PrefixLogits {
 #[derive(Debug, Deserialize)]
 struct PrefixLogitStep {
     step: usize,
+    #[serde(default)]
+    window_start: Option<usize>,
     token: usize,
     slice_start: usize,
     slice: Vec<f32>,
@@ -461,14 +481,26 @@ fn print_coarse_prefix_logits_check(
     let max_semantic_history = (coarse.max_coarse_history as f32 / ratio).floor() as usize;
     let semantic_output =
         semantic_tokens_for_rust_coarse(&fixture.semantic.generated_tokens, generation_config);
-    let mut context = build_coarse_window_input(
-        &semantic_output,
-        &[],
-        0,
-        max_semantic_history,
-        generation_config,
+    let flat_coarse_tokens = flatten_fixture_coarse_tokens(
+        &fixture.coarse.generated_codebooks,
+        generation_config.codebook_size,
+        semantic.semantic_vocab_size,
     );
     for step in &reference.steps {
+        let window_start = step.window_start.unwrap_or(0);
+        let semantic_idx = (window_start as f32 / ratio).round() as usize;
+        let mut context = build_coarse_window_input(
+            &semantic_output,
+            &flat_coarse_tokens[..window_start.min(flat_coarse_tokens.len())],
+            semantic_idx,
+            max_semantic_history,
+            generation_config,
+        );
+        for token in &flat_coarse_tokens
+            [window_start.min(flat_coarse_tokens.len())..step.step.min(flat_coarse_tokens.len())]
+        {
+            context.push(*token);
+        }
         let mut logits = model.last_logits(&context)?;
         mask_coarse_logits_for_codebook(
             &mut logits,
@@ -490,7 +522,21 @@ fn print_coarse_prefix_logits_check(
             max_abs,
             logits[step.token]
         );
-        context.push(step.token);
     }
     Ok(())
+}
+
+fn flatten_fixture_coarse_tokens(
+    codebooks: &[Vec<usize>],
+    codebook_size: usize,
+    semantic_vocab_size: usize,
+) -> Vec<usize> {
+    let frames = codebooks.first().map(Vec::len).unwrap_or_default();
+    let mut tokens = Vec::with_capacity(frames * codebooks.len());
+    for frame in 0..frames {
+        for (codebook, row) in codebooks.iter().enumerate() {
+            tokens.push(semantic_vocab_size + codebook * codebook_size + row[frame]);
+        }
+    }
+    tokens
 }

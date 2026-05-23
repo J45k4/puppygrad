@@ -2326,6 +2326,13 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
                         cap
                     );
                 }
+                if args.top_k.is_none() && !args.greedy {
+                    options.coarse_sampling.top_k = Some(BARK_NATIVE_DEFAULT_COARSE_TOP_K);
+                    eprintln!(
+                        "bark: native coarse top-k {}; pass --top-k to override",
+                        BARK_NATIVE_DEFAULT_COARSE_TOP_K
+                    );
+                }
                 eprintln!(
                     "bark: starting Rust generation with {} thread(s), seed {}, model {}",
                     options.threads,
@@ -2373,9 +2380,13 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
                     condition_bark_rust_cli_samples(&mut samples, trace.audio.sample_rate)
                 {
                     eprintln!(
-                        "bark: conditioned native output{} with gain {:.3}",
-                        if conditioning.low_pass_hz.is_some() {
-                            " using low-pass"
+                        "bark: conditioned native output{}{} with gain {:.3}",
+                        conditioning
+                            .low_pass_hz
+                            .map(|_| " using low-pass")
+                            .unwrap_or(""),
+                        if conditioning.local_limiter {
+                            " and local limiter"
                         } else {
                             ""
                         },
@@ -2489,10 +2500,13 @@ fn bark_rust_default_semantic_token_cap(text: &str, model_max_new_tokens: usize)
     estimated.min(model_max_new_tokens)
 }
 
+const BARK_NATIVE_DEFAULT_COARSE_TOP_K: usize = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BarkOutputConditioning {
     gain: f32,
     low_pass_hz: Option<f32>,
+    local_limiter: bool,
 }
 
 fn condition_bark_rust_cli_samples(
@@ -2531,7 +2545,7 @@ fn condition_bark_rust_cli_samples(
     let should_low_pass =
         sample_rate > 0 && ((zero_crossing_rate > 3_000.0 && rms > 0.04) || rms > 0.09);
     if should_low_pass {
-        low_pass_biquad_in_place(samples, sample_rate, 4_500.0);
+        low_pass_biquad_in_place(samples, sample_rate, BARK_OUTPUT_LOW_PASS_HZ);
         peak = 0.0;
         square_sum = 0.0;
         for sample in samples.iter().copied() {
@@ -2550,14 +2564,55 @@ fn condition_bark_rust_cli_samples(
         return None;
     }
     if gain < 0.999 {
-        for sample in samples {
+        for sample in samples.iter_mut() {
             *sample *= gain;
         }
     }
+    let local_limiter =
+        sample_rate > 0 && limit_bark_local_loudness_in_place(samples, sample_rate, 0.11);
     Some(BarkOutputConditioning {
         gain,
-        low_pass_hz: should_low_pass.then_some(4_500.0),
+        low_pass_hz: should_low_pass.then_some(BARK_OUTPUT_LOW_PASS_HZ),
+        local_limiter,
     })
+}
+
+const BARK_OUTPUT_LOW_PASS_HZ: f32 = 2_600.0;
+
+fn limit_bark_local_loudness_in_place(
+    samples: &mut [f32],
+    sample_rate: usize,
+    threshold: f32,
+) -> bool {
+    if samples.is_empty() || sample_rate == 0 || threshold <= 0.0 {
+        return false;
+    }
+    let attack = (-1.0 / (sample_rate as f32 * 0.005)).exp();
+    let release = (-1.0 / (sample_rate as f32 * 0.080)).exp();
+    let gain_release = (-1.0 / (sample_rate as f32 * 0.120)).exp();
+    let mut envelope = 0.0f32;
+    let mut gain = 1.0f32;
+    let mut limited = false;
+    for sample in samples {
+        let level = sample.abs();
+        let envelope_coef = if level > envelope { attack } else { release };
+        envelope = envelope_coef * envelope + (1.0 - envelope_coef) * level;
+        let target_gain = if envelope > threshold {
+            threshold / envelope
+        } else {
+            1.0
+        };
+        if target_gain < gain {
+            gain = target_gain;
+        } else {
+            gain = gain_release * gain + (1.0 - gain_release) * target_gain;
+        }
+        if gain < 0.999 {
+            *sample *= gain;
+            limited = true;
+        }
+    }
+    limited
 }
 
 fn low_pass_biquad_in_place(samples: &mut [f32], sample_rate: usize, cutoff_hz: f32) {
@@ -6045,6 +6100,11 @@ mod tests {
     }
 
     #[test]
+    fn bark_native_default_coarse_top_k_is_conservative() {
+        assert_eq!(BARK_NATIVE_DEFAULT_COARSE_TOP_K, 5);
+    }
+
+    #[test]
     fn bark_output_conditioner_leaves_quiet_audio_unchanged() {
         let mut samples = vec![0.01, -0.01, 0.02, -0.02];
 
@@ -6056,13 +6116,17 @@ mod tests {
 
     #[test]
     fn bark_output_conditioner_filters_and_limits_hot_audio() {
-        let mut samples = (0usize..256)
-            .map(|idx| if idx.is_multiple_of(2) { 0.8 } else { -0.8 })
-            .collect::<Vec<_>>();
+        let sample_rate = 24_000usize;
+        let mut samples = vec![0.0; sample_rate];
+        for (idx, sample) in samples.iter_mut().enumerate().skip(8_000).take(2_400) {
+            let phase = std::f32::consts::TAU * 300.0 * idx as f32 / sample_rate as f32;
+            *sample = 0.8 * phase.sin();
+        }
 
-        let conditioning = condition_bark_rust_cli_samples(&mut samples, 24_000).unwrap();
+        let conditioning = condition_bark_rust_cli_samples(&mut samples, sample_rate).unwrap();
 
-        assert_eq!(conditioning.low_pass_hz, Some(4_500.0));
+        assert_eq!(conditioning.low_pass_hz, Some(BARK_OUTPUT_LOW_PASS_HZ));
+        assert!(conditioning.local_limiter);
         assert!(conditioning.gain <= 1.0);
         let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
         let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
