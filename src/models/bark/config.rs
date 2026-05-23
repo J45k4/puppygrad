@@ -118,9 +118,39 @@ impl BarkFineSubModelConfig {
 pub struct BarkCodecConfig {
     pub sampling_rate: usize,
     pub audio_channels: usize,
+    #[serde(default = "default_codec_hidden_size")]
+    pub hidden_size: usize,
+    #[serde(default = "default_codec_num_filters")]
+    pub num_filters: usize,
+    #[serde(default = "default_codec_num_residual_layers")]
+    pub num_residual_layers: usize,
     pub codebook_size: usize,
+    #[serde(default = "default_codec_num_quantizers")]
+    pub num_quantizers: usize,
     pub codebook_dim: usize,
     pub upsampling_ratios: Vec<usize>,
+    #[serde(default = "default_codec_kernel_size")]
+    pub kernel_size: usize,
+    #[serde(default = "default_codec_last_kernel_size")]
+    pub last_kernel_size: usize,
+    #[serde(default = "default_codec_residual_kernel_size")]
+    pub residual_kernel_size: usize,
+    #[serde(default = "default_codec_dilation_growth_rate")]
+    pub dilation_growth_rate: usize,
+    #[serde(default = "default_codec_compress")]
+    pub compress: usize,
+    #[serde(default = "default_codec_num_lstm_layers")]
+    pub num_lstm_layers: usize,
+    #[serde(default = "default_codec_use_causal_conv")]
+    pub use_causal_conv: bool,
+    #[serde(default = "default_codec_trim_right_ratio")]
+    pub trim_right_ratio: f32,
+    #[serde(default = "default_codec_norm_type")]
+    pub norm_type: String,
+    #[serde(default = "default_codec_pad_mode")]
+    pub pad_mode: String,
+    #[serde(default = "default_codec_use_conv_shortcut")]
+    pub use_conv_shortcut: bool,
     pub model_type: Option<String>,
 }
 
@@ -136,14 +166,46 @@ impl BarkCodecConfig {
                 "codec_config.audio_channels must be > 0".to_string(),
             ));
         }
-        if self.codebook_size == 0 || self.codebook_dim == 0 {
+        if self.hidden_size == 0
+            || self.num_filters == 0
+            || self.num_residual_layers == 0
+            || self.codebook_size == 0
+            || self.num_quantizers == 0
+            || self.codebook_dim == 0
+            || self.kernel_size == 0
+            || self.last_kernel_size == 0
+            || self.residual_kernel_size == 0
+            || self.dilation_growth_rate == 0
+            || self.compress == 0
+            || self.num_lstm_layers == 0
+        {
             return Err(BarkError::InvalidConfig(
-                "codec_config codebook sizes must be > 0".to_string(),
+                "codec_config channel, codebook, kernel, and layer sizes must be > 0".to_string(),
             ));
         }
         if self.upsampling_ratios.is_empty() || self.upsampling_ratios.contains(&0) {
             return Err(BarkError::InvalidConfig(
                 "codec_config.upsampling_ratios must contain non-zero values".to_string(),
+            ));
+        }
+        if self.norm_type != "weight_norm" {
+            return Err(BarkError::InvalidConfig(format!(
+                "codec_config.norm_type {:?} is not supported yet; expected weight_norm",
+                self.norm_type
+            )));
+        }
+        if self.pad_mode != "reflect" && self.pad_mode != "constant" {
+            return Err(BarkError::InvalidConfig(format!(
+                "codec_config.pad_mode {:?} is not supported yet",
+                self.pad_mode
+            )));
+        }
+        if !self.trim_right_ratio.is_finite()
+            || self.trim_right_ratio < 0.0
+            || self.trim_right_ratio > 1.0
+        {
+            return Err(BarkError::InvalidConfig(
+                "codec_config.trim_right_ratio must be finite and in [0, 1]".to_string(),
             ));
         }
         Ok(())
@@ -232,6 +294,10 @@ pub struct BarkCoarseGenerationConfig {
 }
 
 impl BarkCoarseGenerationConfig {
+    pub fn semantic_to_coarse_token_ratio(&self, semantic_rate_hz: f32) -> f32 {
+        self.coarse_rate_hz as f32 / semantic_rate_hz * self.n_coarse_codebooks as f32
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.coarse_rate_hz == 0
             || self.max_coarse_history == 0
@@ -327,6 +393,66 @@ fn default_top_k() -> usize {
 
 fn default_top_p() -> f32 {
     1.0
+}
+
+fn default_codec_hidden_size() -> usize {
+    128
+}
+
+fn default_codec_num_filters() -> usize {
+    32
+}
+
+fn default_codec_num_residual_layers() -> usize {
+    1
+}
+
+fn default_codec_num_quantizers() -> usize {
+    8
+}
+
+fn default_codec_kernel_size() -> usize {
+    7
+}
+
+fn default_codec_last_kernel_size() -> usize {
+    7
+}
+
+fn default_codec_residual_kernel_size() -> usize {
+    3
+}
+
+fn default_codec_dilation_growth_rate() -> usize {
+    2
+}
+
+fn default_codec_compress() -> usize {
+    2
+}
+
+fn default_codec_num_lstm_layers() -> usize {
+    2
+}
+
+fn default_codec_use_causal_conv() -> bool {
+    true
+}
+
+fn default_codec_trim_right_ratio() -> f32 {
+    1.0
+}
+
+fn default_codec_norm_type() -> String {
+    "weight_norm".to_string()
+}
+
+fn default_codec_pad_mode() -> String {
+    "reflect".to_string()
+}
+
+fn default_codec_use_conv_shortcut() -> bool {
+    true
 }
 
 #[cfg(test)]

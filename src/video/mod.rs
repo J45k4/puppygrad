@@ -1,16 +1,31 @@
 use image::RgbImage;
+#[cfg(feature = "hardware-io")]
 use nokhwa::pixel_format::RgbFormat;
+#[cfg(feature = "hardware-io")]
 use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
     Resolution,
 };
+#[cfg(feature = "hardware-io")]
 use nokhwa::{query, Camera};
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::error;
 use std::fmt;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "hardware-io")]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(not(feature = "hardware-io"))]
+pub struct Camera;
+
+#[cfg(not(feature = "hardware-io"))]
+impl Camera {
+    pub fn open_stream(&mut self) -> Result<(), String> {
+        Err("camera streaming requires the hardware-io feature".to_string())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VideoError {
@@ -177,6 +192,19 @@ impl VideoFrameQueue {
 }
 
 pub fn list_video_devices() -> VideoResult<Vec<VideoDeviceInfo>> {
+    list_video_devices_impl()
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn list_video_devices_impl() -> VideoResult<Vec<VideoDeviceInfo>> {
+    Err(VideoError::Backend {
+        operation: "device query",
+        message: "video devices require the hardware-io feature".to_string(),
+    })
+}
+
+#[cfg(feature = "hardware-io")]
+fn list_video_devices_impl() -> VideoResult<Vec<VideoDeviceInfo>> {
     let cameras =
         query(ApiBackend::Auto).map_err(|source| map_backend_error("device query", source))?;
     Ok(cameras
@@ -195,6 +223,19 @@ pub fn list_video_devices() -> VideoResult<Vec<VideoDeviceInfo>> {
 }
 
 pub fn capture_frame(options: VideoCaptureOptions) -> VideoResult<VideoFrame> {
+    capture_frame_impl(options)
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn capture_frame_impl(_options: VideoCaptureOptions) -> VideoResult<VideoFrame> {
+    Err(VideoError::Backend {
+        operation: "capture frame",
+        message: "camera capture requires the hardware-io feature".to_string(),
+    })
+}
+
+#[cfg(feature = "hardware-io")]
+fn capture_frame_impl(options: VideoCaptureOptions) -> VideoResult<VideoFrame> {
     let mut camera = open_camera(options)?;
     camera
         .open_stream()
@@ -203,6 +244,19 @@ pub fn capture_frame(options: VideoCaptureOptions) -> VideoResult<VideoFrame> {
 }
 
 pub fn open_camera(options: VideoCaptureOptions) -> VideoResult<Camera> {
+    open_camera_impl(options)
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn open_camera_impl(_options: VideoCaptureOptions) -> VideoResult<Camera> {
+    Err(VideoError::Backend {
+        operation: "camera open",
+        message: "camera access requires the hardware-io feature".to_string(),
+    })
+}
+
+#[cfg(feature = "hardware-io")]
+fn open_camera_impl(options: VideoCaptureOptions) -> VideoResult<Camera> {
     if let Some(index) = options.device_index {
         let devices = list_video_devices()?;
         if !devices.iter().any(|device| device.index == index) {
@@ -216,6 +270,19 @@ pub fn open_camera(options: VideoCaptureOptions) -> VideoResult<Camera> {
 }
 
 pub fn decode_next_frame(camera: &mut Camera, timeout: Duration) -> VideoResult<VideoFrame> {
+    decode_next_frame_impl(camera, timeout)
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn decode_next_frame_impl(_camera: &mut Camera, _timeout: Duration) -> VideoResult<VideoFrame> {
+    Err(VideoError::Backend {
+        operation: "decode frame",
+        message: "camera frame decoding requires the hardware-io feature".to_string(),
+    })
+}
+
+#[cfg(feature = "hardware-io")]
+fn decode_next_frame_impl(camera: &mut Camera, timeout: Duration) -> VideoResult<VideoFrame> {
     let start = std::time::Instant::now();
     loop {
         match camera.frame() {
@@ -302,6 +369,7 @@ pub fn save_video_frame(frame: &VideoFrame, path: &Path) -> VideoResult<()> {
     })
 }
 
+#[cfg(feature = "hardware-io")]
 fn requested_format(options: VideoCaptureOptions) -> RequestedFormat<'static> {
     match (options.width, options.height, options.fps) {
         (Some(width), Some(height), Some(fps)) => {
@@ -321,6 +389,7 @@ fn requested_format(options: VideoCaptureOptions) -> RequestedFormat<'static> {
     }
 }
 
+#[cfg(feature = "hardware-io")]
 fn map_backend_error(operation: &'static str, source: nokhwa::NokhwaError) -> VideoError {
     let message = source.to_string();
     if is_permission_denied(&message) {
@@ -330,11 +399,13 @@ fn map_backend_error(operation: &'static str, source: nokhwa::NokhwaError) -> Vi
     }
 }
 
+#[cfg(feature = "hardware-io")]
 fn is_permission_denied(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("permission") || lower.contains("denied") || lower.contains("authorized")
 }
 
+#[cfg(feature = "hardware-io")]
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

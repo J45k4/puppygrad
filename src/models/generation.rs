@@ -395,6 +395,45 @@ mod tests {
     }
 
     #[test]
+    fn top_p_keeps_at_least_highest_probability_candidate() -> Result<(), SamplingError> {
+        let config = TextGenerationConfig {
+            temperature: 1.0,
+            top_p: Some(0.01),
+            ..TextGenerationConfig::new(1)
+        };
+        let mut sampler = LogitsSampler::new(config.seed);
+
+        let token = sampler.select_next_token(&[0.0, 10.0, 9.0], &[], &config)?;
+
+        assert_eq!(token, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_sampling_replays_same_sequence() -> Result<(), SamplingError> {
+        let config = TextGenerationConfig {
+            temperature: 1.0,
+            top_k: Some(3),
+            top_p: Some(1.0),
+            seed: 42,
+            ..TextGenerationConfig::new(4)
+        };
+        let mut first = LogitsSampler::new(config.seed);
+        let mut second = LogitsSampler::new(config.seed);
+        let logits = [0.0, 0.25, 0.5, 0.75];
+
+        let first_tokens = (0..4)
+            .map(|_| first.select_next_token(&logits, &[], &config))
+            .collect::<Result<Vec<_>, _>>()?;
+        let second_tokens = (0..4)
+            .map(|_| second.select_next_token(&logits, &[], &config))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(first_tokens, second_tokens);
+        Ok(())
+    }
+
+    #[test]
     fn validates_sampling_config() {
         let mut config = TextGenerationConfig::new(1);
         config.top_p = Some(2.0);

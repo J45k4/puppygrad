@@ -3,10 +3,14 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "hardware-io")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+#[cfg(feature = "hardware-io")]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "hardware-io")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 #[derive(Debug)]
@@ -65,6 +69,7 @@ pub enum AudioDropPolicy {
 
 pub struct ContinuousInputStream {
     queue: Arc<AudioChunkQueue>,
+    #[cfg(feature = "hardware-io")]
     _stream: cpal::Stream,
     sample_rate: usize,
     channels: usize,
@@ -97,6 +102,26 @@ impl ContinuousInputStream {
 }
 
 pub fn start_input_device_stream(
+    device_index: Option<usize>,
+    max_queued_chunks: usize,
+    drop_policy: AudioDropPolicy,
+) -> AudioResult<ContinuousInputStream> {
+    start_input_device_stream_impl(device_index, max_queued_chunks, drop_policy)
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn start_input_device_stream_impl(
+    _device_index: Option<usize>,
+    _max_queued_chunks: usize,
+    _drop_policy: AudioDropPolicy,
+) -> AudioResult<ContinuousInputStream> {
+    Err(AudioError::Unsupported(
+        "audio input devices require the hardware-io feature".to_string(),
+    ))
+}
+
+#[cfg(feature = "hardware-io")]
+fn start_input_device_stream_impl(
     device_index: Option<usize>,
     max_queued_chunks: usize,
     drop_policy: AudioDropPolicy,
@@ -233,6 +258,18 @@ pub fn start_input_device_stream(
 }
 
 pub fn list_input_devices() -> AudioResult<Vec<InputDeviceInfo>> {
+    list_input_devices_impl()
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn list_input_devices_impl() -> AudioResult<Vec<InputDeviceInfo>> {
+    Err(AudioError::Unsupported(
+        "audio input devices require the hardware-io feature".to_string(),
+    ))
+}
+
+#[cfg(feature = "hardware-io")]
+fn list_input_devices_impl() -> AudioResult<Vec<InputDeviceInfo>> {
     let host = cpal::default_host();
     let default_name = host
         .default_input_device()
@@ -257,6 +294,7 @@ pub fn list_input_devices() -> AudioResult<Vec<InputDeviceInfo>> {
     Ok(infos)
 }
 
+#[cfg(feature = "hardware-io")]
 fn build_queued_input_stream<T, F, E>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -289,6 +327,7 @@ where
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "hardware-io"), allow(dead_code))]
 struct AudioChunkQueue {
     state: Mutex<AudioChunkQueueState>,
     available: Condvar,
@@ -303,6 +342,7 @@ struct AudioChunkQueueState {
     dropped_chunks: usize,
 }
 
+#[cfg_attr(not(feature = "hardware-io"), allow(dead_code))]
 impl AudioChunkQueue {
     fn new(max_chunks: usize, drop_policy: AudioDropPolicy) -> Self {
         Self {
@@ -386,6 +426,24 @@ impl AudioChunkQueue {
 }
 
 pub fn record_input_device(
+    device_index: Option<usize>,
+    duration: Duration,
+) -> AudioResult<PcmAudio> {
+    record_input_device_impl(device_index, duration)
+}
+
+#[cfg(not(feature = "hardware-io"))]
+fn record_input_device_impl(
+    _device_index: Option<usize>,
+    _duration: Duration,
+) -> AudioResult<PcmAudio> {
+    Err(AudioError::Unsupported(
+        "audio input recording requires the hardware-io feature".to_string(),
+    ))
+}
+
+#[cfg(feature = "hardware-io")]
+fn record_input_device_impl(
     device_index: Option<usize>,
     duration: Duration,
 ) -> AudioResult<PcmAudio> {
@@ -566,6 +624,7 @@ pub fn record_input_device(
     })
 }
 
+#[cfg(feature = "hardware-io")]
 fn build_input_stream<T, F, E>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -851,34 +910,42 @@ pub fn convert_u16(sample: u16) -> f32 {
     sample as f32 / 32768.0 - 1.0
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_f32(sample: f32) -> f32 {
     sample.clamp(-1.0, 1.0)
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_f64(sample: f64) -> f32 {
     (sample as f32).clamp(-1.0, 1.0)
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_i8(sample: i8) -> f32 {
     sample as f32 / 128.0
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_i32(sample: i32) -> f32 {
     sample as f32 / 2_147_483_648.0
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_i64(sample: i64) -> f32 {
     sample as f32 / 9_223_372_036_854_775_808.0
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_u8(sample: u8) -> f32 {
     sample as f32 / 128.0 - 1.0
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_u32(sample: u32) -> f32 {
     sample as f32 / 2_147_483_648.0 - 1.0
 }
 
+#[cfg(feature = "hardware-io")]
 fn convert_u64(sample: u64) -> f32 {
     sample as f32 / 9_223_372_036_854_775_808.0 - 1.0
 }

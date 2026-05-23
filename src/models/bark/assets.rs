@@ -10,6 +10,8 @@ pub const BARK_TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 pub const BARK_SPECIAL_TOKENS_MAP_JSON: &str = "special_tokens_map.json";
 pub const BARK_VOCAB_TXT: &str = "vocab.txt";
 pub const BARK_PYTORCH_WEIGHTS: &str = "pytorch_model.bin";
+pub const BARK_NATIVE_WEIGHTS: &str = "model.safetensors";
+pub const BARK_SPEAKER_EMBEDDINGS_JSON: &str = "speaker_embeddings_path.json";
 
 pub const BARK_SMALL_MODEL_ID: &str = "suno/bark-small";
 
@@ -39,6 +41,7 @@ pub struct BarkAssetPaths {
     pub special_tokens_map: PathBuf,
     pub vocab: PathBuf,
     pub weights: PathBuf,
+    pub native_weights: PathBuf,
 }
 
 impl BarkAssetPaths {
@@ -51,6 +54,7 @@ impl BarkAssetPaths {
             special_tokens_map: model_dir.join(BARK_SPECIAL_TOKENS_MAP_JSON),
             vocab: model_dir.join(BARK_VOCAB_TXT),
             weights: model_dir.join(BARK_PYTORCH_WEIGHTS),
+            native_weights: model_dir.join(BARK_NATIVE_WEIGHTS),
             model_dir,
         }
     }
@@ -90,6 +94,19 @@ pub fn prepare_bark_metadata_assets(
     Ok(paths)
 }
 
+pub fn validate_bark_native_assets(paths: &BarkAssetPaths) -> Result<()> {
+    if paths.native_weights.is_file() {
+        return Ok(());
+    }
+    Err(BarkError::Asset(format!(
+        "native Rust Bark backend requires {}; convert the Hugging Face {} checkpoint into {} and place it at {}",
+        BARK_NATIVE_WEIGHTS,
+        BARK_PYTORCH_WEIGHTS,
+        BARK_NATIVE_WEIGHTS,
+        paths.native_weights.display()
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +122,19 @@ mod tests {
             paths.weights,
             PathBuf::from("models/bark-small/pytorch_model.bin")
         );
+        assert_eq!(
+            paths.native_weights,
+            PathBuf::from("models/bark-small/model.safetensors")
+        );
+    }
+
+    #[test]
+    fn native_asset_validation_reports_conversion_path() {
+        let paths = BarkAssetPaths::new("models/definitely-missing-bark");
+
+        let err = validate_bark_native_assets(&paths).unwrap_err();
+
+        assert!(err.to_string().contains("model.safetensors"));
+        assert!(err.to_string().contains("pytorch_model.bin"));
     }
 }

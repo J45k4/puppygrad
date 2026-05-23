@@ -36,3 +36,11 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Rust
 target/
 /models/
+
+# local Python tooling
+.python-packages/
+.venv*/
+
+workdir
+
+__pycache__

@@ -1,0 +1,21 @@
+# Keep small compact JSON fixtures reviewable in git.
+*
+!.gitignore
+!README.md
+!*.json
+!tokenizer/
+!tokenizer/*.json
+
+# Large/local parity artifacts stay untracked.
+*.bin
+*.f32
+*.u32
+*.npy
+*.npz
+*.wav
+*.safetensors
+*.pt
+*.pth
+*.onnx
+full-output/
+local/

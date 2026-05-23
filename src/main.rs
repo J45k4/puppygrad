@@ -7,8 +7,9 @@ use puppygrad::audio::{
 use puppygrad::engine::Tensor;
 use puppygrad::models::autotune::{autotune, AutoTuneOptions, AutoTuneTarget};
 use puppygrad::models::bark::{
-    default_bark_dir, load_bark_config, load_bark_generation_config, prepare_bark_assets,
-    prepare_bark_metadata_assets, BarkTokenizer, BARK_SMALL_MODEL_ID,
+    default_bark_dir, generate_bark_rust_trace_with_progress, load_bark_config,
+    load_bark_generation_config, prepare_bark_assets, prepare_bark_metadata_assets,
+    BarkProgressStatus, BarkRuntimeOptions, BarkTokenizer, BARK_SMALL_MODEL_ID,
 };
 use puppygrad::models::generation::{TextGenerationArgs, TextGenerationConfig};
 use puppygrad::models::gpt2::{
@@ -294,7 +295,7 @@ enum Command {
         #[arg(long)]
         voice_preset: Option<String>,
 
-        /// Output WAV path. Requires --backend python-transformers until native Bark inference lands.
+        /// Output WAV path.
         #[arg(long)]
         out: Option<PathBuf>,
 
@@ -317,6 +318,38 @@ enum Command {
         /// RNG seed passed to the python-transformers backend.
         #[arg(long, default_value_t = 299792458)]
         seed: u64,
+
+        /// Force greedy Bark generation unless a per-stage temperature is explicitly set.
+        #[arg(long)]
+        greedy: bool,
+
+        /// Override semantic-stage generation temperature.
+        #[arg(long)]
+        semantic_temperature: Option<f32>,
+
+        /// Override coarse-stage generation temperature.
+        #[arg(long)]
+        coarse_temperature: Option<f32>,
+
+        /// Override fine-stage generation temperature.
+        #[arg(long)]
+        fine_temperature: Option<f32>,
+
+        /// Override top-k sampling for semantic, coarse, and fine stages.
+        #[arg(long)]
+        top_k: Option<usize>,
+
+        /// Override top-p sampling for semantic, coarse, and fine stages.
+        #[arg(long)]
+        top_p: Option<f32>,
+
+        /// Override the maximum number of semantic tokens to generate.
+        #[arg(long)]
+        max_semantic_tokens: Option<usize>,
+
+        /// Number of worker threads for the native Rust Bark backend.
+        #[arg(long)]
+        threads: Option<usize>,
     },
 
     /// Debug ONNX model contents used by native model loaders.
@@ -1047,6 +1080,14 @@ fn main() -> Result<()> {
             backend,
             python,
             seed,
+            greedy,
+            semantic_temperature,
+            coarse_temperature,
+            fine_temperature,
+            top_k,
+            top_p,
+            max_semantic_tokens,
+            threads,
         } => run_bark(RunBarkArgs {
             model_dir,
             model_id,
@@ -1060,6 +1101,14 @@ fn main() -> Result<()> {
             backend,
             python,
             seed,
+            greedy,
+            semantic_temperature,
+            coarse_temperature,
+            fine_temperature,
+            top_k,
+            top_p,
+            max_semantic_tokens,
+            threads,
         }),
         Command::Onnx { cmd } => run_onnx(cmd),
         Command::Qwen {
@@ -1336,6 +1385,7 @@ enum WhisperBackendArg {
 enum BarkBackendArg {
     #[value(name = "python-transformers")]
     PythonTransformers,
+    Rust,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1477,6 +1527,14 @@ struct RunBarkArgs {
     backend: BarkBackendArg,
     python: String,
     seed: u64,
+    greedy: bool,
+    semantic_temperature: Option<f32>,
+    coarse_temperature: Option<f32>,
+    fine_temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    max_semantic_tokens: Option<usize>,
+    threads: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2148,9 +2206,11 @@ fn run_piper(args: RunPiperArgs) -> Result<()> {
 }
 
 fn run_bark(args: RunBarkArgs) -> Result<()> {
-    let model_dir = args.model_dir.unwrap_or_else(default_bark_dir);
-    let needs_weights = args.out.is_some();
-    let paths = if needs_weights {
+    validate_bark_cli_generation_options(&args)?;
+    let model_dir = args.model_dir.clone().unwrap_or_else(default_bark_dir);
+    let needs_python_weights =
+        args.out.is_some() && matches!(args.backend, BarkBackendArg::PythonTransformers);
+    let paths = if needs_python_weights {
         prepare_bark_assets(&args.model_id, &args.revision, &model_dir, args.download)?
     } else {
         prepare_bark_metadata_assets(&args.model_id, &args.revision, &model_dir, args.download)?
@@ -2195,14 +2255,17 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
             .text
             .as_deref()
             .ok_or("--print-tokens requires --text")?;
-        let tokenizer = BarkTokenizer::from_vocab_file(
+        let tokenizer = BarkTokenizer::from_model_files(
             &paths.vocab,
+            &paths.tokenizer_config,
+            &paths.special_tokens_map,
             generation_config.semantic_config.max_input_semantic_length,
         )?;
         let encoding = tokenizer.encode(text)?;
         let semantic_ids = tokenizer.encode_for_semantic_model(
             text,
             generation_config.semantic_config.text_encoding_offset,
+            generation_config.semantic_config.text_pad_token,
         )?;
         println!("vocab_size\t{}", tokenizer.vocab_len());
         println!("tokens\t{}", encoding.tokens.join(" "));
@@ -2225,7 +2288,7 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
         );
     }
 
-    if let Some(out) = args.out {
+    if let Some(out) = args.out.as_ref() {
         let text = args.text.as_deref().ok_or("--out requires --text")?;
         match args.backend {
             BarkBackendArg::PythonTransformers => run_bark_python_transformers(
@@ -2235,16 +2298,177 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
                 args.voice_preset.as_deref(),
                 &out,
                 args.seed,
+                &bark_cli_generation_settings_json(&args),
             )?,
+            BarkBackendArg::Rust => {
+                if args.model_id != BARK_SMALL_MODEL_ID {
+                    return Err(format!(
+                        "native Bark backend currently supports only {BARK_SMALL_MODEL_ID}, got {}",
+                        args.model_id
+                    )
+                    .into());
+                }
+                let mut options = BarkRuntimeOptions::from_generation_config(
+                    text,
+                    args.voice_preset.clone(),
+                    args.seed,
+                    &generation_config,
+                );
+                apply_bark_cli_generation_options(&mut options, &args);
+                eprintln!(
+                    "bark: starting Rust generation with {} thread(s), seed {}, model {}",
+                    options.threads,
+                    args.seed,
+                    paths.model_dir.display()
+                );
+                let trace = generate_bark_rust_trace_with_progress(
+                    &paths,
+                    &config,
+                    &generation_config,
+                    &options,
+                    |event| match event.status {
+                        BarkProgressStatus::Started => {
+                            eprintln!("bark: {}...", event.stage.label());
+                        }
+                        BarkProgressStatus::Advanced => {
+                            let current = event.current.unwrap_or(0);
+                            let total = event.total.unwrap_or(0);
+                            if total > 0 {
+                                let percent = current as f64 * 100.0 / total as f64;
+                                eprintln!(
+                                    "bark: {} {}/{} ({:.1}%)",
+                                    event.stage.label(),
+                                    current,
+                                    total,
+                                    percent
+                                );
+                            } else {
+                                eprintln!("bark: {} {}", event.stage.label(), current);
+                            }
+                        }
+                        BarkProgressStatus::Finished => {
+                            let elapsed = event.elapsed.unwrap_or(Duration::ZERO);
+                            eprintln!(
+                                "bark: {} done in {}",
+                                event.stage.label(),
+                                format_duration(elapsed)
+                            );
+                        }
+                    },
+                )?;
+                eprintln!("bark: write WAV {}...", out.display());
+                let audio = SharedPcmAudio {
+                    path: out.clone(),
+                    sample_rate: trace.audio.sample_rate,
+                    channels: 1,
+                    samples: trace.audio.samples,
+                };
+                write_wav_pcm16(&out, &audio)?;
+                eprintln!(
+                    "wrote {} ({:.3}s audio at {} Hz from Bark rust backend, seed {}, threads {}, semantic {}, coarse {}, fine {}, encodec {})",
+                    out.display(),
+                    audio.duration_seconds(),
+                    audio.sample_rate,
+                    args.seed,
+                    options.threads,
+                    format_duration(trace.profile.semantic_generation_time),
+                    format_duration(trace.profile.coarse_generation_time),
+                    format_duration(trace.profile.fine_generation_time),
+                    format_duration(trace.profile.encodec_decode_time)
+                );
+            }
         }
     } else if !args.print_config && !args.print_tokens {
         println!(
-            "Bark assets are ready in {}. Pass --text with --print-tokens to inspect inputs or --out to synthesize through python-transformers.",
+            "Bark assets are ready in {}. Pass --text with --print-tokens to inspect inputs or --out to synthesize.",
             paths.model_dir.display()
         );
     }
 
     Ok(())
+}
+
+fn validate_bark_cli_generation_options(args: &RunBarkArgs) -> Result<()> {
+    validate_bark_cli_temperature(args.semantic_temperature, "semantic-temperature")?;
+    validate_bark_cli_temperature(args.coarse_temperature, "coarse-temperature")?;
+    validate_bark_cli_temperature(args.fine_temperature, "fine-temperature")?;
+    if matches!(args.top_k, Some(0)) {
+        return Err("--top-k must be > 0 when set".into());
+    }
+    if let Some(top_p) = args.top_p {
+        if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+            return Err("--top-p must be finite and in (0, 1]".into());
+        }
+    }
+    if matches!(args.max_semantic_tokens, Some(0)) {
+        return Err("--max-semantic-tokens must be > 0 when set".into());
+    }
+    if matches!(args.threads, Some(0)) {
+        return Err("--threads must be > 0 when set".into());
+    }
+    Ok(())
+}
+
+fn validate_bark_cli_temperature(value: Option<f32>, name: &str) -> Result<()> {
+    if let Some(value) = value {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("--{name} must be finite and >= 0").into());
+        }
+    }
+    Ok(())
+}
+
+fn apply_bark_cli_generation_options(options: &mut BarkRuntimeOptions, args: &RunBarkArgs) {
+    if args.greedy {
+        if args.semantic_temperature.is_none() {
+            options.semantic_sampling.temperature = 0.0;
+        }
+        if args.coarse_temperature.is_none() {
+            options.coarse_sampling.temperature = 0.0;
+        }
+        if args.fine_temperature.is_none() {
+            options.fine_sampling.temperature = 1.0;
+        }
+    }
+    if let Some(temperature) = args.semantic_temperature {
+        options.semantic_sampling.temperature = temperature;
+    }
+    if let Some(temperature) = args.coarse_temperature {
+        options.coarse_sampling.temperature = temperature;
+    }
+    if let Some(temperature) = args.fine_temperature {
+        options.fine_sampling.temperature = temperature;
+    }
+    if let Some(top_k) = args.top_k {
+        options.semantic_sampling.top_k = Some(top_k);
+        options.coarse_sampling.top_k = Some(top_k);
+        options.fine_sampling.top_k = Some(top_k);
+    }
+    if let Some(top_p) = args.top_p {
+        options.semantic_sampling.top_p = Some(top_p);
+        options.coarse_sampling.top_p = Some(top_p);
+        options.fine_sampling.top_p = Some(top_p);
+    }
+    if let Some(max_semantic_tokens) = args.max_semantic_tokens {
+        options.max_semantic_tokens = Some(max_semantic_tokens);
+    }
+    if let Some(threads) = args.threads {
+        options.threads = threads;
+    }
+}
+
+fn bark_cli_generation_settings_json(args: &RunBarkArgs) -> String {
+    serde_json::json!({
+        "greedy": args.greedy,
+        "semantic_temperature": args.semantic_temperature,
+        "coarse_temperature": args.coarse_temperature,
+        "fine_temperature": args.fine_temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "max_semantic_tokens": args.max_semantic_tokens,
+        "threads": args.threads,
+    })
+    .to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -2260,6 +2484,7 @@ fn run_bark_python_transformers(
     voice_preset: Option<&str>,
     out: &Path,
     seed: u64,
+    generation_settings_json: &str,
 ) -> Result<()> {
     if text.trim().is_empty() {
         return Err("--text must not be empty".into());
@@ -2282,6 +2507,7 @@ fn run_bark_python_transformers(
         .arg(&raw_path)
         .arg(&meta_path)
         .arg(seed.to_string())
+        .arg(generation_settings_json)
         .status();
     let status = match status {
         Ok(status) => status,
@@ -2342,8 +2568,9 @@ const BARK_PYTHON_TRANSFORMERS_SCRIPT: &str = r#"
 import json
 import sys
 
-model_dir, text, voice_preset, raw_path, meta_path, seed_text = sys.argv[1:7]
+model_dir, text, voice_preset, raw_path, meta_path, seed_text, settings_text = sys.argv[1:8]
 seed = int(seed_text)
+settings = json.loads(settings_text)
 
 import numpy as np
 import torch
@@ -2355,8 +2582,31 @@ model = AutoModelForTextToWaveform.from_pretrained(model_dir)
 kwargs = {"voice_preset": voice_preset} if voice_preset else {}
 inputs = processor(text, **kwargs)
 inputs = {key: value.to(model.device) if hasattr(value, "to") else value for key, value in inputs.items()}
+generate_kwargs = {}
+top_k = settings.get("top_k")
+top_p = settings.get("top_p")
+if top_k is not None:
+    generate_kwargs["top_k"] = int(top_k)
+if top_p is not None:
+    generate_kwargs["top_p"] = float(top_p)
+if settings.get("greedy"):
+    generate_kwargs["do_sample"] = False
+    generate_kwargs["fine_temperature"] = 1.0
+for prefix, key in [
+    ("semantic", "semantic_temperature"),
+    ("coarse", "coarse_temperature"),
+    ("fine", "fine_temperature"),
+]:
+    if settings.get(key) is not None:
+        temperature = float(settings[key])
+        if temperature == 0.0:
+            generate_kwargs[f"{prefix}_do_sample"] = False
+        else:
+            generate_kwargs[f"{prefix}_temperature"] = temperature
+if settings.get("max_semantic_tokens") is not None:
+    generate_kwargs["semantic_max_new_tokens"] = int(settings["max_semantic_tokens"])
 with torch.no_grad():
-    audio = model.generate(**inputs)
+    audio = model.generate(**inputs, **generate_kwargs)
 samples = audio.detach().cpu().numpy().reshape(-1).astype("<f4", copy=False)
 samples.tofile(raw_path)
 sample_rate = int(getattr(model.generation_config, "sample_rate", 24000))

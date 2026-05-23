@@ -136,6 +136,10 @@ impl<'a> TensorStore<'a> {
         validate_tensor(name, &tensor, Dtype::F32, expected_shape)?;
         f32_data(name, &tensor).map(Some)
     }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.tensors.names()
+    }
 }
 
 pub fn tensor_f32(
