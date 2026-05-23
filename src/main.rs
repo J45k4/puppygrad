@@ -6,6 +6,10 @@ use puppygrad::audio::{
 };
 use puppygrad::engine::Tensor;
 use puppygrad::models::autotune::{autotune, AutoTuneOptions, AutoTuneTarget};
+use puppygrad::models::bark::{
+    default_bark_dir, load_bark_config, load_bark_generation_config, prepare_bark_assets,
+    prepare_bark_metadata_assets, BarkTokenizer, BARK_SMALL_MODEL_ID,
+};
 use puppygrad::models::generation::{TextGenerationArgs, TextGenerationConfig};
 use puppygrad::models::gpt2::{
     default_gpt2_small_dir, download_gpt2_small_assets, download_huggingface_gpt2_assets,
@@ -261,6 +265,57 @@ enum Command {
 
         /// Deterministic inference seed.
         #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
+
+    /// Prepare assets and run Bark text-to-audio generation.
+    Bark {
+        /// Local Bark model directory.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used with --download.
+        #[arg(long, default_value = BARK_SMALL_MODEL_ID)]
+        model_id: String,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Download missing model assets into --model-dir before running.
+        #[arg(long)]
+        download: bool,
+
+        /// Text prompt to tokenize or synthesize.
+        #[arg(long)]
+        text: Option<String>,
+
+        /// Optional Bark voice preset, such as en_speaker_6, when available in the model assets/runtime.
+        #[arg(long)]
+        voice_preset: Option<String>,
+
+        /// Output WAV path. Requires --backend python-transformers until native Bark inference lands.
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Print resolved model/generation config summary.
+        #[arg(long)]
+        print_config: bool,
+
+        /// Print tokenizer tokens and ids for --text without generating audio.
+        #[arg(long)]
+        print_tokens: bool,
+
+        /// Execution backend.
+        #[arg(long, value_enum, default_value_t = BarkBackendArg::PythonTransformers)]
+        backend: BarkBackendArg,
+
+        /// Python executable for the python-transformers backend.
+        #[arg(long, default_value = "python3")]
+        python: String,
+
+        /// RNG seed passed to the python-transformers backend.
+        #[arg(long, default_value_t = 299792458)]
         seed: u64,
     },
 
@@ -979,6 +1034,33 @@ fn main() -> Result<()> {
             speaker_id,
             seed,
         }),
+        Command::Bark {
+            model_dir,
+            model_id,
+            revision,
+            download,
+            text,
+            voice_preset,
+            out,
+            print_config,
+            print_tokens,
+            backend,
+            python,
+            seed,
+        } => run_bark(RunBarkArgs {
+            model_dir,
+            model_id,
+            revision,
+            download,
+            text,
+            voice_preset,
+            out,
+            print_config,
+            print_tokens,
+            backend,
+            python,
+            seed,
+        }),
         Command::Onnx { cmd } => run_onnx(cmd),
         Command::Qwen {
             model_dir,
@@ -1251,6 +1333,12 @@ enum WhisperBackendArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BarkBackendArg {
+    #[value(name = "python-transformers")]
+    PythonTransformers,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ExperimentFormatArg {
     Table,
     Csv,
@@ -1373,6 +1461,21 @@ struct RunPiperArgs {
     length_scale: Option<f32>,
     noise_w: Option<f32>,
     speaker_id: Option<usize>,
+    seed: u64,
+}
+
+struct RunBarkArgs {
+    model_dir: Option<PathBuf>,
+    model_id: String,
+    revision: String,
+    download: bool,
+    text: Option<String>,
+    voice_preset: Option<String>,
+    out: Option<PathBuf>,
+    print_config: bool,
+    print_tokens: bool,
+    backend: BarkBackendArg,
+    python: String,
     seed: u64,
 }
 
@@ -2043,6 +2146,223 @@ fn run_piper(args: RunPiperArgs) -> Result<()> {
     );
     Ok(())
 }
+
+fn run_bark(args: RunBarkArgs) -> Result<()> {
+    let model_dir = args.model_dir.unwrap_or_else(default_bark_dir);
+    let needs_weights = args.out.is_some();
+    let paths = if needs_weights {
+        prepare_bark_assets(&args.model_id, &args.revision, &model_dir, args.download)?
+    } else {
+        prepare_bark_metadata_assets(&args.model_id, &args.revision, &model_dir, args.download)?
+    };
+    let config = load_bark_config(&paths.config)?;
+    let generation_config = load_bark_generation_config(&paths.generation_config)?;
+
+    if args.print_config {
+        println!("model_dir\t{}", paths.model_dir.display());
+        println!("model_id\t{}@{}", args.model_id, args.revision);
+        println!("sample_rate\t{}", generation_config.sample_rate);
+        println!("codec_sample_rate\t{}", config.codec_config.sampling_rate);
+        println!("codebook_size\t{}", generation_config.codebook_size);
+        println!(
+            "semantic\tlayers={} heads={} hidden={} input_vocab={} output_vocab={} max_new_tokens={}",
+            config.semantic_config.num_layers,
+            config.semantic_config.num_heads,
+            config.semantic_config.hidden_size,
+            config.semantic_config.input_vocab_size,
+            config.semantic_config.output_vocab_size,
+            generation_config.semantic_config.max_new_tokens
+        );
+        println!(
+            "coarse\tlayers={} heads={} hidden={} codebooks={} rate_hz={}",
+            config.coarse_acoustics_config.num_layers,
+            config.coarse_acoustics_config.num_heads,
+            config.coarse_acoustics_config.hidden_size,
+            generation_config.coarse_acoustics_config.n_coarse_codebooks,
+            generation_config.coarse_acoustics_config.coarse_rate_hz
+        );
+        println!(
+            "fine\tlayers={} heads={} hidden={} codebooks={}",
+            config.fine_acoustics_config.base.num_layers,
+            config.fine_acoustics_config.base.num_heads,
+            config.fine_acoustics_config.base.hidden_size,
+            generation_config.fine_acoustics_config.n_fine_codebooks
+        );
+    }
+
+    if args.print_tokens {
+        let text = args
+            .text
+            .as_deref()
+            .ok_or("--print-tokens requires --text")?;
+        let tokenizer = BarkTokenizer::from_vocab_file(
+            &paths.vocab,
+            generation_config.semantic_config.max_input_semantic_length,
+        )?;
+        let encoding = tokenizer.encode(text)?;
+        let semantic_ids = tokenizer.encode_for_semantic_model(
+            text,
+            generation_config.semantic_config.text_encoding_offset,
+        )?;
+        println!("vocab_size\t{}", tokenizer.vocab_len());
+        println!("tokens\t{}", encoding.tokens.join(" "));
+        println!(
+            "token_ids\t{}",
+            encoding
+                .ids
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!(
+            "semantic_input_ids\t{}",
+            semantic_ids
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    if let Some(out) = args.out {
+        let text = args.text.as_deref().ok_or("--out requires --text")?;
+        match args.backend {
+            BarkBackendArg::PythonTransformers => run_bark_python_transformers(
+                &args.python,
+                &paths.model_dir,
+                text,
+                args.voice_preset.as_deref(),
+                &out,
+                args.seed,
+            )?,
+        }
+    } else if !args.print_config && !args.print_tokens {
+        println!(
+            "Bark assets are ready in {}. Pass --text with --print-tokens to inspect inputs or --out to synthesize through python-transformers.",
+            paths.model_dir.display()
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct BarkPythonMetadata {
+    sample_rate: usize,
+    sample_count: usize,
+}
+
+fn run_bark_python_transformers(
+    python: &str,
+    model_dir: &Path,
+    text: &str,
+    voice_preset: Option<&str>,
+    out: &Path,
+    seed: u64,
+) -> Result<()> {
+    if text.trim().is_empty() {
+        return Err("--text must not be empty".into());
+    }
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let raw_path = temporary_sidecar_path(out, "f32");
+    let meta_path = temporary_sidecar_path(out, "json");
+    let start = Instant::now();
+    let status = ProcessCommand::new(python)
+        .arg("-c")
+        .arg(BARK_PYTHON_TRANSFORMERS_SCRIPT)
+        .arg(model_dir)
+        .arg(text)
+        .arg(voice_preset.unwrap_or(""))
+        .arg(&raw_path)
+        .arg(&meta_path)
+        .arg(seed.to_string())
+        .status();
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => {
+            remove_file_if_present(&raw_path)?;
+            remove_file_if_present(&meta_path)?;
+            return Err(format!("failed to start {python}: {err}").into());
+        }
+    };
+    if !status.success() {
+        remove_file_if_present(&raw_path)?;
+        remove_file_if_present(&meta_path)?;
+        return Err(format!(
+            "Bark python-transformers backend failed with status {status}; install transformers, torch, and numpy for this backend"
+        )
+        .into());
+    }
+
+    let metadata: BarkPythonMetadata = serde_json::from_str(&fs::read_to_string(&meta_path)?)?;
+    let raw = fs::read(&raw_path)?;
+    remove_file_if_present(&raw_path)?;
+    remove_file_if_present(&meta_path)?;
+    if raw.len() != metadata.sample_count * std::mem::size_of::<f32>() {
+        return Err(format!(
+            "Bark backend wrote {} bytes, expected {} for {} f32 samples",
+            raw.len(),
+            metadata.sample_count * std::mem::size_of::<f32>(),
+            metadata.sample_count
+        )
+        .into());
+    }
+    let samples = raw
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    if samples.is_empty() || samples.iter().any(|sample| !sample.is_finite()) {
+        return Err("Bark backend produced empty or non-finite audio".into());
+    }
+
+    let audio = SharedPcmAudio {
+        path: out.to_path_buf(),
+        sample_rate: metadata.sample_rate,
+        channels: 1,
+        samples,
+    };
+    write_wav_pcm16(out, &audio)?;
+    eprintln!(
+        "wrote {} ({:.3}s audio from Bark python-transformers backend, seed {} in {})",
+        out.display(),
+        audio.duration_seconds(),
+        seed,
+        format_duration(start.elapsed())
+    );
+    Ok(())
+}
+
+const BARK_PYTHON_TRANSFORMERS_SCRIPT: &str = r#"
+import json
+import sys
+
+model_dir, text, voice_preset, raw_path, meta_path, seed_text = sys.argv[1:7]
+seed = int(seed_text)
+
+import numpy as np
+import torch
+from transformers import AutoModelForTextToWaveform, AutoProcessor
+
+torch.manual_seed(seed)
+processor = AutoProcessor.from_pretrained(model_dir)
+model = AutoModelForTextToWaveform.from_pretrained(model_dir)
+kwargs = {"voice_preset": voice_preset} if voice_preset else {}
+inputs = processor(text, **kwargs)
+inputs = {key: value.to(model.device) if hasattr(value, "to") else value for key, value in inputs.items()}
+with torch.no_grad():
+    audio = model.generate(**inputs)
+samples = audio.detach().cpu().numpy().reshape(-1).astype("<f4", copy=False)
+samples.tofile(raw_path)
+sample_rate = int(getattr(model.generation_config, "sample_rate", 24000))
+with open(meta_path, "w", encoding="utf-8") as handle:
+    json.dump({"sample_rate": sample_rate, "sample_count": int(samples.size)}, handle)
+"#;
 
 fn synthesize_text_with_platform_tts(text: &str, out: &Path) -> Result<()> {
     if text.trim().is_empty() {

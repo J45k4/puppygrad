@@ -16,6 +16,7 @@ Implemented:
 | Whisper | Working MVP | Rust reference | Prepares Hugging Face Whisper assets, loads typed model/preprocessor/tokenizer/weight metadata, decodes PCM WAV input, computes log-mel features, and runs greedy `tiny.en`/`tiny` transcription. |
 | ResNet | Working MVP | Rust reference | Loads torchvision-origin ResNet-18 safetensors, folds Conv+BatchNorm at load time, preprocesses RGB images or camera frames, and prints ImageNet top-k classes. |
 | Piper/VITS | In progress | Rust reference pieces | Piper parses voice configs and maps text-mode phonemes to ids; VITS owns architecture-oriented 1D CPU kernels and debug WAV synthesis. Full VITS checkpoint inference is not complete yet. |
+| Bark | Working external backend | Python Transformers bridge plus Rust metadata/tokenizer support | Prepares `suno/bark-small` assets, parses Bark config/generation metadata, tokenizes text through a local WordPiece path, and writes WAV output through the shared audio module when the Python Transformers backend is available. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -47,6 +48,38 @@ For text-mode Piper voices, text can be mapped through the config's codepoint ph
 ```
 
 Known limitations: output is a diagnostic waveform, not real speech; eSpeak phonemization is intentionally behind a separate boundary and not linked yet; ONNX Runtime parity and real voice synthesis remain TODO items. Review each voice's license before adding or redistributing assets.
+
+### Bark runtime status
+
+The `bark` command supports Hugging Face Bark model asset preparation and metadata inspection. The native Bark transformer and EnCodec runtime is not implemented yet; WAV generation currently uses the `python-transformers` backend, which requires Python packages `transformers`, `torch`, and `numpy`.
+
+Download the small metadata files and inspect the resolved architecture without downloading the large PyTorch weight file:
+
+```bash
+./target/release/puppygrad bark \
+  --download \
+  --print-config
+```
+
+Inspect text tokenization and the semantic-model input ids:
+
+```bash
+./target/release/puppygrad bark \
+  --download \
+  --text "hello from puppygrad" \
+  --print-tokens
+```
+
+Generate a WAV through the external Transformers backend:
+
+```bash
+./target/release/puppygrad bark \
+  --download \
+  --text "hello from puppygrad" \
+  --out /tmp/bark.wav
+```
+
+Known limitations: model execution is delegated to Python/Transformers, Bark weights are currently the Hugging Face `pytorch_model.bin` file rather than native Rust tensors, and voice presets require the corresponding speaker embedding assets to be available to the external backend.
 
 ### ResNet native runtime status
 

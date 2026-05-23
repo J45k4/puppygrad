@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod autoregressive;
 pub mod autotune;
+pub mod bark;
 pub mod config;
 pub mod cpu;
 pub mod generation;
