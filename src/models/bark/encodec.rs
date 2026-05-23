@@ -206,9 +206,8 @@ pub fn acoustic_codes_to_quantized_latents(
                 )));
             }
             let embedding_start = (codebook * codebook_size + code) * codebook_dim;
-            let frame_start = frame * codebook_dim;
             for dim in 0..codebook_dim {
-                values[frame_start + dim] += codebook_embeddings[embedding_start + dim];
+                values[dim * frames + frame] += codebook_embeddings[embedding_start + dim];
             }
         }
     }
@@ -609,7 +608,7 @@ mod tests {
 
     #[test]
     fn sums_codebook_embeddings_per_frame() -> Result<()> {
-        let codes = vec![vec![0, 1], vec![1, 0]];
+        let codes = vec![vec![0, 1, 0], vec![1, 0, 1]];
         let embeddings = vec![
             1.0, 0.0, // codebook 0 code 0
             0.0, 1.0, // codebook 0 code 1
@@ -619,9 +618,9 @@ mod tests {
 
         let latents = acoustic_codes_to_quantized_latents(&codes, &embeddings, 2, 2)?;
 
-        assert_eq!(latents.frames, 2);
+        assert_eq!(latents.frames, 3);
         assert_eq!(latents.codebook_dim, 2);
-        assert_eq!(latents.values, vec![1.0, 2.0, 2.0, 1.0]);
+        assert_eq!(latents.values, vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
         Ok(())
     }
 

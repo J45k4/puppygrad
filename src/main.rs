@@ -2315,6 +2315,17 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
                     &generation_config,
                 );
                 apply_bark_cli_generation_options(&mut options, &args);
+                if args.max_semantic_tokens.is_none() && !args.greedy {
+                    let cap = bark_rust_default_semantic_token_cap(
+                        text,
+                        generation_config.semantic_config.max_new_tokens,
+                    );
+                    options.max_semantic_tokens = Some(cap);
+                    eprintln!(
+                        "bark: native semantic cap {} token(s); pass --max-semantic-tokens to override",
+                        cap
+                    );
+                }
                 eprintln!(
                     "bark: starting Rust generation with {} thread(s), seed {}, model {}",
                     options.threads,
@@ -2357,11 +2368,25 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
                     },
                 )?;
                 eprintln!("bark: write WAV {}...", out.display());
+                let mut samples = trace.audio.samples;
+                if let Some(conditioning) =
+                    condition_bark_rust_cli_samples(&mut samples, trace.audio.sample_rate)
+                {
+                    eprintln!(
+                        "bark: conditioned native output{} with gain {:.3}",
+                        if conditioning.low_pass_hz.is_some() {
+                            " using low-pass"
+                        } else {
+                            ""
+                        },
+                        conditioning.gain
+                    );
+                }
                 let audio = SharedPcmAudio {
                     path: out.clone(),
                     sample_rate: trace.audio.sample_rate,
                     channels: 1,
-                    samples: trace.audio.samples,
+                    samples,
                 };
                 write_wav_pcm16(&out, &audio)?;
                 eprintln!(
@@ -2454,6 +2479,112 @@ fn apply_bark_cli_generation_options(options: &mut BarkRuntimeOptions, args: &Ru
     }
     if let Some(threads) = args.threads {
         options.threads = threads;
+    }
+}
+
+fn bark_rust_default_semantic_token_cap(text: &str, model_max_new_tokens: usize) -> usize {
+    let chars = text.chars().count();
+    let floor = 96.min(model_max_new_tokens);
+    let estimated = chars.saturating_mul(9).clamp(floor, model_max_new_tokens);
+    estimated.min(model_max_new_tokens)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarkOutputConditioning {
+    gain: f32,
+    low_pass_hz: Option<f32>,
+}
+
+fn condition_bark_rust_cli_samples(
+    samples: &mut [f32],
+    sample_rate: usize,
+) -> Option<BarkOutputConditioning> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut peak = 0.0f32;
+    let mut square_sum = 0.0f64;
+    let mut zero_crossings = 0usize;
+    let mut previous = None;
+    for sample in samples.iter().copied() {
+        if !sample.is_finite() {
+            return None;
+        }
+        if let Some(previous) = previous {
+            if (previous < 0.0) != (sample < 0.0) {
+                zero_crossings += 1;
+            }
+        }
+        previous = Some(sample);
+        peak = peak.max(sample.abs());
+        square_sum += f64::from(sample * sample);
+    }
+    if peak == 0.0 {
+        return None;
+    }
+    let rms = (square_sum / samples.len() as f64).sqrt() as f32;
+    let zero_crossing_rate = if sample_rate == 0 {
+        0.0
+    } else {
+        zero_crossings as f32 * sample_rate as f32 / samples.len() as f32
+    };
+    let should_low_pass =
+        sample_rate > 0 && ((zero_crossing_rate > 3_000.0 && rms > 0.04) || rms > 0.09);
+    if should_low_pass {
+        low_pass_biquad_in_place(samples, sample_rate, 4_500.0);
+        peak = 0.0;
+        square_sum = 0.0;
+        for sample in samples.iter().copied() {
+            peak = peak.max(sample.abs());
+            square_sum += f64::from(sample * sample);
+        }
+    }
+    let rms = (square_sum / samples.len() as f64).sqrt() as f32;
+    if peak <= 0.95 && rms <= 0.09 && !should_low_pass {
+        return None;
+    }
+    let peak_gain = 0.95 / peak;
+    let rms_gain = if rms > 0.0 { 0.06 / rms } else { 1.0 };
+    let gain = peak_gain.min(rms_gain).min(1.0);
+    if gain >= 0.999 && !should_low_pass {
+        return None;
+    }
+    if gain < 0.999 {
+        for sample in samples {
+            *sample *= gain;
+        }
+    }
+    Some(BarkOutputConditioning {
+        gain,
+        low_pass_hz: should_low_pass.then_some(4_500.0),
+    })
+}
+
+fn low_pass_biquad_in_place(samples: &mut [f32], sample_rate: usize, cutoff_hz: f32) {
+    if sample_rate == 0 || samples.is_empty() {
+        return;
+    }
+    let cutoff = cutoff_hz.min(sample_rate as f32 * 0.45).max(10.0);
+    let q = std::f32::consts::FRAC_1_SQRT_2;
+    let omega = std::f32::consts::TAU * cutoff / sample_rate as f32;
+    let cos_omega = omega.cos();
+    let sin_omega = omega.sin();
+    let alpha = sin_omega / (2.0 * q);
+    let a0 = 1.0 + alpha;
+    let b0 = (1.0 - cos_omega) * 0.5 / a0;
+    let b1 = (1.0 - cos_omega) / a0;
+    let b2 = b0;
+    let a1 = -2.0 * cos_omega / a0;
+    let a2 = (1.0 - alpha) / a0;
+    let (mut x1, mut x2, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0);
+    for sample in samples {
+        let x0 = *sample;
+        let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        *sample = y0;
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
     }
 }
 
@@ -5897,4 +6028,47 @@ fn mse(x: &Tensor, y: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
     let pred = x.mul(w)?.add(b)?;
     let diff = pred.sub(y)?;
     Ok(diff.mul(&diff)?.mean()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bark_semantic_cap_scales_short_prompts_below_model_limit() {
+        assert_eq!(
+            bark_rust_default_semantic_token_cap("hello hello i am cute puppy", 768),
+            243
+        );
+        assert_eq!(bark_rust_default_semantic_token_cap("hi", 768), 96);
+        assert_eq!(bark_rust_default_semantic_token_cap("hello", 8), 8);
+    }
+
+    #[test]
+    fn bark_output_conditioner_leaves_quiet_audio_unchanged() {
+        let mut samples = vec![0.01, -0.01, 0.02, -0.02];
+
+        let conditioning = condition_bark_rust_cli_samples(&mut samples, 24_000);
+
+        assert_eq!(conditioning, None);
+        assert_eq!(samples, vec![0.01, -0.01, 0.02, -0.02]);
+    }
+
+    #[test]
+    fn bark_output_conditioner_filters_and_limits_hot_audio() {
+        let mut samples = (0usize..256)
+            .map(|idx| if idx.is_multiple_of(2) { 0.8 } else { -0.8 })
+            .collect::<Vec<_>>();
+
+        let conditioning = condition_bark_rust_cli_samples(&mut samples, 24_000).unwrap();
+
+        assert_eq!(conditioning.low_pass_hz, Some(4_500.0));
+        assert!(conditioning.gain <= 1.0);
+        let peak = samples.iter().copied().map(f32::abs).fold(0.0, f32::max);
+        let rms = (samples.iter().map(|sample| sample * sample).sum::<f32>()
+            / samples.len() as f32)
+            .sqrt();
+        assert!(peak <= 0.95);
+        assert!(rms <= 0.061);
+    }
 }

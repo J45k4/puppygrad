@@ -25,11 +25,15 @@ pub fn build_coarse_input(
             "semantic token is outside semantic vocabulary".to_string(),
         ));
     }
-    let mut semantic_tokens = semantic_tokens.to_vec();
-    semantic_tokens.truncate(coarse.max_coarse_input_length);
+    let semantic_tokens = semantic_tokens.to_vec();
 
     let mut model_input_ids = Vec::with_capacity(coarse.max_coarse_input_length + 1);
-    model_input_ids.extend_from_slice(&semantic_tokens);
+    model_input_ids.extend(
+        semantic_tokens
+            .iter()
+            .copied()
+            .take(coarse.max_coarse_input_length),
+    );
     model_input_ids.resize(
         coarse.max_coarse_input_length,
         coarse.coarse_semantic_pad_token,
@@ -373,6 +377,17 @@ mod tests {
 
         assert_eq!(input.semantic_tokens, vec![1, 2]);
         assert_eq!(input.model_input_ids, vec![1, 2, 99, 99, 77]);
+        Ok(())
+    }
+
+    #[test]
+    fn coarse_input_keeps_full_semantic_sequence_for_output_length() -> Result<()> {
+        let config = generation_config();
+
+        let input = build_coarse_input(&[1, 2, 3, 4, 5, 6], &config)?;
+
+        assert_eq!(input.semantic_tokens, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(input.model_input_ids, vec![1, 2, 3, 4, 77]);
         Ok(())
     }
 

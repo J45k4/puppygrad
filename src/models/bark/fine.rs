@@ -209,16 +209,8 @@ pub fn generate_fine_codes_with_history_and_progress(
     let given = coarse_codes.len();
     let history_frames = prepend_fine_history(&mut matrix, history_prompt, fine)?;
     let mut sampler = LogitsSampler::new(options.seed);
-    let sampler_config = TextGenerationConfig {
-        max_new_tokens: matrix.frames() * (fine.n_fine_codebooks - given),
-        eos_token_id: None,
-        temperature: options.fine_sampling.temperature,
-        top_p: options.fine_sampling.top_p,
-        top_k: options.fine_sampling.top_k,
-        seed: options.seed,
-        repeat_penalty: 1.0,
-        repeat_last_n: 0,
-    };
+    let sampler_config =
+        fine_sampler_config(matrix.frames() * (fine.n_fine_codebooks - given), options);
     sampler_config
         .validate()
         .map_err(|err| BarkError::InvalidInput(err.to_string()))?;
@@ -296,6 +288,24 @@ pub fn generate_fine_codes_with_history_and_progress(
         }
     }
     Ok(matrix)
+}
+
+fn fine_sampler_config(
+    max_new_tokens: usize,
+    options: &BarkRuntimeOptions,
+) -> TextGenerationConfig {
+    TextGenerationConfig {
+        max_new_tokens,
+        eos_token_id: None,
+        temperature: options.fine_sampling.temperature,
+        // Hugging Face Bark's fine-acoustics generate path only uses
+        // temperature from GenerationConfig; top-k/top-p are ignored there.
+        top_p: None,
+        top_k: None,
+        seed: options.seed,
+        repeat_penalty: 1.0,
+        repeat_last_n: 0,
+    }
 }
 
 fn prepend_fine_history(
@@ -427,6 +437,7 @@ pub fn mask_fine_logits(logits: &mut [f32], codebook_size: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::bark::{BarkCoarseGenerationConfig, BarkSemanticGenerationConfig};
 
     #[test]
     fn fine_matrix_keeps_coarse_rows_and_pads_remaining_codebooks() -> Result<()> {
@@ -470,6 +481,23 @@ mod tests {
         assert_eq!(logits[..3], [0.0, 0.0, 0.0]);
         assert_eq!(logits[3], f32::NEG_INFINITY);
         assert_eq!(logits[4], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn fine_sampler_config_ignores_top_k_and_top_p_like_transformers() {
+        let generation_config = generation_config();
+        let mut options =
+            BarkRuntimeOptions::from_generation_config("hello", None, 7, &generation_config);
+        options.fine_sampling.temperature = 0.5;
+        options.fine_sampling.top_k = Some(1);
+        options.fine_sampling.top_p = Some(0.01);
+
+        let sampler = fine_sampler_config(12, &options);
+
+        assert_eq!(sampler.max_new_tokens, 12);
+        assert_eq!(sampler.temperature, 0.5);
+        assert_eq!(sampler.top_k, None);
+        assert_eq!(sampler.top_p, None);
     }
 
     #[test]
@@ -536,5 +564,47 @@ mod tests {
         assert_eq!(fine_generation_loop_count(2, 4, 8), 1);
         assert_eq!(fine_generation_loop_count(10, 4, 8), 2);
         assert_eq!(fine_generation_loop_count(17, 4, 8), 4);
+    }
+
+    fn generation_config() -> BarkGenerationConfig {
+        BarkGenerationConfig {
+            sample_rate: 24_000,
+            codebook_size: 1024,
+            semantic_config: BarkSemanticGenerationConfig {
+                eos_token_id: 10_000,
+                max_input_semantic_length: 256,
+                max_new_tokens: 768,
+                semantic_infer_token: 129_599,
+                semantic_pad_token: 10_000,
+                semantic_rate_hz: 49.9,
+                semantic_vocab_size: 10_000,
+                text_encoding_offset: 10_048,
+                text_pad_token: 129_595,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 1.0,
+            },
+            coarse_acoustics_config: BarkCoarseGenerationConfig {
+                coarse_infer_token: 12_050,
+                coarse_rate_hz: 75,
+                coarse_semantic_pad_token: 12_048,
+                max_coarse_history: 630,
+                max_coarse_input_length: 256,
+                n_coarse_codebooks: 2,
+                sliding_window_len: 60,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 1.0,
+            },
+            fine_acoustics_config: BarkFineGenerationConfig {
+                max_fine_history_length: 512,
+                max_fine_input_length: 1024,
+                n_fine_codebooks: 8,
+                temperature: 0.5,
+                top_k: 50,
+                top_p: 1.0,
+            },
+            model_type: Some("bark".to_string()),
+        }
     }
 }

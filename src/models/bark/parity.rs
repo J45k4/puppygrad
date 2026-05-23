@@ -126,6 +126,15 @@ struct BarkReferenceDecoder {
     first_samples: Vec<f32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct LocalPythonFineCodes {
+    fine_codes: Vec<Vec<usize>>,
+    audio_samples: usize,
+    audio_min: f32,
+    audio_max: f32,
+    audio_rms: f32,
+}
+
 fn fixture_paths() -> Vec<PathBuf> {
     let dir = Path::new(FIXTURE_DIR);
     let Ok(entries) = fs::read_dir(dir) else {
@@ -670,6 +679,42 @@ fn encodec_decode_reference_fixtures_match_when_available() -> Result<()> {
             fixture.fine.generated_codebooks[0].len()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn local_python_fine_codes_decode_match_when_available() -> Result<()> {
+    let path = Path::new("workdir/python-fine-codes.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    let text = fs::read_to_string(path).map_err(|err| {
+        super::BarkError::Asset(format!("failed to read {}: {err}", path.display()))
+    })?;
+    let fixture: LocalPythonFineCodes = serde_json::from_str(&text).map_err(|err| {
+        super::BarkError::Asset(format!("failed to parse {}: {err}", path.display()))
+    })?;
+    let paths = BarkAssetPaths::new("models/bark-small");
+    if !paths.native_weights.exists() || !paths.config.exists() {
+        return Ok(());
+    }
+    let config = load_bark_config(&paths.config)?;
+    let weights = load_bark_encodec_decoder_weights(&paths, &config.codec_config)?;
+    let samples = decode_encodec_audio(&fixture.fine_codes, &config.codec_config, &weights)?;
+    let (min, max, _mean, rms) = waveform_stats(&samples);
+
+    eprintln!(
+        "local Python fine decode stats: len={} min={min:.6} max={max:.6} rms={rms:.6}; reference len={} min={:.6} max={:.6} rms={:.6}",
+        samples.len(),
+        fixture.audio_samples,
+        fixture.audio_min,
+        fixture.audio_max,
+        fixture.audio_rms
+    );
+    assert_eq!(samples.len(), fixture.audio_samples);
+    assert_close(min, fixture.audio_min, "local Python fine waveform min");
+    assert_close(max, fixture.audio_max, "local Python fine waveform max");
+    assert_close(rms, fixture.audio_rms, "local Python fine waveform rms");
     Ok(())
 }
 
