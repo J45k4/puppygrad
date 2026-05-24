@@ -90,11 +90,10 @@ pub fn vae_resnet_block(
         eps,
     )?;
     let hidden = vae_conv2d(&hidden, &weights.conv2)?;
-    let residual = match &weights.shortcut {
-        Some(shortcut) => vae_conv2d(input, shortcut)?,
-        None => input.clone(),
-    };
-    residual.add(&hidden)
+    match &weights.shortcut {
+        Some(shortcut) => vae_conv2d(input, shortcut)?.add(&hidden),
+        None => input.add(&hidden),
+    }
 }
 
 pub fn vae_attention_block(
