@@ -1,5 +1,5 @@
 use super::{
-    concat_tensors, conv2d_nchw, group_norm_nchw, layer_norm_last_dim, matmul2d,
+    concat_tensors, conv2d_nchw, group_norm_nchw, layer_norm_last_dim, linear2d,
     scaled_dot_product_attention, upsample_nearest2d_nchw, Conv2dOptions, Result, SdTensor,
     StableDiffusionError,
 };
@@ -183,17 +183,13 @@ pub fn unet_linear(input: &SdTensor, weights: &UnetLinearWeights) -> Result<SdTe
             weights.bias.len()
         )));
     }
-    let weight = SdTensor::new(
-        [weights.in_features, weights.out_features],
-        weights.weight.clone(),
-    )?;
-    let mut out = matmul2d(input, &weight)?;
-    for row in out.data_mut().chunks_exact_mut(weights.out_features) {
-        for (value, bias) in row.iter_mut().zip(weights.bias.iter()) {
-            *value += *bias;
-        }
-    }
-    Ok(out)
+    linear2d(
+        input,
+        &weights.weight,
+        Some(&weights.bias),
+        weights.in_features,
+        weights.out_features,
+    )
 }
 
 pub fn unet_resnet_block(

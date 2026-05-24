@@ -1140,6 +1140,95 @@ pub fn matmul2d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
     matmul2d_impl(left, right, true)
 }
 
+pub fn linear2d(
+    input: &SdTensor,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_features: usize,
+    out_features: usize,
+) -> Result<SdTensor> {
+    linear2d_impl(input, weight, bias, in_features, out_features, true)
+}
+
+fn linear2d_impl(
+    input: &SdTensor,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_features: usize,
+    out_features: usize,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
+    if input.rank() != 2 || input.shape[1] != in_features {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "linear2d expected input [rows, {in_features}], got {:?}",
+            input.shape
+        )));
+    }
+    if weight.len() != in_features * out_features {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "linear2d weight expected {} values, got {}",
+            in_features * out_features,
+            weight.len()
+        )));
+    }
+    if let Some(bias) = bias {
+        if bias.len() != out_features {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "linear2d bias expected {out_features} values, got {}",
+                bias.len()
+            )));
+        }
+    }
+
+    let rows = input.shape[0];
+    let mut out = vec![0.0; rows * out_features];
+    let estimated_mul_adds = rows
+        .saturating_mul(out_features)
+        .saturating_mul(in_features);
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(rows);
+
+    if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_MATMUL_THRESHOLD {
+        let rows_per_chunk = rows.div_ceil(workers);
+        let values_per_chunk = rows_per_chunk * out_features;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let first_row = chunk_index * rows_per_chunk;
+                scope.spawn(move || {
+                    for (local_row, out_row) in out_chunk.chunks_mut(out_features).enumerate() {
+                        let row = first_row + local_row;
+                        fill_linear2d_row(
+                            &input.data,
+                            weight,
+                            bias,
+                            row,
+                            in_features,
+                            out_features,
+                            out_row,
+                        );
+                    }
+                });
+            }
+        });
+    } else {
+        for row in 0..rows {
+            let out_start = row * out_features;
+            fill_linear2d_row(
+                &input.data,
+                weight,
+                bias,
+                row,
+                in_features,
+                out_features,
+                &mut out[out_start..out_start + out_features],
+            );
+        }
+    }
+    SdTensor::new([rows, out_features], out)
+}
+
 fn matmul2d_impl(left: &SdTensor, right: &SdTensor, allow_parallel: bool) -> Result<SdTensor> {
     if left.rank() != 2 || right.rank() != 2 {
         return Err(StableDiffusionError::InvalidInput(format!(
@@ -1279,6 +1368,24 @@ fn fill_matmul2d_row(
         let mut sum = 0.0;
         for k in 0..inner {
             sum += left[row * inner + k] * right[k * cols + col];
+        }
+        out[col] = sum;
+    }
+}
+
+fn fill_linear2d_row(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    row: usize,
+    in_features: usize,
+    out_features: usize,
+    out: &mut [f32],
+) {
+    for col in 0..out_features {
+        let mut sum = bias.map_or(0.0, |bias| bias[col]);
+        for k in 0..in_features {
+            sum += input[row * in_features + k] * weight[k * out_features + col];
         }
         out[col] = sum;
     }
@@ -2296,6 +2403,71 @@ mod tests {
             serial_elapsed.as_secs_f64(),
             parallel_elapsed.as_secs_f64(),
             serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn linear2d_matches_matmul_plus_bias() {
+        let input =
+            SdTensor::new([3, 4], (0..12).map(|index| index as f32 / 7.0).collect()).unwrap();
+        let weight = (0..20)
+            .map(|index| ((index % 9) as f32 - 4.0) / 5.0)
+            .collect::<Vec<_>>();
+        let bias = (0..5)
+            .map(|index| (index as f32 - 2.0) / 11.0)
+            .collect::<Vec<_>>();
+        let weight_tensor = SdTensor::new([4, 5], weight.clone()).unwrap();
+
+        let mut expected = matmul2d(&input, &weight_tensor).unwrap();
+        for row in expected.data_mut().chunks_exact_mut(5) {
+            for (value, bias) in row.iter_mut().zip(bias.iter()) {
+                *value += *bias;
+            }
+        }
+        let actual = linear2d(&input, &weight, Some(&bias), 4, 5).unwrap();
+
+        assert_eq!(actual.shape(), expected.shape());
+        assert_close(actual.data(), expected.data(), 1e-6);
+    }
+
+    #[test]
+    #[ignore]
+    fn linear2d_avoids_weight_clone_benchmark_smoke() {
+        let input = SdTensor::new(
+            [4096, 320],
+            (0..4096 * 320)
+                .map(|index| ((index % 43) as f32 - 21.0) / 41.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = (0..320 * 1280)
+            .map(|index| ((index % 37) as f32 - 18.0) / 31.0)
+            .collect::<Vec<_>>();
+        let bias = (0..1280)
+            .map(|index| ((index % 17) as f32 - 8.0) / 23.0)
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let weight_tensor = SdTensor::new([320, 1280], weight.clone()).unwrap();
+        let mut cloned = matmul2d(&input, &weight_tensor).unwrap();
+        for row in cloned.data_mut().chunks_exact_mut(1280) {
+            for (value, bias) in row.iter_mut().zip(bias.iter()) {
+                *value += *bias;
+            }
+        }
+        let cloned_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let direct = linear2d(&input, &weight, Some(&bias), 320, 1280).unwrap();
+        let direct_elapsed = started.elapsed();
+
+        assert_eq!(direct.shape(), cloned.shape());
+        assert_close(direct.data(), cloned.data(), 1e-4);
+        eprintln!(
+            "linear2d benchmark: cloned={:.3}s direct={:.3}s speedup={:.2}x",
+            cloned_elapsed.as_secs_f64(),
+            direct_elapsed.as_secs_f64(),
+            cloned_elapsed.as_secs_f64() / direct_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 

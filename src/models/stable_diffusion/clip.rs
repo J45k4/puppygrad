@@ -6,7 +6,7 @@ use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::Tokenizer;
 
 use super::{
-    layer_norm_last_dim, matmul2d, scaled_dot_product_attention, ClipTextConfig, ClipTextWeights,
+    layer_norm_last_dim, linear2d, scaled_dot_product_attention, ClipTextConfig, ClipTextWeights,
     Result, SdTensor, StableDiffusionError,
 };
 
@@ -339,14 +339,7 @@ fn dense(input: &SdTensor, weight: &[f32], bias: &[f32], out_features: usize) ->
         )));
     }
 
-    let weight = SdTensor::new([in_features, out_features], weight.to_vec())?;
-    let mut out = matmul2d(input, &weight)?;
-    for row in out.data_mut().chunks_exact_mut(out_features) {
-        for (value, bias) in row.iter_mut().zip(bias.iter()) {
-            *value += *bias;
-        }
-    }
-    Ok(out)
+    linear2d(input, weight, Some(bias), in_features, out_features)
 }
 
 fn clip_activation(input: &SdTensor, hidden_act: &str) -> Result<SdTensor> {

@@ -51,8 +51,8 @@ pub use runtime::{
 pub use scheduler::DdimScheduler;
 pub use tensor::{
     batched_matmul3d, broadcast_binary, broadcast_shape, channel_affine_nchw, concat_tensors,
-    conv2d_nchw, downsample_nearest2d_nchw, group_norm_nchw, layer_norm_last_dim, matmul2d,
-    scaled_dot_product_attention, softmax_last_dim, split_tensor, tensor_stats,
+    conv2d_nchw, downsample_nearest2d_nchw, group_norm_nchw, layer_norm_last_dim, linear2d,
+    matmul2d, scaled_dot_product_attention, softmax_last_dim, split_tensor, tensor_stats,
     upsample_nearest2d_nchw, Conv2dOptions, SdTensor, TensorStats,
 };
 pub use unet::{
