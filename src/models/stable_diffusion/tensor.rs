@@ -1191,6 +1191,7 @@ fn scaled_dot_product_attention_impl(
                 let key_data = &key.data;
                 let value_data = &value.data;
                 scope.spawn(move || {
+                    let mut scores = vec![0.0; key_len];
                     for (local_query_row, out_row) in out_chunk.chunks_mut(value_dim).enumerate() {
                         let query_row = first_query_row + local_query_row;
                         let b = query_row / (heads * query_len);
@@ -1212,6 +1213,7 @@ fn scaled_dot_product_attention_impl(
                             dim,
                             value_dim,
                             scale,
+                            &mut scores,
                             out_row,
                         );
                     }
@@ -1219,6 +1221,7 @@ fn scaled_dot_product_attention_impl(
             }
         });
     } else {
+        let mut scores = vec![0.0; key_len];
         for b in 0..batch {
             for h in 0..heads {
                 for q in 0..query_len {
@@ -1238,6 +1241,7 @@ fn scaled_dot_product_attention_impl(
                         dim,
                         value_dim,
                         scale,
+                        &mut scores,
                         &mut out[out_index..out_index + value_dim],
                     );
                 }
@@ -1263,9 +1267,9 @@ fn fill_attention_query_row(
     dim: usize,
     value_dim: usize,
     scale: f32,
+    scores: &mut [f32],
     out: &mut [f32],
 ) {
-    let mut scores = vec![0.0; key_len];
     for key_index in 0..key_len {
         let mut dot = 0.0;
         for d in 0..dim {
@@ -1283,7 +1287,7 @@ fn fill_attention_query_row(
             scores[key_index] += mask.data[mask_index];
         }
     }
-    softmax_slice_in_place(&mut scores);
+    softmax_slice_in_place(scores);
     for value_channel in 0..value_dim {
         let mut sum = 0.0;
         for (key_index, score) in scores.iter().copied().enumerate() {
@@ -2005,6 +2009,49 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn attention_score_reuse_benchmark_smoke() {
+        let query = SdTensor::new(
+            [1, 4, 512, 40],
+            (0..4 * 512 * 40)
+                .map(|index| ((index % 73) as f32 - 36.0) / 67.0)
+                .collect(),
+        )
+        .unwrap();
+        let key = SdTensor::new(
+            [1, 4, 512, 40],
+            (0..4 * 512 * 40)
+                .map(|index| ((index % 67) as f32 - 33.0) / 61.0)
+                .collect(),
+        )
+        .unwrap();
+        let value = SdTensor::new(
+            [1, 4, 512, 40],
+            (0..4 * 512 * 40)
+                .map(|index| ((index % 59) as f32 - 29.0) / 53.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let allocating = attention_allocating_reference(&query, &key, &value);
+        let allocating_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let reused = scaled_dot_product_attention_impl(&query, &key, &value, None, false).unwrap();
+        let reused_elapsed = started.elapsed();
+
+        assert_eq!(reused.shape(), allocating.shape());
+        assert_close(reused.data(), allocating.data(), 1e-5);
+        eprintln!(
+            "attention score reuse benchmark: allocating={:.3}s reused={:.3}s speedup={:.2}x",
+            allocating_elapsed.as_secs_f64(),
+            reused_elapsed.as_secs_f64(),
+            allocating_elapsed.as_secs_f64() / reused_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+
+    #[test]
+    #[ignore]
     fn attention_parallel_benchmark_smoke() {
         let query = SdTensor::new(
             [1, 8, 4096, 40],
@@ -2044,5 +2091,50 @@ mod tests {
             parallel_elapsed.as_secs_f64(),
             serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
         );
+    }
+
+    fn attention_allocating_reference(
+        query: &SdTensor,
+        key: &SdTensor,
+        value: &SdTensor,
+    ) -> SdTensor {
+        let [batch, heads, query_len, dim] = shape4(query, "attention query").unwrap();
+        let [_, _, key_len, _] = shape4(key, "attention key").unwrap();
+        let [_, _, _, value_dim] = shape4(value, "attention value").unwrap();
+        let scale = 1.0 / (dim as f32).sqrt();
+        let mut out = vec![0.0; batch * heads * query_len * value_dim];
+        for b in 0..batch {
+            for h in 0..heads {
+                for q in 0..query_len {
+                    let mut scores = vec![0.0; key_len];
+                    for key_index in 0..key_len {
+                        let mut dot = 0.0;
+                        for d in 0..dim {
+                            dot += query.data[nchw_index(b, h, q, d, heads, query_len, dim)]
+                                * key.data[nchw_index(b, h, key_index, d, heads, key_len, dim)];
+                        }
+                        scores[key_index] = dot * scale;
+                    }
+                    softmax_slice_in_place(&mut scores);
+                    for value_channel in 0..value_dim {
+                        let mut sum = 0.0;
+                        for (key_index, score) in scores.iter().copied().enumerate() {
+                            sum += score
+                                * value.data[nchw_index(
+                                    b,
+                                    h,
+                                    key_index,
+                                    value_channel,
+                                    heads,
+                                    key_len,
+                                    value_dim,
+                                )];
+                        }
+                        out[nchw_index(b, h, q, value_channel, heads, query_len, value_dim)] = sum;
+                    }
+                }
+            }
+        }
+        SdTensor::new([batch, heads, query_len, value_dim], out).unwrap()
     }
 }
