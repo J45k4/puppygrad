@@ -463,6 +463,9 @@ pub fn upsample_nearest2d_nchw(input: &SdTensor, scale: usize) -> Result<SdTenso
             "nearest upsample scale must be > 0".to_string(),
         ));
     }
+    if scale == 2 {
+        return upsample_nearest2d_scale2_nchw(input, n, c, h, w);
+    }
     let out_h = h * scale;
     let out_w = w * scale;
     let mut out = vec![0.0; n * c * out_h * out_w];
@@ -474,6 +477,40 @@ pub fn upsample_nearest2d_nchw(input: &SdTensor, scale: usize) -> Result<SdTenso
                     let dst = nchw_index(batch, channel, y, x, c, out_h, out_w);
                     out[dst] = input.data[src];
                 }
+            }
+        }
+    }
+    SdTensor::new([n, c, out_h, out_w], out)
+}
+
+fn upsample_nearest2d_scale2_nchw(
+    input: &SdTensor,
+    n: usize,
+    c: usize,
+    h: usize,
+    w: usize,
+) -> Result<SdTensor> {
+    let out_h = h * 2;
+    let out_w = w * 2;
+    let input_plane_len = h * w;
+    let output_plane_len = out_h * out_w;
+    let mut out = vec![0.0; n * c * output_plane_len];
+    for plane in 0..n * c {
+        let input_plane = &input.data[plane * input_plane_len..(plane + 1) * input_plane_len];
+        let output_plane = &mut out[plane * output_plane_len..(plane + 1) * output_plane_len];
+        for y in 0..h {
+            let input_row = &input_plane[y * w..(y + 1) * w];
+            let row0_start = (y * 2) * out_w;
+            let row1_start = row0_start + out_w;
+            let (before_row1, from_row1) = output_plane.split_at_mut(row1_start);
+            let row0 = &mut before_row1[row0_start..row0_start + out_w];
+            let row1 = &mut from_row1[..out_w];
+            for (x, value) in input_row.iter().copied().enumerate() {
+                let out_x = x * 2;
+                row0[out_x] = value;
+                row0[out_x + 1] = value;
+                row1[out_x] = value;
+                row1[out_x + 1] = value;
             }
         }
     }
@@ -1793,6 +1830,25 @@ mod tests {
         SdTensor::new(shape, data).unwrap()
     }
 
+    fn upsample_nearest2d_generic_reference(input: &SdTensor, scale: usize) -> SdTensor {
+        let [n, c, h, w] = shape4(input, "nearest upsample").unwrap();
+        let out_h = h * scale;
+        let out_w = w * scale;
+        let mut out = vec![0.0; n * c * out_h * out_w];
+        for batch in 0..n {
+            for channel in 0..c {
+                for y in 0..out_h {
+                    for x in 0..out_w {
+                        let src = nchw_index(batch, channel, y / scale, x / scale, c, h, w);
+                        let dst = nchw_index(batch, channel, y, x, c, out_h, out_w);
+                        out[dst] = input.data[src];
+                    }
+                }
+            }
+        }
+        SdTensor::new([n, c, out_h, out_w], out).unwrap()
+    }
+
     #[test]
     fn validates_shape_and_stats() {
         let tensor = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1968,6 +2024,52 @@ mod tests {
             &[1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0]
         );
         assert_eq!(downsample_nearest2d_nchw(&up, 2).unwrap(), input);
+    }
+
+    #[test]
+    fn upsample_scale2_fast_path_matches_generic_reference() {
+        let input = SdTensor::new(
+            [2, 3, 5, 4],
+            (0..2 * 3 * 5 * 4)
+                .map(|index| ((index % 17) as f32 - 8.0) / 11.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let generic = upsample_nearest2d_generic_reference(&input, 2);
+        let fast = upsample_nearest2d_nchw(&input, 2).unwrap();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-6);
+    }
+
+    #[test]
+    #[ignore]
+    fn upsample_scale2_fast_path_benchmark_smoke() {
+        let input = SdTensor::new(
+            [1, 64, 256, 256],
+            (0..64 * 256 * 256)
+                .map(|index| ((index % 37) as f32 - 18.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let generic = upsample_nearest2d_generic_reference(&input, 2);
+        let generic_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let fast = upsample_nearest2d_nchw(&input, 2).unwrap();
+        let fast_elapsed = started.elapsed();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-6);
+        eprintln!(
+            "upsample scale2 benchmark: generic={:.3}s fast={:.3}s speedup={:.2}x",
+            generic_elapsed.as_secs_f64(),
+            fast_elapsed.as_secs_f64(),
+            generic_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
     }
 
     #[test]
