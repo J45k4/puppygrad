@@ -467,6 +467,9 @@ fn conv2d_nchw_impl(
     }
     let out_h = (padded_h - kernel_h) / options.stride + 1;
     let out_w = (padded_w - kernel_w) / options.stride + 1;
+    if kernel_h == 1 && kernel_w == 1 && options.stride == 1 && options.padding == 0 {
+        return conv2d_1x1_nchw(input, weight, &bias, allow_parallel);
+    }
     let mut out = vec![0.0; n * out_channels * out_h * out_w];
 
     let output_planes = n * out_channels;
@@ -540,6 +543,99 @@ fn conv2d_nchw_impl(
         }
     }
     SdTensor::new([n, out_channels, out_h, out_w], out)
+}
+
+fn conv2d_1x1_nchw(
+    input: &SdTensor,
+    weight: &SdTensor,
+    bias: &[f32],
+    allow_parallel: bool,
+) -> Result<SdTensor> {
+    let [n, in_channels, h, w] = shape4(input, "conv2d input")?;
+    let [out_channels, _, _, _] = shape4(weight, "conv2d weight")?;
+    let spatial = h * w;
+    let output_planes = n * out_channels;
+    let mut out = vec![0.0; output_planes * spatial];
+    let estimated_mul_adds = output_planes
+        .saturating_mul(spatial)
+        .saturating_mul(in_channels);
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(output_planes);
+    const PARALLEL_CONV2D_THRESHOLD: usize = 1_000_000;
+
+    if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_CONV2D_THRESHOLD {
+        let planes_per_chunk = output_planes.div_ceil(workers);
+        let values_per_chunk = planes_per_chunk * spatial;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let input_data = &input.data;
+                let weight_data = &weight.data;
+                let first_plane = chunk_index * planes_per_chunk;
+                scope.spawn(move || {
+                    for (local_plane, out_plane) in out_chunk.chunks_mut(spatial).enumerate() {
+                        let plane = first_plane + local_plane;
+                        let batch = plane / out_channels;
+                        let out_channel = plane % out_channels;
+                        fill_conv2d_1x1_plane(
+                            input_data,
+                            weight_data,
+                            bias,
+                            batch,
+                            out_channel,
+                            in_channels,
+                            h,
+                            w,
+                            out_plane,
+                        );
+                    }
+                });
+            }
+        });
+    } else {
+        for batch in 0..n {
+            for out_channel in 0..out_channels {
+                let plane_start = (batch * out_channels + out_channel) * spatial;
+                fill_conv2d_1x1_plane(
+                    &input.data,
+                    &weight.data,
+                    bias,
+                    batch,
+                    out_channel,
+                    in_channels,
+                    h,
+                    w,
+                    &mut out[plane_start..plane_start + spatial],
+                );
+            }
+        }
+    }
+    SdTensor::new([n, out_channels, h, w], out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_conv2d_1x1_plane(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    batch: usize,
+    out_channel: usize,
+    in_channels: usize,
+    height: usize,
+    width: usize,
+    out: &mut [f32],
+) {
+    let spatial = height * width;
+    for spatial_index in 0..spatial {
+        let mut sum = bias[out_channel];
+        for in_channel in 0..in_channels {
+            let input_index = (batch * in_channels + in_channel) * spatial + spatial_index;
+            let weight_index = out_channel * in_channels + in_channel;
+            sum += input[input_index] * weight[weight_index];
+        }
+        out[spatial_index] = sum;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1278,6 +1374,44 @@ mod tests {
         }
     }
 
+    fn conv2d_generic_reference(
+        input: &SdTensor,
+        weight: &SdTensor,
+        bias: &[f32],
+        options: Conv2dOptions,
+    ) -> SdTensor {
+        let [n, in_channels, in_h, in_w] = shape4(input, "conv2d input").unwrap();
+        let [out_channels, _, kernel_h, kernel_w] = shape4(weight, "conv2d weight").unwrap();
+        let padded_h = in_h + options.padding * 2;
+        let padded_w = in_w + options.padding * 2;
+        let out_h = (padded_h - kernel_h) / options.stride + 1;
+        let out_w = (padded_w - kernel_w) / options.stride + 1;
+        let plane_len = out_h * out_w;
+        let mut out = vec![0.0; n * out_channels * plane_len];
+        for batch in 0..n {
+            for out_channel in 0..out_channels {
+                let plane_start = (batch * out_channels + out_channel) * plane_len;
+                fill_conv2d_plane(
+                    input.data(),
+                    weight.data(),
+                    bias,
+                    batch,
+                    out_channel,
+                    in_channels,
+                    in_h,
+                    in_w,
+                    kernel_h,
+                    kernel_w,
+                    out_h,
+                    out_w,
+                    options,
+                    &mut out[plane_start..plane_start + plane_len],
+                );
+            }
+        }
+        SdTensor::new([n, out_channels, out_h, out_w], out).unwrap()
+    }
+
     #[test]
     fn validates_shape_and_stats() {
         let tensor = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1381,6 +1515,37 @@ mod tests {
     }
 
     #[test]
+    fn conv2d_1x1_fast_path_matches_generic_reference() {
+        let input = SdTensor::new(
+            [1, 8, 8, 8],
+            (0..8 * 8 * 8)
+                .map(|index| ((index % 31) as f32 - 15.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = SdTensor::new(
+            [12, 8, 1, 1],
+            (0..12 * 8)
+                .map(|index| ((index % 17) as f32 - 8.0) / 13.0)
+                .collect(),
+        )
+        .unwrap();
+        let bias = (0..12)
+            .map(|index| (index as f32 - 6.0) / 23.0)
+            .collect::<Vec<_>>();
+        let options = Conv2dOptions {
+            stride: 1,
+            padding: 0,
+        };
+
+        let generic = conv2d_generic_reference(&input, &weight, &bias, options);
+        let fast = conv2d_nchw(&input, &weight, Some(&bias), options).unwrap();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-5);
+    }
+
+    #[test]
     #[ignore]
     fn conv2d_parallel_benchmark_smoke() {
         let input = SdTensor::new(
@@ -1418,6 +1583,47 @@ mod tests {
             serial_elapsed.as_secs_f64(),
             parallel_elapsed.as_secs_f64(),
             serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn conv2d_1x1_fast_path_benchmark_smoke() {
+        let input = SdTensor::new(
+            [1, 320, 64, 64],
+            (0..320 * 64 * 64)
+                .map(|index| ((index % 41) as f32 - 20.0) / 37.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = SdTensor::new(
+            [320, 320, 1, 1],
+            (0..320 * 320)
+                .map(|index| ((index % 29) as f32 - 14.0) / 23.0)
+                .collect(),
+        )
+        .unwrap();
+        let bias = vec![0.0; 320];
+        let options = Conv2dOptions {
+            stride: 1,
+            padding: 0,
+        };
+
+        let started = std::time::Instant::now();
+        let generic = conv2d_generic_reference(&input, &weight, &bias, options);
+        let generic_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let fast = conv2d_nchw(&input, &weight, Some(&bias), options).unwrap();
+        let fast_elapsed = started.elapsed();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-5);
+        eprintln!(
+            "conv2d 1x1 benchmark: generic={:.3}s fast={:.3}s speedup={:.2}x",
+            generic_elapsed.as_secs_f64(),
+            fast_elapsed.as_secs_f64(),
+            generic_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 
