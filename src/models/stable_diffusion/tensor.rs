@@ -2,6 +2,8 @@ use std::thread;
 
 use super::{Result, StableDiffusionError};
 
+const PARALLEL_MATMUL_THRESHOLD: usize = 1_000_000;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
     shape: Vec<usize>,
@@ -687,6 +689,10 @@ pub fn layer_norm_last_dim(
 }
 
 pub fn matmul2d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
+    matmul2d_impl(left, right, true)
+}
+
+fn matmul2d_impl(left: &SdTensor, right: &SdTensor, allow_parallel: bool) -> Result<SdTensor> {
     if left.rank() != 2 || right.rank() != 2 {
         return Err(StableDiffusionError::InvalidInput(format!(
             "matmul2d requires rank-2 tensors, got {:?} and {:?}",
@@ -703,19 +709,53 @@ pub fn matmul2d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
     }
     let cols = right.shape[1];
     let mut out = vec![0.0; rows * cols];
-    for row in 0..rows {
-        for col in 0..cols {
-            let mut sum = 0.0;
-            for k in 0..inner {
-                sum += left.data[row * inner + k] * right.data[k * cols + col];
+
+    let estimated_mul_adds = rows.saturating_mul(cols).saturating_mul(inner);
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(rows);
+    if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_MATMUL_THRESHOLD {
+        let rows_per_chunk = rows.div_ceil(workers);
+        let values_per_chunk = rows_per_chunk * cols;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let left_data = &left.data;
+                let right_data = &right.data;
+                let first_row = chunk_index * rows_per_chunk;
+                scope.spawn(move || {
+                    for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                        let row = first_row + local_row;
+                        fill_matmul2d_row(left_data, right_data, row, inner, cols, out_row);
+                    }
+                });
             }
-            out[row * cols + col] = sum;
+        });
+    } else {
+        for row in 0..rows {
+            let out_start = row * cols;
+            fill_matmul2d_row(
+                &left.data,
+                &right.data,
+                row,
+                inner,
+                cols,
+                &mut out[out_start..out_start + cols],
+            );
         }
     }
     SdTensor::new([rows, cols], out)
 }
 
 pub fn batched_matmul3d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
+    batched_matmul3d_impl(left, right, true)
+}
+
+fn batched_matmul3d_impl(
+    left: &SdTensor,
+    right: &SdTensor,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
     if left.rank() != 3 || right.rank() != 3 {
         return Err(StableDiffusionError::InvalidInput(format!(
             "batched_matmul3d requires rank-3 tensors, got {:?} and {:?}",
@@ -731,19 +771,89 @@ pub fn batched_matmul3d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
     }
     let cols = right.shape[2];
     let mut out = vec![0.0; batch * rows * cols];
-    for b in 0..batch {
-        for row in 0..rows {
-            for col in 0..cols {
-                let mut sum = 0.0;
-                for k in 0..inner {
-                    sum += left.data[(b * rows + row) * inner + k]
-                        * right.data[(b * inner + k) * cols + col];
-                }
-                out[(b * rows + row) * cols + col] = sum;
+
+    let output_rows = batch * rows;
+    let estimated_mul_adds = output_rows.saturating_mul(cols).saturating_mul(inner);
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(output_rows);
+
+    if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_MATMUL_THRESHOLD {
+        let output_rows_per_chunk = output_rows.div_ceil(workers);
+        let values_per_chunk = output_rows_per_chunk * cols;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let left_data = &left.data;
+                let right_data = &right.data;
+                let first_output_row = chunk_index * output_rows_per_chunk;
+                scope.spawn(move || {
+                    for (local_output_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                        let output_row = first_output_row + local_output_row;
+                        let b = output_row / rows;
+                        let row = output_row % rows;
+                        fill_batched_matmul3d_row(
+                            left_data, right_data, b, row, rows, inner, cols, out_row,
+                        );
+                    }
+                });
+            }
+        });
+    } else {
+        for b in 0..batch {
+            for row in 0..rows {
+                let out_start = (b * rows + row) * cols;
+                fill_batched_matmul3d_row(
+                    &left.data,
+                    &right.data,
+                    b,
+                    row,
+                    rows,
+                    inner,
+                    cols,
+                    &mut out[out_start..out_start + cols],
+                );
             }
         }
     }
     SdTensor::new([batch, rows, cols], out)
+}
+
+fn fill_matmul2d_row(
+    left: &[f32],
+    right: &[f32],
+    row: usize,
+    inner: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    for col in 0..cols {
+        let mut sum = 0.0;
+        for k in 0..inner {
+            sum += left[row * inner + k] * right[k * cols + col];
+        }
+        out[col] = sum;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_batched_matmul3d_row(
+    left: &[f32],
+    right: &[f32],
+    batch: usize,
+    row: usize,
+    rows: usize,
+    inner: usize,
+    cols: usize,
+    out: &mut [f32],
+) {
+    for col in 0..cols {
+        let mut sum = 0.0;
+        for k in 0..inner {
+            sum += left[(batch * rows + row) * inner + k] * right[(batch * inner + k) * cols + col];
+        }
+        out[col] = sum;
+    }
 }
 
 pub fn softmax_last_dim(input: &SdTensor) -> Result<SdTensor> {
@@ -1115,6 +1225,66 @@ mod tests {
     }
 
     #[test]
+    fn parallel_matmul_matches_serial_reference() {
+        let left = SdTensor::new(
+            [64, 96],
+            (0..64 * 96)
+                .map(|index| ((index % 41) as f32 - 20.0) / 37.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [96, 80],
+            (0..96 * 80)
+                .map(|index| ((index % 31) as f32 - 15.0) / 29.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let serial = matmul2d_impl(&left, &right, false).unwrap();
+        let parallel = matmul2d_impl(&left, &right, true).unwrap();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+    }
+
+    #[test]
+    #[ignore]
+    fn matmul_parallel_benchmark_smoke() {
+        let left = SdTensor::new(
+            [4096, 320],
+            (0..4096 * 320)
+                .map(|index| ((index % 43) as f32 - 21.0) / 41.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [320, 320],
+            (0..320 * 320)
+                .map(|index| ((index % 37) as f32 - 18.0) / 31.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let serial = matmul2d_impl(&left, &right, false).unwrap();
+        let serial_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let parallel = matmul2d_impl(&left, &right, true).unwrap();
+        let parallel_elapsed = started.elapsed();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-4);
+        eprintln!(
+            "matmul benchmark: serial={:.3}s parallel={:.3}s speedup={:.2}x",
+            serial_elapsed.as_secs_f64(),
+            parallel_elapsed.as_secs_f64(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+
+    #[test]
     fn batched_matmul_and_activations_work() {
         let left = SdTensor::new([1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let right = SdTensor::new([1, 2, 1], vec![10.0, 20.0]).unwrap();
@@ -1127,6 +1297,30 @@ mod tests {
         assert_eq!(silu.data(), &[0.0]);
         let gelu = SdTensor::new([1], vec![0.0]).unwrap().gelu().unwrap();
         assert_eq!(gelu.data(), &[0.0]);
+    }
+
+    #[test]
+    fn parallel_batched_matmul_matches_serial_reference() {
+        let left = SdTensor::new(
+            [4, 32, 48],
+            (0..4 * 32 * 48)
+                .map(|index| ((index % 47) as f32 - 23.0) / 43.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [4, 48, 40],
+            (0..4 * 48 * 40)
+                .map(|index| ((index % 29) as f32 - 14.0) / 23.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let serial = batched_matmul3d_impl(&left, &right, false).unwrap();
+        let parallel = batched_matmul3d_impl(&left, &right, true).unwrap();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
     }
 
     #[test]
