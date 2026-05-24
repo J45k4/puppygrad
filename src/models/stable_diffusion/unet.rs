@@ -217,18 +217,16 @@ pub fn unet_resnet_block(
         eps,
     )?;
     hidden = unet_conv2d(&hidden, &weights.conv2)?;
-    let residual = match &weights.shortcut {
-        Some(shortcut) => unet_conv2d(input, shortcut)?,
-        None => input.clone(),
-    };
     if weights.output_scale_factor <= 0.0 || !weights.output_scale_factor.is_finite() {
         return Err(StableDiffusionError::InvalidInput(
             "UNet resnet output_scale_factor must be finite and > 0".to_string(),
         ));
     }
-    residual
-        .add(&hidden)?
-        .scale(1.0 / weights.output_scale_factor)
+    let residual = match &weights.shortcut {
+        Some(shortcut) => unet_conv2d(input, shortcut)?.add(&hidden)?,
+        None => input.add(&hidden)?,
+    };
+    residual.scale(1.0 / weights.output_scale_factor)
 }
 
 pub fn unet_attention(
