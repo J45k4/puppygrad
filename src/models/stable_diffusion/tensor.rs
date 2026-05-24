@@ -385,16 +385,19 @@ pub fn concat_tensors(axis: usize, tensors: &[SdTensor]) -> Result<SdTensor> {
         }
     }
 
+    let inner: usize = first.shape[axis + 1..].iter().product();
+    let outer: usize = first.shape[..axis].iter().product();
+    let output_axis_len = shape[axis];
     let mut data = vec![0.0; tensor_len(&shape)?];
-    let mut axis_offset = 0;
-    for tensor in tensors {
-        for src_index in 0..tensor.data.len() {
-            let mut out_indices = linear_to_indices(src_index, &tensor.shape);
-            out_indices[axis] += axis_offset;
-            let dst_index = indices_to_linear(&out_indices, &shape);
-            data[dst_index] = tensor.data[src_index];
+    for outer_index in 0..outer {
+        let mut output_offset = (outer_index * output_axis_len) * inner;
+        for tensor in tensors {
+            let values = tensor.shape[axis] * inner;
+            let input_offset = (outer_index * tensor.shape[axis]) * inner;
+            data[output_offset..output_offset + values]
+                .copy_from_slice(&tensor.data[input_offset..input_offset + values]);
+            output_offset += values;
         }
-        axis_offset += tensor.shape[axis];
     }
     SdTensor::new(shape, data)
 }
@@ -1652,6 +1655,24 @@ mod tests {
         SdTensor::new(shape, data).unwrap()
     }
 
+    fn concat_tensors_generic_reference(axis: usize, tensors: &[SdTensor]) -> SdTensor {
+        let first = tensors.first().unwrap();
+        let mut shape = first.shape.clone();
+        shape[axis] = tensors.iter().map(|tensor| tensor.shape[axis]).sum();
+        let mut data = vec![0.0; tensor_len(&shape).unwrap()];
+        let mut axis_offset = 0;
+        for tensor in tensors {
+            for src_index in 0..tensor.data.len() {
+                let mut out_indices = linear_to_indices(src_index, &tensor.shape);
+                out_indices[axis] += axis_offset;
+                let dst_index = indices_to_linear(&out_indices, &shape);
+                data[dst_index] = tensor.data[src_index];
+            }
+            axis_offset += tensor.shape[axis];
+        }
+        SdTensor::new(shape, data).unwrap()
+    }
+
     #[test]
     fn validates_shape_and_stats() {
         let tensor = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1752,6 +1773,66 @@ mod tests {
         assert_eq!(concat.data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let split = split_tensor(1, &concat, &[1, 2]).unwrap();
         assert_eq!(split, vec![left, right]);
+    }
+
+    #[test]
+    fn concat_fast_path_matches_generic_reference() {
+        let left = SdTensor::new(
+            [2, 32, 16, 16],
+            (0..2 * 32 * 16 * 16)
+                .map(|index| ((index % 31) as f32 - 15.0) / 23.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [2, 48, 16, 16],
+            (0..2 * 48 * 16 * 16)
+                .map(|index| ((index % 29) as f32 - 14.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let generic = concat_tensors_generic_reference(1, &[left.clone(), right.clone()]);
+        let fast = concat_tensors(1, &[left, right]).unwrap();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-6);
+    }
+
+    #[test]
+    #[ignore]
+    fn concat_fast_path_benchmark_smoke() {
+        let left = SdTensor::new(
+            [1, 640, 32, 32],
+            (0..640 * 32 * 32)
+                .map(|index| ((index % 31) as f32 - 15.0) / 23.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [1, 640, 32, 32],
+            (0..640 * 32 * 32)
+                .map(|index| ((index % 29) as f32 - 14.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let generic = concat_tensors_generic_reference(1, &[left.clone(), right.clone()]);
+        let generic_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let fast = concat_tensors(1, &[left, right]).unwrap();
+        let fast_elapsed = started.elapsed();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-6);
+        eprintln!(
+            "concat benchmark: generic={:.3}s fast={:.3}s speedup={:.2}x",
+            generic_elapsed.as_secs_f64(),
+            fast_elapsed.as_secs_f64(),
+            generic_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
     }
 
     #[test]
