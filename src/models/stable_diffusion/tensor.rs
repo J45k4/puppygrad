@@ -1616,12 +1616,18 @@ fn fill_attention_query_row(
     scores: &mut [f32],
     out: &mut [f32],
 ) {
+    let query_base = ((batch_index * heads + head) * query_len + query_index) * dim;
+    let query_row = &query[query_base..query_base + dim];
+    let key_base = (batch_index * heads + head) * key_len * dim;
     for key_index in 0..key_len {
-        let mut dot = 0.0;
-        for d in 0..dim {
-            dot += query[nchw_index(batch_index, head, query_index, d, heads, query_len, dim)]
-                * key[nchw_index(batch_index, head, key_index, d, heads, key_len, dim)];
-        }
+        let key_start = key_base + key_index * dim;
+        let key_row = &key[key_start..key_start + dim];
+        let dot = query_row
+            .iter()
+            .copied()
+            .zip(key_row.iter().copied())
+            .map(|(query, key)| query * key)
+            .sum::<f32>();
         scores[key_index] = dot * scale;
         if let Some(mask) = additive_mask {
             let mask_indices = [batch_index, head, query_index, key_index];
@@ -1634,21 +1640,11 @@ fn fill_attention_query_row(
         }
     }
     softmax_slice_in_place(scores);
-    for value_channel in 0..value_dim {
-        let mut sum = 0.0;
-        for (key_index, score) in scores.iter().copied().enumerate() {
-            sum += score
-                * value[nchw_index(
-                    batch_index,
-                    head,
-                    key_index,
-                    value_channel,
-                    heads,
-                    key_len,
-                    value_dim,
-                )];
-        }
-        out[value_channel] = sum;
+    out.fill(0.0);
+    let value_base = (batch_index * heads + head) * key_len * value_dim;
+    for (key_index, score) in scores.iter().copied().enumerate() {
+        let value_start = value_base + key_index * value_dim;
+        add_scaled_slice(out, &value[value_start..value_start + value_dim], score);
     }
 }
 
