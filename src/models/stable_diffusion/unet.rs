@@ -222,11 +222,18 @@ pub fn unet_resnet_block(
             "UNet resnet output_scale_factor must be finite and > 0".to_string(),
         ));
     }
-    let residual = match &weights.shortcut {
-        Some(shortcut) => unet_conv2d(input, shortcut)?.add(&hidden)?,
-        None => input.add(&hidden)?,
-    };
-    residual.scale(1.0 / weights.output_scale_factor)
+    match &weights.shortcut {
+        Some(shortcut) => {
+            let residual = unet_conv2d(input, shortcut)?;
+            hidden.add_same_shape_in_place(&residual)?;
+        }
+        None => hidden.add_same_shape_in_place(input)?,
+    }
+    if weights.output_scale_factor == 1.0 {
+        Ok(hidden)
+    } else {
+        hidden.scale(1.0 / weights.output_scale_factor)
+    }
 }
 
 pub fn unet_attention(

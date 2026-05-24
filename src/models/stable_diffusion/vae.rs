@@ -89,11 +89,15 @@ pub fn vae_resnet_block(
         &weights.norm2_bias,
         eps,
     )?;
-    let hidden = vae_conv2d(&hidden, &weights.conv2)?;
+    let mut hidden = vae_conv2d(&hidden, &weights.conv2)?;
     match &weights.shortcut {
-        Some(shortcut) => vae_conv2d(input, shortcut)?.add(&hidden),
-        None => input.add(&hidden),
+        Some(shortcut) => {
+            let residual = vae_conv2d(input, shortcut)?;
+            hidden.add_same_shape_in_place(&residual)?;
+        }
+        None => hidden.add_same_shape_in_place(input)?,
     }
+    Ok(hidden)
 }
 
 pub fn vae_attention_block(

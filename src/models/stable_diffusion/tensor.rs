@@ -124,6 +124,38 @@ impl SdTensor {
         broadcast_binary(self, rhs, |left, right| left + right)
     }
 
+    pub fn add_same_shape_in_place(&mut self, rhs: &Self) -> Result<()> {
+        if self.shape != rhs.shape {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "cannot add shapes {:?} and {:?} in place",
+                self.shape, rhs.shape
+            )));
+        }
+        let workers = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(self.data.len().max(1));
+        if workers > 1 && self.data.len() >= PARALLEL_ELEMENTWISE_THRESHOLD {
+            let values_per_chunk = self.data.len().div_ceil(workers);
+            thread::scope(|scope| {
+                for (chunk_index, out_chunk) in self.data.chunks_mut(values_per_chunk).enumerate() {
+                    let first = chunk_index * values_per_chunk;
+                    let rhs_chunk = &rhs.data[first..first + out_chunk.len()];
+                    scope.spawn(move || {
+                        for (dst, src) in out_chunk.iter_mut().zip(rhs_chunk.iter().copied()) {
+                            *dst += src;
+                        }
+                    });
+                }
+            });
+        } else {
+            for (dst, src) in self.data.iter_mut().zip(rhs.data.iter().copied()) {
+                *dst += src;
+            }
+        }
+        Ok(())
+    }
+
     pub fn sub(&self, rhs: &Self) -> Result<Self> {
         broadcast_binary(self, rhs, |left, right| left - right)
     }
