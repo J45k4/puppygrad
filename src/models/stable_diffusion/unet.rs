@@ -1,7 +1,7 @@
 use super::{
-    concat_tensors, conv2d_nchw, group_norm_nchw, layer_norm_last_dim, linear2d,
-    scaled_dot_product_attention, upsample_nearest2d_nchw, Conv2dOptions, Result, SdTensor,
-    StableDiffusionError,
+    concat_tensors, conv2d_nchw, group_norm_nchw, group_norm_silu_nchw, layer_norm_last_dim,
+    linear2d, scaled_dot_product_attention, upsample_nearest2d_nchw, Conv2dOptions, Result,
+    SdTensor, StableDiffusionError,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,26 +199,24 @@ pub fn unet_resnet_block(
     groups: usize,
     eps: f32,
 ) -> Result<SdTensor> {
-    let mut hidden = group_norm_nchw(
+    let hidden = group_norm_silu_nchw(
         input,
         groups,
         &weights.norm1_weight,
         &weights.norm1_bias,
         eps,
-    )?
-    .silu()
-    .and_then(|hidden| unet_conv2d(&hidden, &weights.conv1))?;
+    )?;
+    let mut hidden = unet_conv2d(&hidden, &weights.conv1)?;
     let time = unet_linear(&time_embedding.silu()?, &weights.time_emb_proj)?;
     add_channel_bias_from_row(&mut hidden, &time)?;
-    hidden = group_norm_nchw(
+    hidden = group_norm_silu_nchw(
         &hidden,
         groups,
         &weights.norm2_weight,
         &weights.norm2_bias,
         eps,
-    )?
-    .silu()
-    .and_then(|hidden| unet_conv2d(&hidden, &weights.conv2))?;
+    )?;
+    hidden = unet_conv2d(&hidden, &weights.conv2)?;
     let residual = match &weights.shortcut {
         Some(shortcut) => unet_conv2d(input, shortcut)?,
         None => input.clone(),
@@ -496,14 +494,13 @@ pub fn unet_forward(
         )?;
     }
 
-    let hidden = group_norm_nchw(
+    let hidden = group_norm_silu_nchw(
         &hidden,
         weights.norm_groups,
         &weights.conv_norm_out_weight,
         &weights.conv_norm_out_bias,
         weights.norm_eps,
-    )?
-    .silu()?;
+    )?;
     let out = unet_conv2d(&hidden, &weights.conv_out)?;
     if out.shape() != sample.shape() {
         return Err(StableDiffusionError::InvalidInput(format!(

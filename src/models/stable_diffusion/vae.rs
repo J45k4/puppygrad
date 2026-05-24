@@ -1,6 +1,7 @@
 use super::{
-    conv2d_nchw, group_norm_nchw, scaled_dot_product_attention, upsample_nearest2d_nchw,
-    AutoencoderKlConfig, Conv2dOptions, Result, SdTensor, StableDiffusionError,
+    conv2d_nchw, group_norm_nchw, group_norm_silu_nchw, scaled_dot_product_attention,
+    upsample_nearest2d_nchw, AutoencoderKlConfig, Conv2dOptions, Result, SdTensor,
+    StableDiffusionError,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,24 +74,22 @@ pub fn vae_resnet_block(
     groups: usize,
     eps: f32,
 ) -> Result<SdTensor> {
-    let hidden = group_norm_nchw(
+    let hidden = group_norm_silu_nchw(
         input,
         groups,
         &weights.norm1_weight,
         &weights.norm1_bias,
         eps,
-    )?
-    .silu()
-    .and_then(|hidden| vae_conv2d(&hidden, &weights.conv1))?;
-    let hidden = group_norm_nchw(
+    )?;
+    let hidden = vae_conv2d(&hidden, &weights.conv1)?;
+    let hidden = group_norm_silu_nchw(
         &hidden,
         groups,
         &weights.norm2_weight,
         &weights.norm2_bias,
         eps,
-    )?
-    .silu()
-    .and_then(|hidden| vae_conv2d(&hidden, &weights.conv2))?;
+    )?;
+    let hidden = vae_conv2d(&hidden, &weights.conv2)?;
     let residual = match &weights.shortcut {
         Some(shortcut) => vae_conv2d(input, shortcut)?,
         None => input.clone(),
@@ -145,14 +144,13 @@ pub fn vae_decode_latents(
             hidden = vae_conv2d(&hidden, upsample)?;
         }
     }
-    let hidden = group_norm_nchw(
+    let hidden = group_norm_silu_nchw(
         &hidden,
         norm_groups,
         &weights.conv_norm_out_weight,
         &weights.conv_norm_out_bias,
         1e-6,
-    )?
-    .silu()?;
+    )?;
     vae_conv2d(&hidden, &weights.conv_out)
 }
 

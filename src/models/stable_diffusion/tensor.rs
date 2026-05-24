@@ -1076,7 +1076,17 @@ pub fn group_norm_nchw(
     beta: &[f32],
     eps: f32,
 ) -> Result<SdTensor> {
-    group_norm_nchw_impl(input, groups, gamma, beta, eps, true)
+    group_norm_nchw_impl(input, groups, gamma, beta, eps, false, true)
+}
+
+pub fn group_norm_silu_nchw(
+    input: &SdTensor,
+    groups: usize,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+) -> Result<SdTensor> {
+    group_norm_nchw_impl(input, groups, gamma, beta, eps, true, true)
 }
 
 fn group_norm_nchw_impl(
@@ -1085,6 +1095,7 @@ fn group_norm_nchw_impl(
     gamma: &[f32],
     beta: &[f32],
     eps: f32,
+    apply_silu: bool,
     allow_parallel: bool,
 ) -> Result<SdTensor> {
     let [n, c, h, w] = shape4(input, "group norm")?;
@@ -1138,6 +1149,7 @@ fn group_norm_nchw_impl(
                             w,
                             channels_per_group,
                             eps,
+                            apply_silu,
                             out_group,
                         );
                     }
@@ -1159,6 +1171,7 @@ fn group_norm_nchw_impl(
                     w,
                     channels_per_group,
                     eps,
+                    apply_silu,
                     &mut out[out_start..out_start + group_len],
                 );
             }
@@ -1179,6 +1192,7 @@ fn fill_group_norm_group(
     width: usize,
     channels_per_group: usize,
     eps: f32,
+    apply_silu: bool,
     out: &mut [f32],
 ) {
     let spatial = height * width;
@@ -1203,7 +1217,12 @@ fn fill_group_norm_group(
             .iter_mut()
             .zip(input_group[start..end].iter().copied())
         {
-            *dst = (src - mean) * inv_std * gamma[global_channel] + beta[global_channel];
+            let value = (src - mean) * inv_std * gamma[global_channel] + beta[global_channel];
+            *dst = if apply_silu {
+                value / (1.0 + (-value).exp())
+            } else {
+                value
+            };
         }
     }
 }
@@ -2514,11 +2533,37 @@ mod tests {
             .map(|index| (index as f32 - 16.0) / 101.0)
             .collect::<Vec<_>>();
 
-        let serial = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false).unwrap();
-        let parallel = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, true).unwrap();
+        let serial = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false, false).unwrap();
+        let parallel = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false, true).unwrap();
 
         assert_eq!(parallel.shape(), serial.shape());
         assert_close(parallel.data(), serial.data(), 1e-5);
+    }
+
+    #[test]
+    fn group_norm_silu_matches_separate_ops() {
+        let input = SdTensor::new(
+            [1, 8, 8, 7],
+            (0..8 * 8 * 7)
+                .map(|index| ((index % 53) as f32 - 26.0) / 47.0)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = (0..8)
+            .map(|index| 0.75 + index as f32 / 127.0)
+            .collect::<Vec<_>>();
+        let beta = (0..8)
+            .map(|index| (index as f32 - 4.0) / 101.0)
+            .collect::<Vec<_>>();
+
+        let separate = group_norm_nchw(&input, 4, &gamma, &beta, 1e-5)
+            .unwrap()
+            .silu()
+            .unwrap();
+        let fused = group_norm_silu_nchw(&input, 4, &gamma, &beta, 1e-5).unwrap();
+
+        assert_eq!(fused.shape(), separate.shape());
+        assert_close(fused.data(), separate.data(), 1e-6);
     }
 
     #[test]
@@ -2539,11 +2584,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         let started = std::time::Instant::now();
-        let serial = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false).unwrap();
+        let serial = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false, false).unwrap();
         let serial_elapsed = started.elapsed();
 
         let started = std::time::Instant::now();
-        let parallel = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, true).unwrap();
+        let parallel = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false, true).unwrap();
         let parallel_elapsed = started.elapsed();
 
         assert_eq!(parallel.shape(), serial.shape());
@@ -2553,6 +2598,44 @@ mod tests {
             serial_elapsed.as_secs_f64(),
             parallel_elapsed.as_secs_f64(),
             serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn group_norm_silu_benchmark_smoke() {
+        let input = SdTensor::new(
+            [1, 128, 512, 512],
+            (0..128 * 512 * 512)
+                .map(|index| ((index % 59) as f32 - 29.0) / 53.0)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = (0..128)
+            .map(|index| 0.8 + index as f32 / 4096.0)
+            .collect::<Vec<_>>();
+        let beta = (0..128)
+            .map(|index| (index as f32 - 64.0) / 4096.0)
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let separate = group_norm_nchw(&input, 32, &gamma, &beta, 1e-5)
+            .unwrap()
+            .silu()
+            .unwrap();
+        let separate_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let fused = group_norm_silu_nchw(&input, 32, &gamma, &beta, 1e-5).unwrap();
+        let fused_elapsed = started.elapsed();
+
+        assert_eq!(fused.shape(), separate.shape());
+        assert_close(fused.data(), separate.data(), 1e-5);
+        eprintln!(
+            "group_norm_silu benchmark: separate={:.3}s fused={:.3}s speedup={:.2}x",
+            separate_elapsed.as_secs_f64(),
+            fused_elapsed.as_secs_f64(),
+            separate_elapsed.as_secs_f64() / fused_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 
