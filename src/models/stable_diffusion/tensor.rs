@@ -789,14 +789,16 @@ fn fill_conv2d_1x1_plane(
     out: &mut [f32],
 ) {
     let spatial = height * width;
-    for spatial_index in 0..spatial {
-        let mut sum = bias[out_channel];
-        for in_channel in 0..in_channels {
-            let input_index = (batch * in_channels + in_channel) * spatial + spatial_index;
-            let weight_index = out_channel * in_channels + in_channel;
-            sum += input[input_index] * weight[weight_index];
+    out.fill(bias[out_channel]);
+    let input_batch_base = batch * in_channels * spatial;
+    let weight_base = out_channel * in_channels;
+    for in_channel in 0..in_channels {
+        let scale = weight[weight_base + in_channel];
+        let input_start = input_batch_base + in_channel * spatial;
+        let input_plane = &input[input_start..input_start + spatial];
+        for (dst, src) in out.iter_mut().zip(input_plane.iter().copied()) {
+            *dst += src * scale;
         }
-        out[spatial_index] = sum;
     }
 }
 
