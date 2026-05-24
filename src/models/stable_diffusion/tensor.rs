@@ -11,7 +11,7 @@ const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
 const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV1X1_THRESHOLD: usize = 4_000_000;
-const GEMM_CONV3X3_MIDDLE_COLUMN_THRESHOLD: usize = 64_000_000;
+const GEMM_CONV3X3_THRESHOLD: usize = 64_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -885,9 +885,9 @@ fn conv2d_3x3_pad1_nchw(
         && available_workers > 1
         && out_channels >= 16
         && in_channels >= 16
-        && estimated_mul_adds >= GEMM_CONV3X3_MIDDLE_COLUMN_THRESHOLD
+        && estimated_mul_adds >= GEMM_CONV3X3_THRESHOLD
     {
-        return conv2d_3x3_pad1_middle_column_gemm_nchw(input, weight, bias, available_workers);
+        return conv2d_3x3_pad1_gemm_nchw(input, weight, bias, available_workers);
     }
 
     if allow_parallel
@@ -948,7 +948,7 @@ fn conv2d_3x3_pad1_nchw(
     SdTensor::new([n, out_channels, h, w], out)
 }
 
-fn conv2d_3x3_pad1_middle_column_gemm_nchw(
+fn conv2d_3x3_pad1_gemm_nchw(
     input: &SdTensor,
     weight: &SdTensor,
     bias: &[f32],
@@ -968,12 +968,12 @@ fn conv2d_3x3_pad1_middle_column_gemm_nchw(
             row.fill(bias);
         }
         let input_batch = &input.data[batch * input_batch_len..(batch + 1) * input_batch_len];
-        let middle_column_taps = [
+        let full_width_taps = [
             (w, 0usize, (h - 1) * w, 1usize),
             (0usize, 0usize, spatial, 4usize),
             (0usize, w, (h - 1) * w, 7usize),
         ];
-        for (out_offset, input_offset, cols, weight_offset) in middle_column_taps {
+        for (out_offset, input_offset, cols, weight_offset) in full_width_taps {
             unsafe {
                 gemm::gemm(
                     out_channels,
@@ -998,35 +998,56 @@ fn conv2d_3x3_pad1_middle_column_gemm_nchw(
                 );
             }
         }
-    }
-
-    let workers = workers.min(output_planes);
-    let planes_per_chunk = output_planes.div_ceil(workers);
-    let values_per_chunk = planes_per_chunk * spatial;
-    thread::scope(|scope| {
-        for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
-            let input_data = &input.data;
-            let weight_data = &weight.data;
-            let first_plane = chunk_index * planes_per_chunk;
-            scope.spawn(move || {
-                for (local_plane, out_plane) in out_chunk.chunks_mut(spatial).enumerate() {
-                    let plane = first_plane + local_plane;
-                    let batch = plane / out_channels;
-                    let out_channel = plane % out_channels;
-                    add_conv2d_3x3_pad1_plane_except_middle_column(
-                        input_data,
-                        weight_data,
-                        batch,
-                        out_channel,
+        let side_taps = [
+            (0usize, 0usize),
+            (0usize, 2usize),
+            (1usize, 0usize),
+            (1usize, 2usize),
+            (2usize, 0usize),
+            (2usize, 2usize),
+        ];
+        for (kernel_y, kernel_x) in side_taps {
+            let (out_y_start, out_y_end) = match kernel_y {
+                0 => (1, h),
+                1 => (0, h),
+                _ => (0, h.saturating_sub(1)),
+            };
+            let (out_x_start, input_x_start) = match kernel_x {
+                0 => (1, 0),
+                _ => (0, 1),
+            };
+            let cols = w - 1;
+            let weight_offset = kernel_y * 3 + kernel_x;
+            for out_y in out_y_start..out_y_end {
+                let input_y = out_y + kernel_y - 1;
+                let out_offset = out_y * w + out_x_start;
+                let input_offset = input_y * w + input_x_start;
+                unsafe {
+                    gemm::gemm(
+                        out_channels,
+                        cols,
                         in_channels,
-                        h,
-                        w,
-                        out_plane,
+                        out_batch.as_mut_ptr().add(out_offset),
+                        1,
+                        spatial as isize,
+                        true,
+                        weight.data.as_ptr().add(weight_offset),
+                        9,
+                        (in_channels * 9) as isize,
+                        input_batch.as_ptr().add(input_offset),
+                        1,
+                        spatial as isize,
+                        1.0f32,
+                        1.0f32,
+                        false,
+                        false,
+                        false,
+                        Parallelism::Rayon(workers),
                     );
                 }
-            });
+            }
         }
-    });
+    }
     SdTensor::new([n, out_channels, h, w], out)
 }
 
@@ -1187,62 +1208,6 @@ fn fill_conv2d_3x3_pad1_plane(
                 continue;
             }
             for kernel_x in 0..3 {
-                let (out_x_start, out_x_end) = match kernel_x {
-                    0 => (1, width),
-                    1 => (0, width),
-                    _ => (0, width.saturating_sub(1)),
-                };
-                if out_x_start >= out_x_end {
-                    continue;
-                }
-                let scale = weight[weight_base + kernel_y * 3 + kernel_x];
-                let values = out_x_end - out_x_start;
-                for out_y in out_y_start..out_y_end {
-                    let input_y = out_y + kernel_y - 1;
-                    let input_x_start = out_x_start + kernel_x - 1;
-                    let out_start = out_y * width + out_x_start;
-                    let input_start = input_y * width + input_x_start;
-                    add_scaled_slice(
-                        &mut out[out_start..out_start + values],
-                        &input_plane[input_start..input_start + values],
-                        scale,
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_conv2d_3x3_pad1_plane_except_middle_column(
-    input: &[f32],
-    weight: &[f32],
-    batch: usize,
-    out_channel: usize,
-    in_channels: usize,
-    height: usize,
-    width: usize,
-    out: &mut [f32],
-) {
-    let spatial = height * width;
-    let input_batch_base = batch * in_channels * spatial;
-    for in_channel in 0..in_channels {
-        let input_start = input_batch_base + in_channel * spatial;
-        let input_plane = &input[input_start..input_start + spatial];
-        let weight_base = (out_channel * in_channels + in_channel) * 9;
-        for kernel_y in 0..3 {
-            let (out_y_start, out_y_end) = match kernel_y {
-                0 => (1, height),
-                1 => (0, height),
-                _ => (0, height.saturating_sub(1)),
-            };
-            if out_y_start >= out_y_end {
-                continue;
-            }
-            for kernel_x in 0..3 {
-                if kernel_x == 1 {
-                    continue;
-                }
                 let (out_x_start, out_x_end) = match kernel_x {
                     0 => (1, width),
                     1 => (0, width),
@@ -2734,7 +2699,7 @@ mod tests {
     }
 
     #[test]
-    fn conv2d_3x3_pad1_middle_column_gemm_matches_direct_fast_path() {
+    fn conv2d_3x3_pad1_gemm_matches_direct_fast_path() {
         let input = SdTensor::new(
             [1, 16, 17, 19],
             (0..16 * 17 * 19)
@@ -2754,7 +2719,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let direct = conv2d_3x3_pad1_nchw(&input, &weight, &bias, false).unwrap();
-        let gemm = conv2d_3x3_pad1_middle_column_gemm_nchw(&input, &weight, &bias, 2).unwrap();
+        let gemm = conv2d_3x3_pad1_gemm_nchw(&input, &weight, &bias, 2).unwrap();
 
         assert_eq!(gemm.shape(), direct.shape());
         assert_close(gemm.data(), direct.data(), 1e-4);
