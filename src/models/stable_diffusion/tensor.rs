@@ -11,7 +11,7 @@ const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
 const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV1X1_THRESHOLD: usize = 4_000_000;
-const GEMM_CONV3X3_CENTER_THRESHOLD: usize = 64_000_000;
+const GEMM_CONV3X3_MIDDLE_COLUMN_THRESHOLD: usize = 64_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -885,9 +885,9 @@ fn conv2d_3x3_pad1_nchw(
         && available_workers > 1
         && out_channels >= 16
         && in_channels >= 16
-        && estimated_mul_adds >= GEMM_CONV3X3_CENTER_THRESHOLD
+        && estimated_mul_adds >= GEMM_CONV3X3_MIDDLE_COLUMN_THRESHOLD
     {
-        return conv2d_3x3_pad1_center_gemm_nchw(input, weight, bias, available_workers);
+        return conv2d_3x3_pad1_middle_column_gemm_nchw(input, weight, bias, available_workers);
     }
 
     if allow_parallel
@@ -948,7 +948,7 @@ fn conv2d_3x3_pad1_nchw(
     SdTensor::new([n, out_channels, h, w], out)
 }
 
-fn conv2d_3x3_pad1_center_gemm_nchw(
+fn conv2d_3x3_pad1_middle_column_gemm_nchw(
     input: &SdTensor,
     weight: &SdTensor,
     bias: &[f32],
@@ -968,28 +968,35 @@ fn conv2d_3x3_pad1_center_gemm_nchw(
             row.fill(bias);
         }
         let input_batch = &input.data[batch * input_batch_len..(batch + 1) * input_batch_len];
-        unsafe {
-            gemm::gemm(
-                out_channels,
-                spatial,
-                in_channels,
-                out_batch.as_mut_ptr(),
-                1,
-                spatial as isize,
-                true,
-                weight.data.as_ptr().add(4),
-                9,
-                (in_channels * 9) as isize,
-                input_batch.as_ptr(),
-                1,
-                spatial as isize,
-                1.0f32,
-                1.0f32,
-                false,
-                false,
-                false,
-                Parallelism::Rayon(workers),
-            );
+        let middle_column_taps = [
+            (w, 0usize, (h - 1) * w, 1usize),
+            (0usize, 0usize, spatial, 4usize),
+            (0usize, w, (h - 1) * w, 7usize),
+        ];
+        for (out_offset, input_offset, cols, weight_offset) in middle_column_taps {
+            unsafe {
+                gemm::gemm(
+                    out_channels,
+                    cols,
+                    in_channels,
+                    out_batch.as_mut_ptr().add(out_offset),
+                    1,
+                    spatial as isize,
+                    true,
+                    weight.data.as_ptr().add(weight_offset),
+                    9,
+                    (in_channels * 9) as isize,
+                    input_batch.as_ptr().add(input_offset),
+                    1,
+                    spatial as isize,
+                    1.0f32,
+                    1.0f32,
+                    false,
+                    false,
+                    false,
+                    Parallelism::Rayon(workers),
+                );
+            }
         }
     }
 
@@ -1006,7 +1013,7 @@ fn conv2d_3x3_pad1_center_gemm_nchw(
                     let plane = first_plane + local_plane;
                     let batch = plane / out_channels;
                     let out_channel = plane % out_channels;
-                    add_conv2d_3x3_pad1_plane_except_center(
+                    add_conv2d_3x3_pad1_plane_except_middle_column(
                         input_data,
                         weight_data,
                         batch,
@@ -1207,7 +1214,7 @@ fn fill_conv2d_3x3_pad1_plane(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn add_conv2d_3x3_pad1_plane_except_center(
+fn add_conv2d_3x3_pad1_plane_except_middle_column(
     input: &[f32],
     weight: &[f32],
     batch: usize,
@@ -1233,7 +1240,7 @@ fn add_conv2d_3x3_pad1_plane_except_center(
                 continue;
             }
             for kernel_x in 0..3 {
-                if kernel_y == 1 && kernel_x == 1 {
+                if kernel_x == 1 {
                     continue;
                 }
                 let (out_x_start, out_x_end) = match kernel_x {
@@ -2727,7 +2734,7 @@ mod tests {
     }
 
     #[test]
-    fn conv2d_3x3_pad1_center_gemm_matches_direct_fast_path() {
+    fn conv2d_3x3_pad1_middle_column_gemm_matches_direct_fast_path() {
         let input = SdTensor::new(
             [1, 16, 17, 19],
             (0..16 * 17 * 19)
@@ -2747,7 +2754,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let direct = conv2d_3x3_pad1_nchw(&input, &weight, &bias, false).unwrap();
-        let gemm = conv2d_3x3_pad1_center_gemm_nchw(&input, &weight, &bias, 2).unwrap();
+        let gemm = conv2d_3x3_pad1_middle_column_gemm_nchw(&input, &weight, &bias, 2).unwrap();
 
         assert_eq!(gemm.shape(), direct.shape());
         assert_close(gemm.data(), direct.data(), 1e-4);
