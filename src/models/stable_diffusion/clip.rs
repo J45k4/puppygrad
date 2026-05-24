@@ -1,8 +1,7 @@
+use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 
-use tokenizers::models::bpe::BPE;
-use tokenizers::normalizers::{unicode::NFC, utils::Lowercase, utils::Sequence};
-use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::Tokenizer;
 
 use super::{
@@ -14,9 +13,23 @@ pub const SD1_CLIP_MAX_TOKENS: usize = 77;
 
 #[derive(Clone)]
 pub struct StableDiffusionTokenizer {
-    tokenizer: Tokenizer,
+    backend: StableDiffusionTokenizerBackend,
     special_tokens: StableDiffusionTokenizerSpecialTokens,
     max_tokens: usize,
+}
+
+#[derive(Clone)]
+enum StableDiffusionTokenizerBackend {
+    Tokenizers(Tokenizer),
+    ClipBpe(ClipBpeTokenizer),
+}
+
+#[derive(Clone)]
+struct ClipBpeTokenizer {
+    vocab: HashMap<String, u32>,
+    merges: HashMap<(String, String), usize>,
+    byte_encoder: HashMap<u8, char>,
+    unk_token_id: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,48 +79,23 @@ impl StableDiffusionTokenizer {
             return Self::from_file(tokenizer_json);
         }
 
-        let vocab_json = vocab_json.as_ref();
-        let merges_txt = merges_txt.as_ref();
-        let model = BPE::from_file(
-            vocab_json.to_str().ok_or_else(|| {
-                StableDiffusionError::Asset(format!(
-                    "tokenizer vocab path is not valid UTF-8: {}",
-                    vocab_json.display()
-                ))
-            })?,
-            merges_txt.to_str().ok_or_else(|| {
-                StableDiffusionError::Asset(format!(
-                    "tokenizer merges path is not valid UTF-8: {}",
-                    merges_txt.display()
-                ))
-            })?,
-        )
-        .unk_token("<|endoftext|>".to_string())
-        .end_of_word_suffix("</w>".to_string())
-        .build()
-        .map_err(|err| {
-            StableDiffusionError::Asset(format!(
-                "failed to load Stable Diffusion tokenizer from {} and {}: {err}",
-                vocab_json.display(),
-                merges_txt.display()
-            ))
-        })?;
-        let mut tokenizer = Tokenizer::new(model);
-        tokenizer
-            .with_normalizer(Some(Sequence::new(vec![NFC.into(), Lowercase.into()])))
-            .map_err(|err| {
-                StableDiffusionError::Asset(format!(
-                    "failed to configure Stable Diffusion tokenizer normalizer: {err}"
-                ))
-            })?;
-        tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
-        Self::from_tokenizer(tokenizer)
+        let backend = ClipBpeTokenizer::from_files(vocab_json.as_ref(), merges_txt.as_ref())?;
+        let special_tokens = StableDiffusionTokenizerSpecialTokens {
+            bos: backend.token_id("<|startoftext|>")?,
+            eos: backend.token_id("<|endoftext|>")?,
+            pad: backend.token_id("<|endoftext|>")?,
+        };
+        Ok(Self {
+            backend: StableDiffusionTokenizerBackend::ClipBpe(backend),
+            special_tokens,
+            max_tokens: SD1_CLIP_MAX_TOKENS,
+        })
     }
 
     pub fn from_tokenizer(tokenizer: Tokenizer) -> Result<Self> {
         let special_tokens = StableDiffusionTokenizerSpecialTokens::from_tokenizer(&tokenizer)?;
         Ok(Self {
-            tokenizer,
+            backend: StableDiffusionTokenizerBackend::Tokenizers(tokenizer),
             special_tokens,
             max_tokens: SD1_CLIP_MAX_TOKENS,
         })
@@ -142,10 +130,7 @@ impl StableDiffusionTokenizer {
                 "CLIP max token length must leave room for BOS and EOS".to_string(),
             ));
         }
-        let encoding = self.tokenizer.encode(prompt, false).map_err(|err| {
-            StableDiffusionError::Asset(format!("failed to encode Stable Diffusion prompt: {err}"))
-        })?;
-        let raw_ids = encoding.get_ids();
+        let raw_ids = self.encode_raw_ids(prompt)?;
         let content_limit = max_tokens - 2;
         let truncated = raw_ids.len() > content_limit;
 
@@ -166,6 +151,174 @@ impl StableDiffusionTokenizer {
             truncated,
         })
     }
+
+    fn encode_raw_ids(&self, prompt: &str) -> Result<Vec<u32>> {
+        match &self.backend {
+            StableDiffusionTokenizerBackend::Tokenizers(tokenizer) => {
+                let encoding = tokenizer.encode(prompt, false).map_err(|err| {
+                    StableDiffusionError::Asset(format!(
+                        "failed to encode Stable Diffusion prompt: {err}"
+                    ))
+                })?;
+                Ok(encoding.get_ids().to_vec())
+            }
+            StableDiffusionTokenizerBackend::ClipBpe(tokenizer) => tokenizer.encode(prompt),
+        }
+    }
+}
+
+impl ClipBpeTokenizer {
+    fn from_files(vocab_json: &Path, merges_txt: &Path) -> Result<Self> {
+        let vocab_raw = fs::read_to_string(vocab_json).map_err(|err| {
+            StableDiffusionError::Asset(format!("failed to read {}: {err}", vocab_json.display()))
+        })?;
+        let vocab: HashMap<String, u32> = serde_json::from_str(&vocab_raw).map_err(|err| {
+            StableDiffusionError::Asset(format!("failed to parse {}: {err}", vocab_json.display()))
+        })?;
+        let merges_raw = fs::read_to_string(merges_txt).map_err(|err| {
+            StableDiffusionError::Asset(format!("failed to read {}: {err}", merges_txt.display()))
+        })?;
+        let mut merges = HashMap::new();
+        for (rank, line) in merges_raw
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .enumerate()
+        {
+            let mut parts = line.split_whitespace();
+            let Some(left) = parts.next() else {
+                continue;
+            };
+            let Some(right) = parts.next() else {
+                continue;
+            };
+            merges.insert((left.to_string(), right.to_string()), rank);
+        }
+        let unk_token_id = *vocab.get("<|endoftext|>").ok_or_else(|| {
+            StableDiffusionError::Asset(format!(
+                "Stable Diffusion tokenizer vocab {} is missing <|endoftext|>",
+                vocab_json.display()
+            ))
+        })?;
+        Ok(Self {
+            vocab,
+            merges,
+            byte_encoder: bytes_to_unicode(),
+            unk_token_id,
+        })
+    }
+
+    fn token_id(&self, token: &str) -> Result<u32> {
+        self.vocab.get(token).copied().ok_or_else(|| {
+            StableDiffusionError::Asset(format!(
+                "Stable Diffusion tokenizer is missing required token {token}"
+            ))
+        })
+    }
+
+    fn encode(&self, prompt: &str) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        for token in clip_pretokenize(prompt) {
+            let encoded = token
+                .as_bytes()
+                .iter()
+                .map(|byte| self.byte_encoder[byte])
+                .collect::<String>();
+            for piece in self.bpe(&encoded) {
+                ids.push(*self.vocab.get(&piece).unwrap_or(&self.unk_token_id));
+            }
+        }
+        Ok(ids)
+    }
+
+    fn bpe(&self, token: &str) -> Vec<String> {
+        let chars = token.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return Vec::new();
+        }
+        let mut word = Vec::with_capacity(chars.len());
+        for ch in chars.iter().take(chars.len().saturating_sub(1)) {
+            word.push(ch.to_string());
+        }
+        word.push(format!("{}</w>", chars[chars.len() - 1]));
+        if word.len() == 1 {
+            return word;
+        }
+
+        loop {
+            let mut best: Option<(usize, usize)> = None;
+            for index in 0..word.len() - 1 {
+                if let Some(rank) = self
+                    .merges
+                    .get(&(word[index].clone(), word[index + 1].clone()))
+                {
+                    if best.map_or(true, |(_, best_rank)| *rank < best_rank) {
+                        best = Some((index, *rank));
+                    }
+                }
+            }
+            let Some((index, _rank)) = best else {
+                break;
+            };
+            let merged = format!("{}{}", word[index], word[index + 1]);
+            word.splice(index..=index + 1, [merged]);
+            if word.len() == 1 {
+                break;
+            }
+        }
+        word
+    }
+}
+
+fn clip_pretokenize(prompt: &str) -> Vec<String> {
+    let text = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_kind: Option<bool> = None;
+    for ch in text.to_lowercase().chars() {
+        if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current_kind = None;
+            continue;
+        }
+        let is_word = ch.is_alphanumeric();
+        if current_kind == Some(is_word) || current.is_empty() {
+            current.push(ch);
+            current_kind = Some(is_word);
+        } else {
+            tokens.push(std::mem::take(&mut current));
+            current.push(ch);
+            current_kind = Some(is_word);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn bytes_to_unicode() -> HashMap<u8, char> {
+    let mut bytes = Vec::new();
+    bytes.extend(b'!'..=b'~');
+    bytes.extend(0xA1..=0xAC);
+    bytes.extend(0xAE..=0xFF);
+
+    let mut chars = bytes.iter().copied().map(u32::from).collect::<Vec<_>>();
+    let mut extra = 0u32;
+    for byte in 0u8..=255 {
+        if !bytes.contains(&byte) {
+            bytes.push(byte);
+            chars.push(256 + extra);
+            extra += 1;
+        }
+    }
+
+    bytes
+        .into_iter()
+        .zip(chars)
+        .filter_map(|(byte, codepoint)| char::from_u32(codepoint).map(|ch| (byte, ch)))
+        .collect()
 }
 
 impl ClipTextEncoder {
@@ -494,6 +647,49 @@ mod tests {
         assert_eq!(encoded.token_ids[0], 0);
         assert_eq!(encoded.token_ids[1], 1);
         assert_eq!(encoded.token_ids[2], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn clip_bpe_fallback_ignores_inter_word_spaces() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "puppygrad-sd-bpe-tokenizer-spaces-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let vocab = root.join("vocab.json");
+        let merges = root.join("merges.txt");
+        fs::write(
+            &vocab,
+            r#"{
+                "<|startoftext|>": 0,
+                "<|endoftext|>": 1,
+                "cat</w>": 2,
+                "on</w>": 3,
+                "puppy</w>": 4,
+                "pillow</w>": 5
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            &merges,
+            "#version: 0.2\nc a\nca t</w>\no n</w>\np u\npu p\npup p\npupp y</w>\np i\npi l\npil l\npill o\npillo w</w>\n",
+        )
+        .unwrap();
+
+        let tokenizer = StableDiffusionTokenizer::from_diffusers_files(
+            root.join("tokenizer.json"),
+            &vocab,
+            &merges,
+        )?;
+        let encoded = tokenizer.encode_prompt("cat on puppy pillow")?;
+
+        fs::remove_dir_all(&root).ok();
+        assert_eq!(&encoded.token_ids[..6], &[0, 2, 3, 4, 5, 1]);
         Ok(())
     }
 

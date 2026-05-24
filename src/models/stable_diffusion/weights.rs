@@ -677,12 +677,12 @@ fn load_unet_spatial_transformer(
     prefix: &str,
     channels: usize,
     cross_attention_dim: usize,
-    attention_head_dim: usize,
+    attention_heads: usize,
     transformer_layers: usize,
 ) -> Result<UnetSpatialTransformerWeights> {
-    if attention_head_dim == 0 || channels % attention_head_dim != 0 {
+    if attention_heads == 0 || channels % attention_heads != 0 {
         return Err(StableDiffusionError::Config(format!(
-            "UNet attention_head_dim {attention_head_dim} must divide channels {channels}"
+            "UNet attention_head_dim {attention_heads} must divide channels {channels}"
         )));
     }
     if transformer_layers == 0 {
@@ -690,7 +690,6 @@ fn load_unet_spatial_transformer(
             "UNet transformer_layers_per_block must be > 0".to_string(),
         ));
     }
-    let heads = channels / attention_head_dim;
     let mut blocks = Vec::with_capacity(transformer_layers);
     for layer in 0..transformer_layers {
         blocks.push(unet_transformer_block_weights_from_tensors(
@@ -698,7 +697,7 @@ fn load_unet_spatial_transformer(
             &format!("{prefix}.transformer_blocks.{layer}"),
             channels,
             cross_attention_dim,
-            heads,
+            attention_heads,
             channels * 4,
         )?);
     }

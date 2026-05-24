@@ -227,6 +227,25 @@ fn assert_tensor_matches_reference(
         expected.slice.len(),
         actual.len()
     );
+    let print_stats = std::env::var_os("PUPPYGRAD_SD_PARITY_PRINT_STATS").is_some();
+    if print_stats {
+        if let Some(expected_stats) = expected.stats {
+            let actual_stats = actual.stats()?;
+            eprintln!(
+                "{label} stats: actual min={:.6} max={:.6} mean={:.6} std={:.6} rms={:.6}; expected min={:.6} max={:.6} mean={:.6} std={:.6} rms={:.6}",
+                actual_stats.min,
+                actual_stats.max,
+                actual_stats.mean,
+                actual_stats.stddev,
+                actual_stats.rms,
+                expected_stats.min,
+                expected_stats.max,
+                expected_stats.mean,
+                expected_stats.stddev,
+                expected_stats.rms,
+            );
+        }
+    }
     for (index, expected_value) in expected.slice.iter().copied().enumerate() {
         assert_close(
             actual.data()[index],

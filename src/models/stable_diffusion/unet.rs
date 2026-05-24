@@ -353,20 +353,16 @@ pub fn unet_transformer_block(
     eps: f32,
 ) -> Result<SdTensor> {
     let norm1 = layer_norm_last_dim(input, &weights.norm1_weight, &weights.norm1_bias, eps)?;
-    let _ = (&norm1, &weights.self_attn);
-    let hidden = input.clone();
+    let self_attn = unet_attention(&norm1, &norm1, &weights.self_attn)?;
+    let hidden = input.add(&self_attn)?;
 
     let norm2 = layer_norm_last_dim(&hidden, &weights.norm2_weight, &weights.norm2_bias, eps)?;
     let cross_attn = unet_attention(&norm2, encoder_hidden_states, &weights.cross_attn)?;
     let hidden = hidden.add(&cross_attn)?;
 
-    let _ = (
-        &weights.norm3_weight,
-        &weights.norm3_bias,
-        &weights.feed_forward,
-        eps,
-    );
-    Ok(hidden)
+    let norm3 = layer_norm_last_dim(&hidden, &weights.norm3_weight, &weights.norm3_bias, eps)?;
+    let feed_forward = unet_feed_forward(&norm3, &weights.feed_forward)?;
+    hidden.add(&feed_forward)
 }
 
 pub fn unet_spatial_transformer(
@@ -383,7 +379,13 @@ pub fn unet_spatial_transformer(
         ));
     }
     let residual = input.clone();
-    let hidden = group_norm_nchw(input, groups, &weights.norm_weight, &weights.norm_bias, eps)?;
+    let hidden = group_norm_nchw(
+        input,
+        groups,
+        &weights.norm_weight,
+        &weights.norm_bias,
+        1e-6,
+    )?;
     let hidden = unet_conv2d(&hidden, &weights.proj_in)?;
     let inner_channels = hidden.shape()[1];
     let mut hidden = spatial_nchw_to_sequence(&hidden)?;
@@ -609,7 +611,19 @@ pub fn sequence_to_spatial_nchw(
 }
 
 fn gelu_scalar(x: f32) -> f32 {
-    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
+    0.5 * x * (1.0 + erf_approx(x * std::f32::consts::FRAC_1_SQRT_2))
+}
+
+fn erf_approx(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp());
+    sign * y
 }
 
 fn add_channel_bias_from_row(input: &mut SdTensor, row: &SdTensor) -> Result<()> {
