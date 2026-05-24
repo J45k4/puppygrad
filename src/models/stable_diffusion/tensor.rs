@@ -4,6 +4,7 @@ use super::{Result, StableDiffusionError};
 
 const PARALLEL_MATMUL_THRESHOLD: usize = 1_000_000;
 const PARALLEL_GROUP_NORM_THRESHOLD: usize = 64 * 1024;
+const PARALLEL_LAYER_NORM_THRESHOLD: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -736,6 +737,16 @@ pub fn layer_norm_last_dim(
     beta: &[f32],
     eps: f32,
 ) -> Result<SdTensor> {
+    layer_norm_last_dim_impl(input, gamma, beta, eps, true)
+}
+
+fn layer_norm_last_dim_impl(
+    input: &SdTensor,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
     let cols = *input.shape.last().ok_or_else(|| {
         StableDiffusionError::InvalidInput("layer norm requires rank >= 1".to_string())
     })?;
@@ -747,25 +758,63 @@ pub fn layer_norm_last_dim(
         )));
     }
     let rows = input.data.len() / cols;
-    let mut out = input.data.clone();
-    for row in 0..rows {
-        let start = row * cols;
-        let values = &input.data[start..start + cols];
-        let mean = values.iter().sum::<f32>() / cols as f32;
-        let variance = values
-            .iter()
-            .map(|value| {
-                let delta = *value - mean;
-                delta * delta
-            })
-            .sum::<f32>()
-            / cols as f32;
-        let inv_std = 1.0 / (variance + eps).sqrt();
-        for col in 0..cols {
-            out[start + col] = (values[col] - mean) * inv_std * gamma[col] + beta[col];
+    let mut out = vec![0.0; input.data.len()];
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(rows);
+
+    if allow_parallel && workers > 1 && input.data.len() >= PARALLEL_LAYER_NORM_THRESHOLD {
+        let rows_per_chunk = rows.div_ceil(workers);
+        let values_per_chunk = rows_per_chunk * cols;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let input_data = &input.data;
+                let first_row = chunk_index * rows_per_chunk;
+                scope.spawn(move || {
+                    for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                        let row = first_row + local_row;
+                        let start = row * cols;
+                        fill_layer_norm_row(
+                            &input_data[start..start + cols],
+                            gamma,
+                            beta,
+                            eps,
+                            out_row,
+                        );
+                    }
+                });
+            }
+        });
+    } else {
+        for row in 0..rows {
+            let start = row * cols;
+            fill_layer_norm_row(
+                &input.data[start..start + cols],
+                gamma,
+                beta,
+                eps,
+                &mut out[start..start + cols],
+            );
         }
     }
     SdTensor::new(input.shape.clone(), out)
+}
+
+fn fill_layer_norm_row(input: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &mut [f32]) {
+    let mean = input.iter().sum::<f32>() / input.len() as f32;
+    let variance = input
+        .iter()
+        .map(|value| {
+            let delta = *value - mean;
+            delta * delta
+        })
+        .sum::<f32>()
+        / input.len() as f32;
+    let inv_std = 1.0 / (variance + eps).sqrt();
+    for col in 0..input.len() {
+        out[col] = (input[col] - mean) * inv_std * gamma[col] + beta[col];
+    }
 }
 
 pub fn matmul2d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
@@ -1359,6 +1408,64 @@ mod tests {
         assert_eq!(
             matmul2d(&input, &right).unwrap().data(),
             &[10.0, 14.0, 14.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn parallel_layer_norm_matches_serial_reference() {
+        let input = SdTensor::new(
+            [128, 320],
+            (0..128 * 320)
+                .map(|index| ((index % 61) as f32 - 30.0) / 57.0)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = (0..320)
+            .map(|index| 0.9 + index as f32 / 2048.0)
+            .collect::<Vec<_>>();
+        let beta = (0..320)
+            .map(|index| (index as f32 - 160.0) / 2048.0)
+            .collect::<Vec<_>>();
+
+        let serial = layer_norm_last_dim_impl(&input, &gamma, &beta, 1e-5, false).unwrap();
+        let parallel = layer_norm_last_dim_impl(&input, &gamma, &beta, 1e-5, true).unwrap();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+    }
+
+    #[test]
+    #[ignore]
+    fn layer_norm_parallel_benchmark_smoke() {
+        let input = SdTensor::new(
+            [4096, 320],
+            (0..4096 * 320)
+                .map(|index| ((index % 67) as f32 - 33.0) / 61.0)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = (0..320)
+            .map(|index| 0.9 + index as f32 / 4096.0)
+            .collect::<Vec<_>>();
+        let beta = (0..320)
+            .map(|index| (index as f32 - 160.0) / 4096.0)
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let serial = layer_norm_last_dim_impl(&input, &gamma, &beta, 1e-5, false).unwrap();
+        let serial_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let parallel = layer_norm_last_dim_impl(&input, &gamma, &beta, 1e-5, true).unwrap();
+        let parallel_elapsed = started.elapsed();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+        eprintln!(
+            "layer_norm benchmark: serial={:.3}s parallel={:.3}s speedup={:.2}x",
+            serial_elapsed.as_secs_f64(),
+            parallel_elapsed.as_secs_f64(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 
