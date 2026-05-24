@@ -5,6 +5,7 @@ use super::{Result, StableDiffusionError};
 const PARALLEL_MATMUL_THRESHOLD: usize = 1_000_000;
 const PARALLEL_GROUP_NORM_THRESHOLD: usize = 64 * 1024;
 const PARALLEL_LAYER_NORM_THRESHOLD: usize = 64 * 1024;
+const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -1013,6 +1014,16 @@ pub fn scaled_dot_product_attention(
     value: &SdTensor,
     additive_mask: Option<&SdTensor>,
 ) -> Result<SdTensor> {
+    scaled_dot_product_attention_impl(query, key, value, additive_mask, true)
+}
+
+fn scaled_dot_product_attention_impl(
+    query: &SdTensor,
+    key: &SdTensor,
+    value: &SdTensor,
+    additive_mask: Option<&SdTensor>,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
     let [batch, heads, query_len, dim] = shape4(query, "attention query")?;
     let [key_batch, key_heads, key_len, key_dim] = shape4(key, "attention key")?;
     let [value_batch, value_heads, value_len, value_dim] = shape4(value, "attention value")?;
@@ -1034,41 +1045,134 @@ pub fn scaled_dot_product_attention(
 
     let scale = 1.0 / (dim as f32).sqrt();
     let mut out = vec![0.0; batch * heads * query_len * value_dim];
-    for b in 0..batch {
-        for h in 0..heads {
-            for q in 0..query_len {
-                let mut scores = vec![0.0; key_len];
-                for k in 0..key_len {
-                    let mut dot = 0.0;
-                    for d in 0..dim {
-                        dot += query.data[nchw_index(b, h, q, d, heads, query_len, dim)]
-                            * key.data[nchw_index(b, h, k, d, heads, key_len, dim)];
-                    }
-                    scores[k] = dot * scale;
-                    if let Some(mask) = additive_mask {
-                        let mask_indices = [b, h, q, k];
-                        let mask_index = broadcast_linear_index(
-                            &mask_indices,
-                            &[batch, heads, query_len, key_len],
-                            mask.shape(),
+    let query_rows = batch * heads * query_len;
+    let estimated_mul_adds = query_rows
+        .saturating_mul(key_len)
+        .saturating_mul(dim + value_dim);
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(query_rows);
+
+    if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_ATTENTION_THRESHOLD {
+        let rows_per_chunk = query_rows.div_ceil(workers);
+        let values_per_chunk = rows_per_chunk * value_dim;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let first_query_row = chunk_index * rows_per_chunk;
+                let query_data = &query.data;
+                let key_data = &key.data;
+                let value_data = &value.data;
+                scope.spawn(move || {
+                    for (local_query_row, out_row) in out_chunk.chunks_mut(value_dim).enumerate() {
+                        let query_row = first_query_row + local_query_row;
+                        let b = query_row / (heads * query_len);
+                        let within_batch = query_row % (heads * query_len);
+                        let h = within_batch / query_len;
+                        let q = within_batch % query_len;
+                        fill_attention_query_row(
+                            query_data,
+                            key_data,
+                            value_data,
+                            additive_mask,
+                            b,
+                            h,
+                            q,
+                            batch,
+                            heads,
+                            query_len,
+                            key_len,
+                            dim,
+                            value_dim,
+                            scale,
+                            out_row,
                         );
-                        scores[k] += mask.data[mask_index];
                     }
-                }
-                softmax_slice_in_place(&mut scores);
-                for value_channel in 0..value_dim {
-                    let mut sum = 0.0;
-                    for (k, score) in scores.iter().copied().enumerate() {
-                        sum += score
-                            * value.data
-                                [nchw_index(b, h, k, value_channel, heads, key_len, value_dim)];
-                    }
-                    out[nchw_index(b, h, q, value_channel, heads, query_len, value_dim)] = sum;
+                });
+            }
+        });
+    } else {
+        for b in 0..batch {
+            for h in 0..heads {
+                for q in 0..query_len {
+                    let out_index = nchw_index(b, h, q, 0, heads, query_len, value_dim);
+                    fill_attention_query_row(
+                        &query.data,
+                        &key.data,
+                        &value.data,
+                        additive_mask,
+                        b,
+                        h,
+                        q,
+                        batch,
+                        heads,
+                        query_len,
+                        key_len,
+                        dim,
+                        value_dim,
+                        scale,
+                        &mut out[out_index..out_index + value_dim],
+                    );
                 }
             }
         }
     }
     SdTensor::new([batch, heads, query_len, value_dim], out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_attention_query_row(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    additive_mask: Option<&SdTensor>,
+    batch_index: usize,
+    head: usize,
+    query_index: usize,
+    batch: usize,
+    heads: usize,
+    query_len: usize,
+    key_len: usize,
+    dim: usize,
+    value_dim: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let mut scores = vec![0.0; key_len];
+    for key_index in 0..key_len {
+        let mut dot = 0.0;
+        for d in 0..dim {
+            dot += query[nchw_index(batch_index, head, query_index, d, heads, query_len, dim)]
+                * key[nchw_index(batch_index, head, key_index, d, heads, key_len, dim)];
+        }
+        scores[key_index] = dot * scale;
+        if let Some(mask) = additive_mask {
+            let mask_indices = [batch_index, head, query_index, key_index];
+            let mask_index = broadcast_linear_index(
+                &mask_indices,
+                &[batch, heads, query_len, key_len],
+                mask.shape(),
+            );
+            scores[key_index] += mask.data[mask_index];
+        }
+    }
+    softmax_slice_in_place(&mut scores);
+    for value_channel in 0..value_dim {
+        let mut sum = 0.0;
+        for (key_index, score) in scores.iter().copied().enumerate() {
+            sum += score
+                * value[nchw_index(
+                    batch_index,
+                    head,
+                    key_index,
+                    value_channel,
+                    heads,
+                    key_len,
+                    value_dim,
+                )];
+        }
+        out[value_channel] = sum;
+    }
 }
 
 fn tensor_len(shape: &[usize]) -> Result<usize> {
@@ -1579,5 +1683,79 @@ mod tests {
 
         assert_eq!(out.shape(), &[1, 1, 2, 1]);
         assert_close(out.data(), &[13.302_38, 16.697_62], 1e-4);
+    }
+
+    #[test]
+    fn parallel_attention_matches_serial_reference() {
+        let query = SdTensor::new(
+            [1, 4, 128, 16],
+            (0..4 * 128 * 16)
+                .map(|index| ((index % 71) as f32 - 35.0) / 67.0)
+                .collect(),
+        )
+        .unwrap();
+        let key = SdTensor::new(
+            [1, 4, 77, 16],
+            (0..4 * 77 * 16)
+                .map(|index| ((index % 61) as f32 - 30.0) / 59.0)
+                .collect(),
+        )
+        .unwrap();
+        let value = SdTensor::new(
+            [1, 4, 77, 16],
+            (0..4 * 77 * 16)
+                .map(|index| ((index % 53) as f32 - 26.0) / 47.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let serial = scaled_dot_product_attention_impl(&query, &key, &value, None, false).unwrap();
+        let parallel = scaled_dot_product_attention_impl(&query, &key, &value, None, true).unwrap();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+    }
+
+    #[test]
+    #[ignore]
+    fn attention_parallel_benchmark_smoke() {
+        let query = SdTensor::new(
+            [1, 8, 4096, 40],
+            (0..8 * 4096 * 40)
+                .map(|index| ((index % 73) as f32 - 36.0) / 67.0)
+                .collect(),
+        )
+        .unwrap();
+        let key = SdTensor::new(
+            [1, 8, 77, 40],
+            (0..8 * 77 * 40)
+                .map(|index| ((index % 67) as f32 - 33.0) / 61.0)
+                .collect(),
+        )
+        .unwrap();
+        let value = SdTensor::new(
+            [1, 8, 77, 40],
+            (0..8 * 77 * 40)
+                .map(|index| ((index % 59) as f32 - 29.0) / 53.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let serial = scaled_dot_product_attention_impl(&query, &key, &value, None, false).unwrap();
+        let serial_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let parallel = scaled_dot_product_attention_impl(&query, &key, &value, None, true).unwrap();
+        let parallel_elapsed = started.elapsed();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+        eprintln!(
+            "attention benchmark: serial={:.3}s parallel={:.3}s speedup={:.2}x",
+            serial_elapsed.as_secs_f64(),
+            parallel_elapsed.as_secs_f64(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
     }
 }
