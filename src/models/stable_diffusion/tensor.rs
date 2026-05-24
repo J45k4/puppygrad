@@ -12,7 +12,7 @@ const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV1X1_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV3X3_THRESHOLD: usize = 64_000_000;
-const PACKED_SIDE_TAP_MAX_SPATIAL: usize = 4_096;
+const PACKED_SIDE_TAP_MAX_SPATIAL: usize = 16_384;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
