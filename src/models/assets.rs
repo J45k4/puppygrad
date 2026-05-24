@@ -1,7 +1,7 @@
 use std::error;
 use std::fmt;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -170,6 +170,7 @@ pub fn download_huggingface_file(
 
     let tmp = dst.with_extension("download");
     let url = format!("https://huggingface.co/{model_id}/resolve/{revision}/{filename}");
+    eprintln!("download: {url} -> {}", dst.display());
     let client = reqwest::blocking::Client::builder()
         .user_agent("puppygrad/0.1")
         .build()
@@ -182,20 +183,67 @@ pub fn download_huggingface_file(
             url: url.clone(),
             source,
         })?;
+    let expected_len = response.content_length();
     let mut file = File::create(&tmp).map_err(|source| AssetError::CreateTempFile {
         path: tmp.display().to_string(),
         source,
     })?;
-    io::copy(&mut response, &mut file).map_err(|source| AssetError::WriteDownload {
-        path: tmp.display().to_string(),
-        source,
-    })?;
+    let bytes =
+        copy_with_progress(&mut response, &mut file, filename, expected_len).map_err(|source| {
+            AssetError::WriteDownload {
+                path: tmp.display().to_string(),
+                source,
+            }
+        })?;
     fs::rename(&tmp, dst).map_err(|source| AssetError::RenameDownload {
         from: tmp.display().to_string(),
         to: dst.display().to_string(),
         source,
     })?;
+    match expected_len {
+        Some(total) => eprintln!(
+            "download: wrote {} bytes for {} (expected {})",
+            bytes, filename, total
+        ),
+        None => eprintln!("download: wrote {} bytes for {}", bytes, filename),
+    }
     Ok(())
+}
+
+fn copy_with_progress(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    filename: &str,
+    expected_len: Option<u64>,
+) -> io::Result<u64> {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    const REPORT_EVERY_BYTES: u64 = 64 * 1024 * 1024;
+
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut written = 0_u64;
+    let mut next_report = REPORT_EVERY_BYTES;
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(written);
+        }
+        writer.write_all(&buffer[..read])?;
+        written += read as u64;
+        if written >= next_report {
+            match expected_len {
+                Some(total) => eprintln!(
+                    "download: {} {} / {} bytes ({:.1}%)",
+                    filename,
+                    written,
+                    total,
+                    (written as f64 / total.max(1) as f64) * 100.0
+                ),
+                None => eprintln!("download: {} {} bytes", filename, written),
+            }
+            next_report = written.saturating_add(REPORT_EVERY_BYTES);
+        }
+    }
 }
 
 fn sanitize_cache_component(value: &str) -> String {

@@ -1,0 +1,15 @@
+# Keep docs and tiny curated JSON fixtures reviewable.
+*
+!README.md
+!.gitignore
+!*.json
+
+# Large generated artifacts should stay local-only.
+*.png
+*.jpg
+*.jpeg
+*.safetensors
+*.bin
+*.pt
+*.npy
+*.npz

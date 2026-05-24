@@ -2100,6 +2100,7 @@ dependencies = [
  "ctrlc",
  "flate2",
  "gemm",
+ "half",
  "image",
  "nokhwa",
  "reqwest",

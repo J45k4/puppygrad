@@ -17,6 +17,7 @@ Implemented:
 | ResNet | Working MVP | Rust reference | Loads torchvision-origin ResNet-18 safetensors, folds Conv+BatchNorm at load time, preprocesses RGB images or camera frames, and prints ImageNet top-k classes. |
 | Piper/VITS | In progress | Rust reference pieces | Piper parses voice configs and maps text-mode phonemes to ids; VITS owns architecture-oriented 1D CPU kernels and debug WAV synthesis. Full VITS checkpoint inference is not complete yet. |
 | Bark | Working external backend | Python Transformers bridge plus Rust metadata/tokenizer support | Prepares `suno/bark-small` assets, parses Bark config/generation metadata, tokenizes text through a local WordPiece path, and writes WAV output through the shared audio module when the Python Transformers backend is available. |
+| Stable Diffusion 1.x / 1.5 | Working external backend; native reference path | Python Diffusers bridge plus Rust CPU kernels | Runs text-to-image through `python-diffusers` or a local Rust path that loads CLIP, UNet, VAE, and DDIM from Diffusers-format safetensors. |
 | Qwen | Stub | None yet | CLI placeholder for future native loading/runtime work. |
 
 Model assets are stored under the project-root `models/` directory, which is ignored by git. Rust source lives under `src/models/` and is tracked. GPT-2-specific code is organized under `src/models/gpt2/`, with the current Rust reference implementation in `src/models/gpt2/rust.rs`.
@@ -80,6 +81,78 @@ Generate a WAV through the external Transformers backend:
 ```
 
 Known limitations: model execution is delegated to Python/Transformers, Bark weights are currently the Hugging Face `pytorch_model.bin` file rather than native Rust tensors, and voice presets require the corresponding speaker embedding assets to be available to the external backend.
+
+### Stable Diffusion runtime status
+
+The `stable-diffusion` command targets Stable Diffusion 1.x / 1.5 Diffusers-format checkpoints, batch size 1, text-to-image generation, classifier-free guidance, and DDIM as the first native scheduler target. SDXL, img2img, inpainting, ControlNet, LoRA, textual inversion, safety checker execution, batched generation, GPU acceleration, and quantized native execution are outside the initial native scope.
+
+The external backend requires Python packages `diffusers`, `torch`, `transformers`, `safetensors`, and `Pillow`:
+
+```bash
+./target/release/puppygrad stable-diffusion \
+  --backend python-diffusers \
+  --download \
+  --prompt "a corgi in a spacesuit" \
+  --out /tmp/corgi.png \
+  --steps 25 \
+  --seed 42
+```
+
+The Python backend may execute Python, Torch, Diffusers, Transformers, and Pillow. The native `rust` backend does not call Python, Torch, Diffusers, Transformers, ONNX Runtime, or another model execution process. It loads CLIP, UNet, VAE, and DDIM weights from local Diffusers-format safetensors and runs a correctness-first CPU reference path.
+
+Default image dimensions are `512x512`. Width and height must be positive multiples of 8. Output format is inferred from `--out`; `.png`, `.jpg`, and `.jpeg` are supported, with PNG preferred for examples. Generated image bytes are written only to the requested file path.
+
+Users are responsible for complying with model licenses, use restrictions, and Hugging Face access terms. The default model id is `runwayml/stable-diffusion-v1-5`, which may require accepting upstream terms or providing credentials in some environments. For tiny local smoke fixtures, `hf-internal-testing/tiny-stable-diffusion-pipe` is useful when its availability fits the test environment.
+
+Native Rust inference expects this Diffusers directory layout:
+
+```text
+model_index.json
+scheduler/scheduler_config.json
+tokenizer/vocab.json
+tokenizer/merges.txt
+tokenizer/tokenizer_config.json
+text_encoder/config.json
+text_encoder/model.safetensors
+unet/config.json
+unet/diffusion_pytorch_model.safetensors
+vae/config.json
+vae/diffusion_pytorch_model.safetensors
+```
+
+The native path prefers unsharded safetensors. PyTorch `.bin` weights and sharded safetensors currently produce explicit unsupported-checkpoint errors. The Python backend can load any layout Diffusers supports.
+
+`tokenizer/tokenizer.json` is used when present, but the native tokenizer can also build the CLIP BPE tokenizer from `tokenizer/vocab.json` and `tokenizer/merges.txt`.
+
+Local-only Python execution:
+
+```bash
+./target/release/puppygrad stable-diffusion \
+  --backend python-diffusers \
+  --model-dir models/stable-diffusion-v1-5 \
+  --prompt "hello" \
+  --out /tmp/sd.png
+```
+
+Native local execution:
+
+```bash
+./target/release/puppygrad stable-diffusion \
+  --backend rust \
+  --model-dir models/stable-diffusion-v1-5 \
+  --prompt "a corgi in a spacesuit" \
+  --negative-prompt "blurry, low quality" \
+  --out /tmp/corgi-rust.png \
+  --steps 25 \
+  --guidance-scale 7.5 \
+  --seed 42
+```
+
+Pass `--stats` with the native backend to print per-step latent statistics and final decoded/RGB tensor statistics to stderr. This is intended for progress visibility and parity debugging; generated image bytes are still written only to `--out`.
+
+Troubleshooting: install missing Python packages with `python3 -m pip install diffusers torch transformers safetensors Pillow` for the Python backend; pass `--download` for model-id loading or provide `--model-dir` with the layout above; authenticate with Hugging Face and accept model terms for gated download failures; choose dimensions that are positive multiples of 8; expect the native CPU path to be slow before optimization.
+
+Parity fixtures are generated outside the Rust runtime with `scripts/stable_diffusion_reference_fixture.py`. They capture token ids, CLIP embedding slices, scheduler state, first-step UNet predictions, first-step latents, VAE decoded tensor slices, and RGB tensor statistics. Rust tests consume fixtures from `tests/data/stable_diffusion/`, or from `PUPPYGRAD_SD_PARITY_FIXTURE` for local-only JSON, and skip real-model comparisons unless matching model assets are present; set `PUPPYGRAD_SD_PARITY_MODEL_DIR` to point a fixture at a local Diffusers directory. `scripts/stable_diffusion_compare_backends.py` can run both backends locally and write a JSON summary plus generated images for manual comparison.
 
 ### ResNet native runtime status
 

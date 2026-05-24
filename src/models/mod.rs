@@ -10,6 +10,7 @@ pub mod onnx;
 pub mod piper;
 pub mod resnet;
 pub mod safetensors;
+pub mod stable_diffusion;
 pub mod streaming;
 pub mod vits;
 pub mod whisper;

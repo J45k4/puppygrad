@@ -24,6 +24,11 @@ use puppygrad::models::resnet::{
     default_resnet18_dir, download_resnet18_assets, preprocess_resnet_video_frame,
     ResNetClassification, ResNetRuntime,
 };
+use puppygrad::models::stable_diffusion::{
+    default_stable_diffusion_dir, generate_stable_diffusion, StableDiffusionBackend,
+    StableDiffusionOutputFormat, StableDiffusionRuntimeOptions, StableDiffusionScheduler,
+    STABLE_DIFFUSION_V1_5_MODEL_ID,
+};
 use puppygrad::models::streaming::{escape_raw_token, RawTokenDecoder};
 use puppygrad::models::vits::{
     DeterministicRng, VitsSynthesisScales, VitsWeightConfig, VitsWeights,
@@ -350,6 +355,73 @@ enum Command {
         /// Number of worker threads for the native Rust Bark backend.
         #[arg(long)]
         threads: Option<usize>,
+    },
+
+    /// Generate an image with Stable Diffusion 1.x text-to-image backends.
+    StableDiffusion {
+        /// Local Diffusers-format model directory.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+
+        /// Hugging Face model id used when --download or model-id based execution is requested.
+        #[arg(long, default_value = STABLE_DIFFUSION_V1_5_MODEL_ID)]
+        model_id: String,
+
+        /// Hugging Face revision used with --download.
+        #[arg(long, default_value = "main")]
+        revision: String,
+
+        /// Permit Hugging Face/Diffusers downloads; omitted requires local model files or cache.
+        #[arg(long)]
+        download: bool,
+
+        /// Execution backend. python-diffusers is external; rust is native-only.
+        #[arg(long, value_enum, default_value_t = StableDiffusionBackendArg::PythonDiffusers)]
+        backend: StableDiffusionBackendArg,
+
+        /// Python executable for the python-diffusers backend.
+        #[arg(long, default_value = "python3")]
+        python: String,
+
+        /// Text prompt.
+        #[arg(long)]
+        prompt: String,
+
+        /// Negative prompt for classifier-free guidance.
+        #[arg(long, default_value = "")]
+        negative_prompt: String,
+
+        /// Output PNG or JPEG image path.
+        #[arg(long)]
+        out: PathBuf,
+
+        /// Denoising step count.
+        #[arg(long, default_value_t = 25)]
+        steps: usize,
+
+        /// Classifier-free guidance scale.
+        #[arg(long, default_value_t = 7.5)]
+        guidance_scale: f32,
+
+        /// Output image width. Must be a positive multiple of 8.
+        #[arg(long, default_value_t = 512)]
+        width: u32,
+
+        /// Output image height. Must be a positive multiple of 8.
+        #[arg(long, default_value_t = 512)]
+        height: u32,
+
+        /// Deterministic generation seed.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// Scheduler. DDIM is the first native target; Euler/DDPM are exposed for Python parity work.
+        #[arg(long, value_enum, default_value_t = StableDiffusionSchedulerArg::Ddim)]
+        scheduler: StableDiffusionSchedulerArg,
+
+        /// Print timing and generation metadata to stderr.
+        #[arg(long)]
+        stats: bool,
     },
 
     /// Debug ONNX model contents used by native model loaders.
@@ -1110,6 +1182,41 @@ fn main() -> Result<()> {
             max_semantic_tokens,
             threads,
         }),
+        Command::StableDiffusion {
+            model_dir,
+            model_id,
+            revision,
+            download,
+            backend,
+            python,
+            prompt,
+            negative_prompt,
+            out,
+            steps,
+            guidance_scale,
+            width,
+            height,
+            seed,
+            scheduler,
+            stats,
+        } => run_stable_diffusion(RunStableDiffusionArgs {
+            model_dir,
+            model_id,
+            revision,
+            download,
+            backend,
+            python,
+            prompt,
+            negative_prompt,
+            out,
+            steps,
+            guidance_scale,
+            width,
+            height,
+            seed,
+            scheduler,
+            stats,
+        }),
         Command::Onnx { cmd } => run_onnx(cmd),
         Command::Qwen {
             model_dir,
@@ -1389,6 +1496,39 @@ enum BarkBackendArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum StableDiffusionBackendArg {
+    #[value(name = "python-diffusers")]
+    PythonDiffusers,
+    Rust,
+}
+
+impl From<StableDiffusionBackendArg> for StableDiffusionBackend {
+    fn from(value: StableDiffusionBackendArg) -> Self {
+        match value {
+            StableDiffusionBackendArg::PythonDiffusers => StableDiffusionBackend::PythonDiffusers,
+            StableDiffusionBackendArg::Rust => StableDiffusionBackend::Rust,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum StableDiffusionSchedulerArg {
+    Ddim,
+    Euler,
+    Ddpm,
+}
+
+impl From<StableDiffusionSchedulerArg> for StableDiffusionScheduler {
+    fn from(value: StableDiffusionSchedulerArg) -> Self {
+        match value {
+            StableDiffusionSchedulerArg::Ddim => StableDiffusionScheduler::Ddim,
+            StableDiffusionSchedulerArg::Euler => StableDiffusionScheduler::Euler,
+            StableDiffusionSchedulerArg::Ddpm => StableDiffusionScheduler::Ddpm,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum ExperimentFormatArg {
     Table,
     Csv,
@@ -1535,6 +1675,25 @@ struct RunBarkArgs {
     top_p: Option<f32>,
     max_semantic_tokens: Option<usize>,
     threads: Option<usize>,
+}
+
+struct RunStableDiffusionArgs {
+    model_dir: Option<PathBuf>,
+    model_id: String,
+    revision: String,
+    download: bool,
+    backend: StableDiffusionBackendArg,
+    python: String,
+    prompt: String,
+    negative_prompt: String,
+    out: PathBuf,
+    steps: usize,
+    guidance_scale: f32,
+    width: u32,
+    height: u32,
+    seed: u64,
+    scheduler: StableDiffusionSchedulerArg,
+    stats: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2421,6 +2580,58 @@ fn run_bark(args: RunBarkArgs) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn run_stable_diffusion(args: RunStableDiffusionArgs) -> Result<()> {
+    let backend: StableDiffusionBackend = args.backend.into();
+    let scheduler: StableDiffusionScheduler = args.scheduler.into();
+    let output_format = StableDiffusionOutputFormat::infer(&args.out)?;
+    let model_dir = match (args.model_dir, backend, args.download) {
+        (Some(model_dir), _, _) => Some(model_dir),
+        (None, StableDiffusionBackend::Rust, _) => Some(default_stable_diffusion_dir()),
+        (None, StableDiffusionBackend::PythonDiffusers, false) => {
+            Some(default_stable_diffusion_dir())
+        }
+        (None, StableDiffusionBackend::PythonDiffusers, true) => None,
+    };
+    let options = StableDiffusionRuntimeOptions {
+        prompt: args.prompt,
+        negative_prompt: args.negative_prompt,
+        out: args.out,
+        width: args.width,
+        height: args.height,
+        steps: args.steps,
+        guidance_scale: args.guidance_scale,
+        seed: args.seed,
+        scheduler,
+        backend,
+        model_dir,
+        model_id: args.model_id,
+        revision: args.revision,
+        download: args.download,
+        output_format,
+        stats: args.stats,
+        python: args.python,
+    };
+    let metadata = generate_stable_diffusion(&options)?;
+    eprintln!(
+        "stable-diffusion: backend={} model={} seed={} dimensions={}x{} scheduler={} steps={} guidance-scale={} format={} out={}{}",
+        metadata.backend.label(),
+        metadata.model_source,
+        metadata.seed,
+        metadata.width,
+        metadata.height,
+        metadata.scheduler.label(),
+        metadata.steps,
+        metadata.guidance_scale,
+        options.output_format.label(),
+        metadata.output_path.display(),
+        metadata
+            .elapsed
+            .map(|elapsed| format!(" elapsed={}", format_duration(elapsed)))
+            .unwrap_or_default()
+    );
     Ok(())
 }
 

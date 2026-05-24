@@ -1,0 +1,1005 @@
+use super::{Result, StableDiffusionError};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SdTensor {
+    shape: Vec<usize>,
+    data: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Conv2dOptions {
+    pub stride: usize,
+    pub padding: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TensorStats {
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    pub stddev: f32,
+    pub rms: f32,
+}
+
+impl SdTensor {
+    pub fn new(shape: impl Into<Vec<usize>>, data: Vec<f32>) -> Result<Self> {
+        let shape = shape.into();
+        let expected = tensor_len(&shape)?;
+        if expected != data.len() {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "tensor shape {:?} expects {expected} values, got {}",
+                shape,
+                data.len()
+            )));
+        }
+        Ok(Self { shape, data })
+    }
+
+    pub fn zeros(shape: impl Into<Vec<usize>>) -> Result<Self> {
+        let shape = shape.into();
+        let len = tensor_len(&shape)?;
+        Self::new(shape, vec![0.0; len])
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn rank(&self) -> usize {
+        self.shape.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    pub fn require_shape(&self, expected: &[usize]) -> Result<()> {
+        if self.shape != expected {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "tensor shape {:?} does not match expected {:?}",
+                self.shape, expected
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn is_finite(&self) -> bool {
+        self.data.iter().all(|value| value.is_finite())
+    }
+
+    pub fn stats(&self) -> Result<TensorStats> {
+        tensor_stats(&self.data)
+    }
+
+    pub fn selected_slice(&self, offset: usize, len: usize) -> Result<Vec<f32>> {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            StableDiffusionError::InvalidInput("slice range overflow".to_string())
+        })?;
+        if end > self.data.len() {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "slice {offset}..{end} exceeds tensor length {}",
+                self.data.len()
+            )));
+        }
+        Ok(self.data[offset..end].to_vec())
+    }
+
+    pub fn map_binary(&self, rhs: &Self, op: impl Fn(f32, f32) -> f32) -> Result<Self> {
+        if self.shape != rhs.shape {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "cannot combine shapes {:?} and {:?}",
+                self.shape, rhs.shape
+            )));
+        }
+        let data = self
+            .data
+            .iter()
+            .zip(rhs.data.iter())
+            .map(|(left, right)| op(*left, *right))
+            .collect();
+        Self::new(self.shape.clone(), data)
+    }
+
+    pub fn add(&self, rhs: &Self) -> Result<Self> {
+        broadcast_binary(self, rhs, |left, right| left + right)
+    }
+
+    pub fn sub(&self, rhs: &Self) -> Result<Self> {
+        broadcast_binary(self, rhs, |left, right| left - right)
+    }
+
+    pub fn mul(&self, rhs: &Self) -> Result<Self> {
+        broadcast_binary(self, rhs, |left, right| left * right)
+    }
+
+    pub fn div(&self, rhs: &Self) -> Result<Self> {
+        broadcast_binary(self, rhs, |left, right| left / right)
+    }
+
+    pub fn scale(&self, value: f32) -> Result<Self> {
+        Self::new(
+            self.shape.clone(),
+            self.data.iter().map(|element| element * value).collect(),
+        )
+    }
+
+    pub fn add_scalar(&self, value: f32) -> Result<Self> {
+        Self::new(
+            self.shape.clone(),
+            self.data.iter().map(|element| element + value).collect(),
+        )
+    }
+
+    pub fn clamp(&self, min: f32, max: f32) -> Result<Self> {
+        if min > max {
+            return Err(StableDiffusionError::InvalidInput(
+                "clamp min must be <= max".to_string(),
+            ));
+        }
+        Self::new(
+            self.shape.clone(),
+            self.data
+                .iter()
+                .map(|element| element.clamp(min, max))
+                .collect(),
+        )
+    }
+
+    pub fn silu(&self) -> Result<Self> {
+        Self::new(
+            self.shape.clone(),
+            self.data
+                .iter()
+                .map(|value| *value / (1.0 + (-*value).exp()))
+                .collect(),
+        )
+    }
+
+    pub fn gelu(&self) -> Result<Self> {
+        Self::new(
+            self.shape.clone(),
+            self.data
+                .iter()
+                .map(|value| {
+                    let x = *value;
+                    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
+                })
+                .collect(),
+        )
+    }
+}
+
+pub fn tensor_stats(data: &[f32]) -> Result<TensorStats> {
+    if data.is_empty() {
+        return Err(StableDiffusionError::InvalidInput(
+            "cannot compute statistics for an empty tensor".to_string(),
+        ));
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(StableDiffusionError::InvalidInput(
+            "tensor contains non-finite values".to_string(),
+        ));
+    }
+
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    let mut square_sum = 0.0f64;
+    for value in data {
+        min = min.min(*value);
+        max = max.max(*value);
+        sum += f64::from(*value);
+        square_sum += f64::from(*value) * f64::from(*value);
+    }
+    let mean = (sum / data.len() as f64) as f32;
+    let rms = (square_sum / data.len() as f64).sqrt() as f32;
+    let variance = data
+        .iter()
+        .map(|value| {
+            let delta = f64::from(*value) - f64::from(mean);
+            delta * delta
+        })
+        .sum::<f64>()
+        / data.len() as f64;
+    Ok(TensorStats {
+        min,
+        max,
+        mean,
+        stddev: variance.sqrt() as f32,
+        rms,
+    })
+}
+
+pub fn broadcast_binary(
+    left: &SdTensor,
+    right: &SdTensor,
+    op: impl Fn(f32, f32) -> f32,
+) -> Result<SdTensor> {
+    let shape = broadcast_shape(&left.shape, &right.shape)?;
+    let len = tensor_len(&shape)?;
+    let mut data = Vec::with_capacity(len);
+    for index in 0..len {
+        let out_indices = linear_to_indices(index, &shape);
+        let left_index = broadcast_linear_index(&out_indices, &shape, &left.shape);
+        let right_index = broadcast_linear_index(&out_indices, &shape, &right.shape);
+        data.push(op(left.data[left_index], right.data[right_index]));
+    }
+    SdTensor::new(shape, data)
+}
+
+pub fn broadcast_shape(left: &[usize], right: &[usize]) -> Result<Vec<usize>> {
+    let rank = left.len().max(right.len());
+    let mut out = vec![1; rank];
+    for offset in 0..rank {
+        let left_dim = dim_from_right(left, offset).unwrap_or(1);
+        let right_dim = dim_from_right(right, offset).unwrap_or(1);
+        let dim = match (left_dim, right_dim) {
+            (a, b) if a == b => a,
+            (1, b) => b,
+            (a, 1) => a,
+            (a, b) => {
+                return Err(StableDiffusionError::InvalidInput(format!(
+                    "cannot broadcast dimensions {a} and {b} for shapes {left:?} and {right:?}"
+                )))
+            }
+        };
+        out[rank - 1 - offset] = dim;
+    }
+    Ok(out)
+}
+
+pub fn concat_tensors(axis: usize, tensors: &[SdTensor]) -> Result<SdTensor> {
+    let first = tensors.first().ok_or_else(|| {
+        StableDiffusionError::InvalidInput("concat requires at least one tensor".to_string())
+    })?;
+    if axis >= first.shape.len() {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "concat axis {axis} is out of range for shape {:?}",
+            first.shape
+        )));
+    }
+    if tensors
+        .iter()
+        .any(|tensor| tensor.shape.len() != first.shape.len())
+    {
+        return Err(StableDiffusionError::InvalidInput(
+            "concat tensors must have the same rank".to_string(),
+        ));
+    }
+    let mut shape = first.shape.clone();
+    shape[axis] = tensors.iter().map(|tensor| tensor.shape[axis]).sum();
+    for tensor in tensors {
+        for (dim_index, (actual, expected)) in
+            tensor.shape.iter().zip(first.shape.iter()).enumerate()
+        {
+            if dim_index != axis && actual != expected {
+                return Err(StableDiffusionError::InvalidInput(format!(
+                    "concat dimension {dim_index} mismatch: got {actual}, expected {expected}"
+                )));
+            }
+        }
+    }
+
+    let mut data = vec![0.0; tensor_len(&shape)?];
+    let mut axis_offset = 0;
+    for tensor in tensors {
+        for src_index in 0..tensor.data.len() {
+            let mut out_indices = linear_to_indices(src_index, &tensor.shape);
+            out_indices[axis] += axis_offset;
+            let dst_index = indices_to_linear(&out_indices, &shape);
+            data[dst_index] = tensor.data[src_index];
+        }
+        axis_offset += tensor.shape[axis];
+    }
+    SdTensor::new(shape, data)
+}
+
+pub fn split_tensor(axis: usize, tensor: &SdTensor, sizes: &[usize]) -> Result<Vec<SdTensor>> {
+    if axis >= tensor.rank() {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "split axis {axis} is out of range for shape {:?}",
+            tensor.shape
+        )));
+    }
+    if sizes.iter().sum::<usize>() != tensor.shape[axis] {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "split sizes {:?} do not sum to axis {} length {}",
+            sizes, axis, tensor.shape[axis]
+        )));
+    }
+
+    let mut out = Vec::with_capacity(sizes.len());
+    let mut axis_offset = 0;
+    for size in sizes {
+        let mut shape = tensor.shape.clone();
+        shape[axis] = *size;
+        let mut data = vec![0.0; tensor_len(&shape)?];
+        for (dst_index, dst) in data.iter_mut().enumerate() {
+            let mut src_indices = linear_to_indices(dst_index, &shape);
+            src_indices[axis] += axis_offset;
+            *dst = tensor.data[indices_to_linear(&src_indices, &tensor.shape)];
+        }
+        out.push(SdTensor::new(shape, data)?);
+        axis_offset += size;
+    }
+    Ok(out)
+}
+
+pub fn channel_affine_nchw(input: &SdTensor, scale: &[f32], bias: &[f32]) -> Result<SdTensor> {
+    let [n, c, h, w] = shape4(input, "channel affine")?;
+    if scale.len() != c || bias.len() != c {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "channel affine expected {c} scale/bias values, got {} and {}",
+            scale.len(),
+            bias.len()
+        )));
+    }
+    let mut data = input.data.clone();
+    for batch in 0..n {
+        for channel in 0..c {
+            for y in 0..h {
+                for x in 0..w {
+                    let index = nchw_index(batch, channel, y, x, c, h, w);
+                    data[index] = data[index] * scale[channel] + bias[channel];
+                }
+            }
+        }
+    }
+    SdTensor::new(input.shape.clone(), data)
+}
+
+pub fn upsample_nearest2d_nchw(input: &SdTensor, scale: usize) -> Result<SdTensor> {
+    let [n, c, h, w] = shape4(input, "nearest upsample")?;
+    if scale == 0 {
+        return Err(StableDiffusionError::InvalidInput(
+            "nearest upsample scale must be > 0".to_string(),
+        ));
+    }
+    let out_h = h * scale;
+    let out_w = w * scale;
+    let mut out = vec![0.0; n * c * out_h * out_w];
+    for batch in 0..n {
+        for channel in 0..c {
+            for y in 0..out_h {
+                for x in 0..out_w {
+                    let src = nchw_index(batch, channel, y / scale, x / scale, c, h, w);
+                    let dst = nchw_index(batch, channel, y, x, c, out_h, out_w);
+                    out[dst] = input.data[src];
+                }
+            }
+        }
+    }
+    SdTensor::new([n, c, out_h, out_w], out)
+}
+
+pub fn downsample_nearest2d_nchw(input: &SdTensor, stride: usize) -> Result<SdTensor> {
+    let [n, c, h, w] = shape4(input, "nearest downsample")?;
+    if stride == 0 {
+        return Err(StableDiffusionError::InvalidInput(
+            "nearest downsample stride must be > 0".to_string(),
+        ));
+    }
+    let out_h = h / stride;
+    let out_w = w / stride;
+    if out_h == 0 || out_w == 0 {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "nearest downsample stride {stride} is too large for {h}x{w}"
+        )));
+    }
+    let mut out = vec![0.0; n * c * out_h * out_w];
+    for batch in 0..n {
+        for channel in 0..c {
+            for y in 0..out_h {
+                for x in 0..out_w {
+                    let src = nchw_index(batch, channel, y * stride, x * stride, c, h, w);
+                    let dst = nchw_index(batch, channel, y, x, c, out_h, out_w);
+                    out[dst] = input.data[src];
+                }
+            }
+        }
+    }
+    SdTensor::new([n, c, out_h, out_w], out)
+}
+
+pub fn conv2d_nchw(
+    input: &SdTensor,
+    weight: &SdTensor,
+    bias: Option<&[f32]>,
+    options: Conv2dOptions,
+) -> Result<SdTensor> {
+    let [n, in_channels, in_h, in_w] = shape4(input, "conv2d input")?;
+    let [out_channels, weight_in_channels, kernel_h, kernel_w] = shape4(weight, "conv2d weight")?;
+    if in_channels != weight_in_channels {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "conv2d input channels {in_channels} do not match weight channels {weight_in_channels}"
+        )));
+    }
+    if options.stride == 0 {
+        return Err(StableDiffusionError::InvalidInput(
+            "conv2d stride must be > 0".to_string(),
+        ));
+    }
+    let bias = match bias {
+        Some(bias) if bias.len() == out_channels => bias.to_vec(),
+        Some(bias) => {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "conv2d bias length {} does not match output channels {out_channels}",
+                bias.len()
+            )));
+        }
+        None => vec![0.0; out_channels],
+    };
+    let padded_h = in_h + options.padding * 2;
+    let padded_w = in_w + options.padding * 2;
+    if padded_h < kernel_h || padded_w < kernel_w {
+        return Err(StableDiffusionError::InvalidInput(
+            "conv2d kernel is larger than padded input".to_string(),
+        ));
+    }
+    let out_h = (padded_h - kernel_h) / options.stride + 1;
+    let out_w = (padded_w - kernel_w) / options.stride + 1;
+    let mut out = vec![0.0; n * out_channels * out_h * out_w];
+    for batch in 0..n {
+        for out_channel in 0..out_channels {
+            for out_y in 0..out_h {
+                for out_x in 0..out_w {
+                    let mut sum = bias[out_channel];
+                    for in_channel in 0..in_channels {
+                        for kernel_y in 0..kernel_h {
+                            let Some(in_y) = spatial_index(
+                                out_y,
+                                kernel_y,
+                                options.stride,
+                                options.padding,
+                                in_h,
+                            ) else {
+                                continue;
+                            };
+                            for kernel_x in 0..kernel_w {
+                                let Some(in_x) = spatial_index(
+                                    out_x,
+                                    kernel_x,
+                                    options.stride,
+                                    options.padding,
+                                    in_w,
+                                ) else {
+                                    continue;
+                                };
+                                let input_index = nchw_index(
+                                    batch,
+                                    in_channel,
+                                    in_y,
+                                    in_x,
+                                    in_channels,
+                                    in_h,
+                                    in_w,
+                                );
+                                let weight_index = ((out_channel * in_channels + in_channel)
+                                    * kernel_h
+                                    + kernel_y)
+                                    * kernel_w
+                                    + kernel_x;
+                                sum += input.data[input_index] * weight.data[weight_index];
+                            }
+                        }
+                    }
+                    let out_index =
+                        nchw_index(batch, out_channel, out_y, out_x, out_channels, out_h, out_w);
+                    out[out_index] = sum;
+                }
+            }
+        }
+    }
+    SdTensor::new([n, out_channels, out_h, out_w], out)
+}
+
+pub fn group_norm_nchw(
+    input: &SdTensor,
+    groups: usize,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+) -> Result<SdTensor> {
+    let [n, c, h, w] = shape4(input, "group norm")?;
+    if groups == 0 || c % groups != 0 {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "group norm requires groups > 0 and channels divisible by groups, got c={c}, groups={groups}"
+        )));
+    }
+    if gamma.len() != c || beta.len() != c {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "group norm expected {c} gamma/beta values, got {} and {}",
+            gamma.len(),
+            beta.len()
+        )));
+    }
+    let channels_per_group = c / groups;
+    let mut out = input.data.clone();
+    for batch in 0..n {
+        for group in 0..groups {
+            let channel_start = group * channels_per_group;
+            let channel_end = channel_start + channels_per_group;
+            let count = channels_per_group * h * w;
+            let mut sum = 0.0;
+            for channel in channel_start..channel_end {
+                for y in 0..h {
+                    for x in 0..w {
+                        sum += input.data[nchw_index(batch, channel, y, x, c, h, w)];
+                    }
+                }
+            }
+            let mean = sum / count as f32;
+            let mut variance_sum = 0.0;
+            for channel in channel_start..channel_end {
+                for y in 0..h {
+                    for x in 0..w {
+                        let value = input.data[nchw_index(batch, channel, y, x, c, h, w)];
+                        let delta = value - mean;
+                        variance_sum += delta * delta;
+                    }
+                }
+            }
+            let inv_std = 1.0 / (variance_sum / count as f32 + eps).sqrt();
+            for channel in channel_start..channel_end {
+                for y in 0..h {
+                    for x in 0..w {
+                        let index = nchw_index(batch, channel, y, x, c, h, w);
+                        out[index] =
+                            (input.data[index] - mean) * inv_std * gamma[channel] + beta[channel];
+                    }
+                }
+            }
+        }
+    }
+    SdTensor::new(input.shape.clone(), out)
+}
+
+pub fn layer_norm_last_dim(
+    input: &SdTensor,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+) -> Result<SdTensor> {
+    let cols = *input.shape.last().ok_or_else(|| {
+        StableDiffusionError::InvalidInput("layer norm requires rank >= 1".to_string())
+    })?;
+    if gamma.len() != cols || beta.len() != cols {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "layer norm expected {cols} gamma/beta values, got {} and {}",
+            gamma.len(),
+            beta.len()
+        )));
+    }
+    let rows = input.data.len() / cols;
+    let mut out = input.data.clone();
+    for row in 0..rows {
+        let start = row * cols;
+        let values = &input.data[start..start + cols];
+        let mean = values.iter().sum::<f32>() / cols as f32;
+        let variance = values
+            .iter()
+            .map(|value| {
+                let delta = *value - mean;
+                delta * delta
+            })
+            .sum::<f32>()
+            / cols as f32;
+        let inv_std = 1.0 / (variance + eps).sqrt();
+        for col in 0..cols {
+            out[start + col] = (values[col] - mean) * inv_std * gamma[col] + beta[col];
+        }
+    }
+    SdTensor::new(input.shape.clone(), out)
+}
+
+pub fn matmul2d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
+    if left.rank() != 2 || right.rank() != 2 {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "matmul2d requires rank-2 tensors, got {:?} and {:?}",
+            left.shape, right.shape
+        )));
+    }
+    let rows = left.shape[0];
+    let inner = left.shape[1];
+    if right.shape[0] != inner {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "matmul2d inner dimensions do not match: {} vs {}",
+            inner, right.shape[0]
+        )));
+    }
+    let cols = right.shape[1];
+    let mut out = vec![0.0; rows * cols];
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut sum = 0.0;
+            for k in 0..inner {
+                sum += left.data[row * inner + k] * right.data[k * cols + col];
+            }
+            out[row * cols + col] = sum;
+        }
+    }
+    SdTensor::new([rows, cols], out)
+}
+
+pub fn batched_matmul3d(left: &SdTensor, right: &SdTensor) -> Result<SdTensor> {
+    if left.rank() != 3 || right.rank() != 3 {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "batched_matmul3d requires rank-3 tensors, got {:?} and {:?}",
+            left.shape, right.shape
+        )));
+    }
+    let [batch, rows, inner] = [left.shape[0], left.shape[1], left.shape[2]];
+    if right.shape[0] != batch || right.shape[1] != inner {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "batched matmul shapes {:?} and {:?} are incompatible",
+            left.shape, right.shape
+        )));
+    }
+    let cols = right.shape[2];
+    let mut out = vec![0.0; batch * rows * cols];
+    for b in 0..batch {
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut sum = 0.0;
+                for k in 0..inner {
+                    sum += left.data[(b * rows + row) * inner + k]
+                        * right.data[(b * inner + k) * cols + col];
+                }
+                out[(b * rows + row) * cols + col] = sum;
+            }
+        }
+    }
+    SdTensor::new([batch, rows, cols], out)
+}
+
+pub fn softmax_last_dim(input: &SdTensor) -> Result<SdTensor> {
+    let cols = *input.shape.last().ok_or_else(|| {
+        StableDiffusionError::InvalidInput("softmax requires rank >= 1".to_string())
+    })?;
+    let mut out = input.data.clone();
+    for row in out.chunks_exact_mut(cols) {
+        let max = row
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |acc, value| acc.max(value));
+        let mut sum = 0.0;
+        for value in row.iter_mut() {
+            *value = (*value - max).exp();
+            sum += *value;
+        }
+        for value in row {
+            *value /= sum;
+        }
+    }
+    SdTensor::new(input.shape.clone(), out)
+}
+
+pub fn scaled_dot_product_attention(
+    query: &SdTensor,
+    key: &SdTensor,
+    value: &SdTensor,
+    additive_mask: Option<&SdTensor>,
+) -> Result<SdTensor> {
+    let [batch, heads, query_len, dim] = shape4(query, "attention query")?;
+    let [key_batch, key_heads, key_len, key_dim] = shape4(key, "attention key")?;
+    let [value_batch, value_heads, value_len, value_dim] = shape4(value, "attention value")?;
+    if (key_batch, key_heads, key_dim) != (batch, heads, dim) {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "attention key shape {:?} is incompatible with query shape {:?}",
+            key.shape, query.shape
+        )));
+    }
+    if (value_batch, value_heads, value_len) != (batch, heads, key_len) {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "attention value shape {:?} is incompatible with key shape {:?}",
+            value.shape, key.shape
+        )));
+    }
+    if let Some(mask) = additive_mask {
+        broadcast_shape(mask.shape(), &[batch, heads, query_len, key_len])?;
+    }
+
+    let scale = 1.0 / (dim as f32).sqrt();
+    let mut out = vec![0.0; batch * heads * query_len * value_dim];
+    for b in 0..batch {
+        for h in 0..heads {
+            for q in 0..query_len {
+                let mut scores = vec![0.0; key_len];
+                for k in 0..key_len {
+                    let mut dot = 0.0;
+                    for d in 0..dim {
+                        dot += query.data[nchw_index(b, h, q, d, heads, query_len, dim)]
+                            * key.data[nchw_index(b, h, k, d, heads, key_len, dim)];
+                    }
+                    scores[k] = dot * scale;
+                    if let Some(mask) = additive_mask {
+                        let mask_indices = [b, h, q, k];
+                        let mask_index = broadcast_linear_index(
+                            &mask_indices,
+                            &[batch, heads, query_len, key_len],
+                            mask.shape(),
+                        );
+                        scores[k] += mask.data[mask_index];
+                    }
+                }
+                softmax_slice_in_place(&mut scores);
+                for value_channel in 0..value_dim {
+                    let mut sum = 0.0;
+                    for (k, score) in scores.iter().copied().enumerate() {
+                        sum += score
+                            * value.data
+                                [nchw_index(b, h, k, value_channel, heads, key_len, value_dim)];
+                    }
+                    out[nchw_index(b, h, q, value_channel, heads, query_len, value_dim)] = sum;
+                }
+            }
+        }
+    }
+    SdTensor::new([batch, heads, query_len, value_dim], out)
+}
+
+fn tensor_len(shape: &[usize]) -> Result<usize> {
+    shape
+        .iter()
+        .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| StableDiffusionError::InvalidInput("tensor shape overflow".to_string()))
+}
+
+fn dim_from_right(shape: &[usize], offset: usize) -> Option<usize> {
+    shape
+        .len()
+        .checked_sub(1 + offset)
+        .map(|index| shape[index])
+}
+
+fn broadcast_linear_index(
+    out_indices: &[usize],
+    out_shape: &[usize],
+    source_shape: &[usize],
+) -> usize {
+    let rank_offset = out_shape.len() - source_shape.len();
+    let mut source_indices = vec![0; source_shape.len()];
+    for (source_axis, source_dim) in source_shape.iter().copied().enumerate() {
+        source_indices[source_axis] = if source_dim == 1 {
+            0
+        } else {
+            out_indices[rank_offset + source_axis]
+        };
+    }
+    indices_to_linear(&source_indices, source_shape)
+}
+
+fn shape4(tensor: &SdTensor, name: &str) -> Result<[usize; 4]> {
+    if tensor.shape.len() != 4 {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "{name} requires rank-4 NCHW tensor, got {:?}",
+            tensor.shape
+        )));
+    }
+    Ok([
+        tensor.shape[0],
+        tensor.shape[1],
+        tensor.shape[2],
+        tensor.shape[3],
+    ])
+}
+
+fn nchw_index(
+    batch: usize,
+    channel: usize,
+    y: usize,
+    x: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+) -> usize {
+    ((batch * channels + channel) * height + y) * width + x
+}
+
+fn spatial_index(
+    out_index: usize,
+    kernel_index: usize,
+    stride: usize,
+    padding: usize,
+    input_size: usize,
+) -> Option<usize> {
+    let raw = out_index * stride + kernel_index;
+    if raw < padding {
+        return None;
+    }
+    let input_index = raw - padding;
+    (input_index < input_size).then_some(input_index)
+}
+
+fn linear_to_indices(mut index: usize, shape: &[usize]) -> Vec<usize> {
+    let mut indices = vec![0; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        indices[axis] = index % shape[axis];
+        index /= shape[axis];
+    }
+    indices
+}
+
+fn indices_to_linear(indices: &[usize], shape: &[usize]) -> usize {
+    indices
+        .iter()
+        .zip(shape.iter())
+        .fold(0usize, |acc, (index, dim)| acc * dim + index)
+}
+
+fn softmax_slice_in_place(values: &mut [f32]) {
+    let max = values
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |acc, value| acc.max(value));
+    let mut sum = 0.0;
+    for value in values.iter_mut() {
+        *value = (*value - max).exp();
+        sum += *value;
+    }
+    for value in values {
+        *value /= sum;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!(
+                (*actual - *expected).abs() <= tolerance,
+                "actual {actual} expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_shape_and_stats() {
+        let tensor = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+
+        assert!(tensor.require_shape(&[2, 2]).is_ok());
+        let stats = tensor.stats().unwrap();
+        assert_eq!(stats.min, 1.0);
+        assert_eq!(stats.max, 4.0);
+        assert_eq!(stats.mean, 2.5);
+        assert!((stats.rms - 2.738613).abs() < 1e-5);
+    }
+
+    #[test]
+    fn supports_elementwise_operations_and_broadcasting() {
+        let left = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let right = SdTensor::new([2], vec![10.0, 20.0]).unwrap();
+
+        assert_eq!(left.add(&right).unwrap().data(), &[11.0, 22.0, 13.0, 24.0]);
+        assert_eq!(left.scale(2.0).unwrap().data(), &[2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(left.clamp(1.5, 3.5).unwrap().data(), &[1.5, 2.0, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn concatenates_and_splits_nonzero_axis() {
+        let left = SdTensor::new([1, 1, 2], vec![1.0, 2.0]).unwrap();
+        let right = SdTensor::new([1, 2, 2], vec![3.0, 4.0, 5.0, 6.0]).unwrap();
+
+        let concat = concat_tensors(1, &[left.clone(), right.clone()]).unwrap();
+
+        assert_eq!(concat.shape(), &[1, 3, 2]);
+        assert_eq!(concat.data(), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let split = split_tensor(1, &concat, &[1, 2]).unwrap();
+        assert_eq!(split, vec![left, right]);
+    }
+
+    #[test]
+    fn applies_channel_affine_and_nearest_resize() {
+        let input = SdTensor::new([1, 2, 1, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+
+        let affine = channel_affine_nchw(&input, &[2.0, 3.0], &[0.5, -1.0]).unwrap();
+        assert_eq!(affine.data(), &[2.5, 4.5, 8.0, 11.0]);
+        let up = upsample_nearest2d_nchw(&input, 2).unwrap();
+        assert_eq!(up.shape(), &[1, 2, 2, 4]);
+        assert_eq!(
+            up.data(),
+            &[1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0]
+        );
+        assert_eq!(downsample_nearest2d_nchw(&up, 2).unwrap(), input);
+    }
+
+    #[test]
+    fn conv2d_nchw_supports_bias_stride_and_padding() {
+        let input =
+            SdTensor::new([1, 1, 3, 3], (1..=9).map(|value| value as f32).collect()).unwrap();
+        let weight = SdTensor::new([1, 1, 2, 2], vec![1.0, 0.0, 0.0, -1.0]).unwrap();
+
+        let out = conv2d_nchw(
+            &input,
+            &weight,
+            Some(&[0.5]),
+            Conv2dOptions {
+                stride: 1,
+                padding: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(out.shape(), &[1, 1, 2, 2]);
+        assert_eq!(out.data(), &[-3.5, -3.5, -3.5, -3.5]);
+    }
+
+    #[test]
+    fn group_norm_normalizes_per_group() {
+        let input = SdTensor::new([1, 2, 1, 2], vec![1.0, 3.0, 10.0, 14.0]).unwrap();
+
+        let out = group_norm_nchw(&input, 2, &[1.0, 1.0], &[0.0, 0.0], 1e-5).unwrap();
+
+        assert_close(
+            out.data(),
+            &[-0.999_995, 0.999_995, -0.999_999, 0.999_999],
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn layer_norm_softmax_and_matmul_are_deterministic() {
+        let input = SdTensor::new([2, 2], vec![1.0, 3.0, 2.0, 4.0]).unwrap();
+
+        let norm = layer_norm_last_dim(&input, &[1.0, 1.0], &[0.0, 0.0], 1e-5).unwrap();
+        assert_close(
+            norm.data(),
+            &[-0.999_995, 0.999_995, -0.999_995, 0.999_995],
+            1e-4,
+        );
+        let softmax = softmax_last_dim(&input).unwrap();
+        assert_close(
+            softmax.data(),
+            &[0.119_202_92, 0.880_797, 0.119_202_92, 0.880_797],
+            1e-5,
+        );
+        let right = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(
+            matmul2d(&input, &right).unwrap().data(),
+            &[10.0, 14.0, 14.0, 20.0]
+        );
+    }
+
+    #[test]
+    fn batched_matmul_and_activations_work() {
+        let left = SdTensor::new([1, 2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let right = SdTensor::new([1, 2, 1], vec![10.0, 20.0]).unwrap();
+
+        let out = batched_matmul3d(&left, &right).unwrap();
+
+        assert_eq!(out.shape(), &[1, 2, 1]);
+        assert_eq!(out.data(), &[50.0, 110.0]);
+        let silu = SdTensor::new([1], vec![0.0]).unwrap().silu().unwrap();
+        assert_eq!(silu.data(), &[0.0]);
+        let gelu = SdTensor::new([1], vec![0.0]).unwrap().gelu().unwrap();
+        assert_eq!(gelu.data(), &[0.0]);
+    }
+
+    #[test]
+    fn scaled_dot_product_attention_supports_cross_attention_and_mask() {
+        let query = SdTensor::new([1, 1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+        let key = SdTensor::new([1, 1, 3, 2], vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+        let value = SdTensor::new([1, 1, 3, 1], vec![10.0, 20.0, 30.0]).unwrap();
+        let mask = SdTensor::new([1, 1, 1, 3], vec![0.0, 0.0, -10_000.0]).unwrap();
+
+        let out = scaled_dot_product_attention(&query, &key, &value, Some(&mask)).unwrap();
+
+        assert_eq!(out.shape(), &[1, 1, 2, 1]);
+        assert_close(out.data(), &[13.302_38, 16.697_62], 1e-4);
+    }
+}

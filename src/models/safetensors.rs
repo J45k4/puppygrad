@@ -34,6 +34,10 @@ pub enum SafeTensorLoadError {
         name: String,
         byte_len: usize,
     },
+    MisalignedF16 {
+        name: String,
+        byte_len: usize,
+    },
 }
 
 impl fmt::Display for SafeTensorLoadError {
@@ -67,6 +71,10 @@ impl fmt::Display for SafeTensorLoadError {
             SafeTensorLoadError::MisalignedF32 { name, byte_len } => write!(
                 f,
                 "tensor {name} byte length {byte_len} is not divisible by 4"
+            ),
+            SafeTensorLoadError::MisalignedF16 { name, byte_len } => write!(
+                f,
+                "tensor {name} byte length {byte_len} is not divisible by 2"
             ),
         }
     }
@@ -129,6 +137,12 @@ impl<'a> TensorStore<'a> {
         f32_data(name, &tensor)
     }
 
+    pub fn required_f32_lossy(&self, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
+        let tensor = self.required(name)?;
+        validate_tensor_shape(name, &tensor, expected_shape)?;
+        tensor_data_as_f32(name, &tensor)
+    }
+
     pub fn optional_f32(&self, name: &str, expected_shape: &[usize]) -> Result<Option<Vec<f32>>> {
         let Some(tensor) = self.optional(name)? else {
             return Ok(None);
@@ -163,6 +177,14 @@ pub fn validate_tensor(
             expected: expected_dtype,
         });
     }
+    validate_tensor_shape(name, tensor, expected_shape)
+}
+
+pub fn validate_tensor_shape(
+    name: &str,
+    tensor: &TensorView<'_>,
+    expected_shape: &[usize],
+) -> Result<()> {
     if tensor.shape() != expected_shape {
         return Err(SafeTensorLoadError::WrongShape {
             name: name.to_string(),
@@ -171,6 +193,19 @@ pub fn validate_tensor(
         });
     }
     Ok(())
+}
+
+pub fn tensor_data_as_f32(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
+    match tensor.dtype() {
+        Dtype::F32 => f32_data(name, tensor),
+        Dtype::F16 => f16_data(name, tensor),
+        Dtype::BF16 => bf16_data(name, tensor),
+        actual => Err(SafeTensorLoadError::WrongDtype {
+            name: name.to_string(),
+            actual,
+            expected: Dtype::F32,
+        }),
+    }
 }
 
 fn f32_data(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
@@ -185,6 +220,42 @@ fn f32_data(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
     Ok(data
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        .collect())
+}
+
+fn f16_data(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
+    let data = tensor.data();
+    if !data.len().is_multiple_of(2) {
+        return Err(SafeTensorLoadError::MisalignedF16 {
+            name: name.to_string(),
+            byte_len: data.len(),
+        });
+    }
+
+    Ok(data
+        .chunks_exact(2)
+        .map(|bytes| {
+            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+            half::f16::from_bits(bits).to_f32()
+        })
+        .collect())
+}
+
+fn bf16_data(name: &str, tensor: &TensorView<'_>) -> Result<Vec<f32>> {
+    let data = tensor.data();
+    if !data.len().is_multiple_of(2) {
+        return Err(SafeTensorLoadError::MisalignedF16 {
+            name: name.to_string(),
+            byte_len: data.len(),
+        });
+    }
+
+    Ok(data
+        .chunks_exact(2)
+        .map(|bytes| {
+            let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+            half::bf16::from_bits(bits).to_f32()
+        })
         .collect())
 }
 
@@ -220,5 +291,27 @@ mod tests {
         let err = store.required_f32("weight", &[2]).unwrap_err();
 
         assert!(matches!(err, SafeTensorLoadError::WrongShape { .. }));
+    }
+
+    #[test]
+    fn tensor_store_converts_f16_and_bf16_to_f32() -> Result<()> {
+        let f16_values = [half::f16::from_f32(1.5), half::f16::from_f32(-2.0)];
+        let f16_data = f16_values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let bf16_values = [half::bf16::from_f32(3.0), half::bf16::from_f32(-4.5)];
+        let bf16_data = bf16_values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let f16_view = TensorView::new(Dtype::F16, vec![2], &f16_data).unwrap();
+        let bf16_view = TensorView::new(Dtype::BF16, vec![2], &bf16_data).unwrap();
+        let bytes = serialize([("f16", f16_view), ("bf16", bf16_view)], None).unwrap();
+        let store = TensorStore::from_bytes(Path::new("memory.safetensors"), &bytes)?;
+
+        assert_eq!(store.required_f32_lossy("f16", &[2])?, vec![1.5, -2.0]);
+        assert_eq!(store.required_f32_lossy("bf16", &[2])?, vec![3.0, -4.5]);
+        Ok(())
     }
 }
