@@ -895,9 +895,125 @@ fn fill_conv2d_3x3_pad1_plane(
 }
 
 fn add_scaled_slice(out: &mut [f32], input: &[f32], scale: f32) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by runtime AVX2 detection and uses unaligned loads/stores.
+            unsafe {
+                add_scaled_slice_avx2(out, input, scale);
+            }
+            return;
+        }
+    }
     for (dst, src) in out.iter_mut().zip(input.iter().copied()) {
         *dst += src * scale;
     }
+}
+
+fn dot_slices(left: &[f32], right: &[f32]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by runtime AVX2 detection and uses unaligned loads.
+            return unsafe { dot_slices_avx2(left, right) };
+        }
+    }
+    left.iter()
+        .copied()
+        .zip(right.iter().copied())
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_scaled_slice_avx2(out: &mut [f32], input: &[f32], scale: f32) {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps, _mm256_storeu_ps,
+    };
+    let scale_vec = _mm256_set1_ps(scale);
+    let chunks = out.len() / 8;
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let src = _mm256_loadu_ps(input.as_ptr().add(offset));
+        let dst = _mm256_loadu_ps(out.as_ptr().add(offset));
+        _mm256_storeu_ps(
+            out.as_mut_ptr().add(offset),
+            _mm256_add_ps(dst, _mm256_mul_ps(src, scale_vec)),
+        );
+    }
+    for index in chunks * 8..out.len() {
+        out[index] += input[index] * scale;
+    }
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2")]
+unsafe fn add_scaled_slice_avx2(out: &mut [f32], input: &[f32], scale: f32) {
+    use std::arch::x86::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_set1_ps, _mm256_storeu_ps,
+    };
+    let scale_vec = _mm256_set1_ps(scale);
+    let chunks = out.len() / 8;
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let src = _mm256_loadu_ps(input.as_ptr().add(offset));
+        let dst = _mm256_loadu_ps(out.as_ptr().add(offset));
+        _mm256_storeu_ps(
+            out.as_mut_ptr().add(offset),
+            _mm256_add_ps(dst, _mm256_mul_ps(src, scale_vec)),
+        );
+    }
+    for index in chunks * 8..out.len() {
+        out[index] += input[index] * scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_slices_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let mut acc = _mm256_setzero_ps();
+    let chunks = left.len() / 8;
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let lhs = _mm256_loadu_ps(left.as_ptr().add(offset));
+        let rhs = _mm256_loadu_ps(right.as_ptr().add(offset));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(lhs, rhs));
+    }
+    let mut lanes = [0.0; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    for index in chunks * 8..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_slices_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let mut acc = _mm256_setzero_ps();
+    let chunks = left.len() / 8;
+    for chunk in 0..chunks {
+        let offset = chunk * 8;
+        let lhs = _mm256_loadu_ps(left.as_ptr().add(offset));
+        let rhs = _mm256_loadu_ps(right.as_ptr().add(offset));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(lhs, rhs));
+    }
+    let mut lanes = [0.0; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+    let mut sum = lanes.iter().sum::<f32>();
+    for index in chunks * 8..left.len() {
+        sum += left[index] * right[index];
+    }
+    sum
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1622,12 +1738,7 @@ fn fill_attention_query_row(
     for key_index in 0..key_len {
         let key_start = key_base + key_index * dim;
         let key_row = &key[key_start..key_start + dim];
-        let dot = query_row
-            .iter()
-            .copied()
-            .zip(key_row.iter().copied())
-            .map(|(query, key)| query * key)
-            .sum::<f32>();
+        let dot = dot_slices(query_row, key_row);
         scores[key_index] = dot * scale;
         if let Some(mask) = additive_mask {
             let mask_indices = [batch_index, head, query_index, key_index];
