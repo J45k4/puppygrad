@@ -6,6 +6,7 @@ const PARALLEL_MATMUL_THRESHOLD: usize = 1_000_000;
 const PARALLEL_GROUP_NORM_THRESHOLD: usize = 64 * 1024;
 const PARALLEL_LAYER_NORM_THRESHOLD: usize = 64 * 1024;
 const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
+const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -165,27 +166,57 @@ impl SdTensor {
     }
 
     pub fn silu(&self) -> Result<Self> {
-        Self::new(
-            self.shape.clone(),
-            self.data
-                .iter()
-                .map(|value| *value / (1.0 + (-*value).exp()))
-                .collect(),
-        )
+        self.silu_impl(true)
+    }
+
+    fn silu_impl(&self, allow_parallel: bool) -> Result<Self> {
+        unary_map(&self.shape, &self.data, allow_parallel, |value| {
+            value / (1.0 + (-value).exp())
+        })
     }
 
     pub fn gelu(&self) -> Result<Self> {
-        Self::new(
-            self.shape.clone(),
-            self.data
-                .iter()
-                .map(|value| {
-                    let x = *value;
-                    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
-                })
-                .collect(),
-        )
+        self.gelu_impl(true)
     }
+
+    fn gelu_impl(&self, allow_parallel: bool) -> Result<Self> {
+        unary_map(&self.shape, &self.data, allow_parallel, |value| {
+            0.5 * value * (1.0 + (0.797_884_6 * (value + 0.044_715 * value * value * value)).tanh())
+        })
+    }
+}
+
+fn unary_map(
+    shape: &[usize],
+    data: &[f32],
+    allow_parallel: bool,
+    op: impl Fn(f32) -> f32 + Copy + Send + Sync,
+) -> Result<SdTensor> {
+    let mut out = vec![0.0; data.len()];
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(data.len().max(1));
+
+    if allow_parallel && workers > 1 && data.len() >= PARALLEL_ELEMENTWISE_THRESHOLD {
+        let values_per_chunk = data.len().div_ceil(workers);
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let first = chunk_index * values_per_chunk;
+                let input_chunk = &data[first..first + out_chunk.len()];
+                scope.spawn(move || {
+                    for (dst, src) in out_chunk.iter_mut().zip(input_chunk.iter().copied()) {
+                        *dst = op(src);
+                    }
+                });
+            }
+        });
+    } else {
+        for (dst, src) in out.iter_mut().zip(data.iter().copied()) {
+            *dst = op(src);
+        }
+    }
+    SdTensor::new(shape.to_vec(), out)
 }
 
 pub fn tensor_stats(data: &[f32]) -> Result<TensorStats> {
@@ -1852,6 +1883,56 @@ mod tests {
         assert_eq!(silu.data(), &[0.0]);
         let gelu = SdTensor::new([1], vec![0.0]).unwrap().gelu().unwrap();
         assert_eq!(gelu.data(), &[0.0]);
+    }
+
+    #[test]
+    fn parallel_activations_match_serial_reference() {
+        let input = SdTensor::new(
+            [1, 32, 32, 32],
+            (0..32 * 32 * 32)
+                .map(|index| ((index % 43) as f32 - 21.0) / 17.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let silu_serial = input.silu_impl(false).unwrap();
+        let silu_parallel = input.silu_impl(true).unwrap();
+        let gelu_serial = input.gelu_impl(false).unwrap();
+        let gelu_parallel = input.gelu_impl(true).unwrap();
+
+        assert_eq!(silu_parallel.shape(), silu_serial.shape());
+        assert_eq!(gelu_parallel.shape(), gelu_serial.shape());
+        assert_close(silu_parallel.data(), silu_serial.data(), 1e-6);
+        assert_close(gelu_parallel.data(), gelu_serial.data(), 1e-6);
+    }
+
+    #[test]
+    #[ignore]
+    fn silu_parallel_benchmark_smoke() {
+        let input = SdTensor::new(
+            [1, 320, 64, 64],
+            (0..320 * 64 * 64)
+                .map(|index| ((index % 47) as f32 - 23.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let serial = input.silu_impl(false).unwrap();
+        let serial_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let parallel = input.silu_impl(true).unwrap();
+        let parallel_elapsed = started.elapsed();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-6);
+        eprintln!(
+            "silu benchmark: serial={:.3}s parallel={:.3}s speedup={:.2}x",
+            serial_elapsed.as_secs_f64(),
+            parallel_elapsed.as_secs_f64(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
     }
 
     #[test]
