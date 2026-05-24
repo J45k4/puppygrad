@@ -3,6 +3,7 @@ use std::thread;
 use super::{Result, StableDiffusionError};
 
 const PARALLEL_MATMUL_THRESHOLD: usize = 1_000_000;
+const PARALLEL_GROUP_NORM_THRESHOLD: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -596,6 +597,17 @@ pub fn group_norm_nchw(
     beta: &[f32],
     eps: f32,
 ) -> Result<SdTensor> {
+    group_norm_nchw_impl(input, groups, gamma, beta, eps, true)
+}
+
+fn group_norm_nchw_impl(
+    input: &SdTensor,
+    groups: usize,
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
     let [n, c, h, w] = shape4(input, "group norm")?;
     if groups == 0 || c % groups != 0 {
         return Err(StableDiffusionError::InvalidInput(format!(
@@ -610,44 +622,112 @@ pub fn group_norm_nchw(
         )));
     }
     let channels_per_group = c / groups;
-    let mut out = input.data.clone();
-    for batch in 0..n {
-        for group in 0..groups {
-            let channel_start = group * channels_per_group;
-            let channel_end = channel_start + channels_per_group;
-            let count = channels_per_group * h * w;
-            let mut sum = 0.0;
-            for channel in channel_start..channel_end {
-                for y in 0..h {
-                    for x in 0..w {
-                        sum += input.data[nchw_index(batch, channel, y, x, c, h, w)];
+    let group_len = channels_per_group * h * w;
+    let mut out = vec![0.0; input.data.len()];
+    let group_count = n * groups;
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(group_count);
+
+    if allow_parallel
+        && workers > 1
+        && input.data.len() >= PARALLEL_GROUP_NORM_THRESHOLD
+        && group_count > 1
+    {
+        let groups_per_chunk = group_count.div_ceil(workers);
+        let values_per_chunk = groups_per_chunk * group_len;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let input_data = &input.data;
+                let first_group_index = chunk_index * groups_per_chunk;
+                scope.spawn(move || {
+                    for (local_group_index, out_group) in
+                        out_chunk.chunks_mut(group_len).enumerate()
+                    {
+                        let group_index = first_group_index + local_group_index;
+                        let batch = group_index / groups;
+                        let group = group_index % groups;
+                        fill_group_norm_group(
+                            input_data,
+                            gamma,
+                            beta,
+                            batch,
+                            group,
+                            c,
+                            h,
+                            w,
+                            channels_per_group,
+                            eps,
+                            out_group,
+                        );
                     }
-                }
+                });
             }
-            let mean = sum / count as f32;
-            let mut variance_sum = 0.0;
-            for channel in channel_start..channel_end {
-                for y in 0..h {
-                    for x in 0..w {
-                        let value = input.data[nchw_index(batch, channel, y, x, c, h, w)];
-                        let delta = value - mean;
-                        variance_sum += delta * delta;
-                    }
-                }
-            }
-            let inv_std = 1.0 / (variance_sum / count as f32 + eps).sqrt();
-            for channel in channel_start..channel_end {
-                for y in 0..h {
-                    for x in 0..w {
-                        let index = nchw_index(batch, channel, y, x, c, h, w);
-                        out[index] =
-                            (input.data[index] - mean) * inv_std * gamma[channel] + beta[channel];
-                    }
-                }
+        });
+    } else {
+        for batch in 0..n {
+            for group in 0..groups {
+                let out_start = (batch * c + group * channels_per_group) * h * w;
+                fill_group_norm_group(
+                    &input.data,
+                    gamma,
+                    beta,
+                    batch,
+                    group,
+                    c,
+                    h,
+                    w,
+                    channels_per_group,
+                    eps,
+                    &mut out[out_start..out_start + group_len],
+                );
             }
         }
     }
     SdTensor::new(input.shape.clone(), out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_group_norm_group(
+    input: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    batch: usize,
+    group: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+    channels_per_group: usize,
+    eps: f32,
+    out: &mut [f32],
+) {
+    let spatial = height * width;
+    let channel_start = group * channels_per_group;
+    let input_start = (batch * channels + channel_start) * spatial;
+    let input_group = &input[input_start..input_start + out.len()];
+    let mean = input_group.iter().sum::<f32>() / input_group.len() as f32;
+    let variance = input_group
+        .iter()
+        .map(|value| {
+            let delta = *value - mean;
+            delta * delta
+        })
+        .sum::<f32>()
+        / input_group.len() as f32;
+    let inv_std = 1.0 / (variance + eps).sqrt();
+
+    for local_channel in 0..channels_per_group {
+        let global_channel = channel_start + local_channel;
+        let start = local_channel * spatial;
+        let end = start + spatial;
+        for (dst, src) in out[start..end]
+            .iter_mut()
+            .zip(input_group[start..end].iter().copied())
+        {
+            *dst = (src - mean) * inv_std * gamma[global_channel] + beta[global_channel];
+        }
+    }
 }
 
 pub fn layer_norm_last_dim(
@@ -1198,6 +1278,64 @@ mod tests {
             out.data(),
             &[-0.999_995, 0.999_995, -0.999_999, 0.999_999],
             1e-4,
+        );
+    }
+
+    #[test]
+    fn parallel_group_norm_matches_serial_reference() {
+        let input = SdTensor::new(
+            [1, 32, 32, 32],
+            (0..32 * 32 * 32)
+                .map(|index| ((index % 53) as f32 - 26.0) / 47.0)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = (0..32)
+            .map(|index| 0.75 + index as f32 / 127.0)
+            .collect::<Vec<_>>();
+        let beta = (0..32)
+            .map(|index| (index as f32 - 16.0) / 101.0)
+            .collect::<Vec<_>>();
+
+        let serial = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false).unwrap();
+        let parallel = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, true).unwrap();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+    }
+
+    #[test]
+    #[ignore]
+    fn group_norm_parallel_benchmark_smoke() {
+        let input = SdTensor::new(
+            [1, 320, 64, 64],
+            (0..320 * 64 * 64)
+                .map(|index| ((index % 59) as f32 - 29.0) / 53.0)
+                .collect(),
+        )
+        .unwrap();
+        let gamma = (0..320)
+            .map(|index| 0.8 + index as f32 / 4096.0)
+            .collect::<Vec<_>>();
+        let beta = (0..320)
+            .map(|index| (index as f32 - 160.0) / 4096.0)
+            .collect::<Vec<_>>();
+
+        let started = std::time::Instant::now();
+        let serial = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, false).unwrap();
+        let serial_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let parallel = group_norm_nchw_impl(&input, 32, &gamma, &beta, 1e-5, true).unwrap();
+        let parallel_elapsed = started.elapsed();
+
+        assert_eq!(parallel.shape(), serial.shape());
+        assert_close(parallel.data(), serial.data(), 1e-5);
+        eprintln!(
+            "group_norm benchmark: serial={:.3}s parallel={:.3}s speedup={:.2}x",
+            serial_elapsed.as_secs_f64(),
+            parallel_elapsed.as_secs_f64(),
+            serial_elapsed.as_secs_f64() / parallel_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 
