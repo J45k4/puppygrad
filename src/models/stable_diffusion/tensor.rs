@@ -1,5 +1,7 @@
 use std::thread;
 
+use gemm::Parallelism;
+
 use super::{Result, StableDiffusionError};
 
 const PARALLEL_MATMUL_THRESHOLD: usize = 1_000_000;
@@ -7,6 +9,7 @@ const PARALLEL_GROUP_NORM_THRESHOLD: usize = 64 * 1024;
 const PARALLEL_LAYER_NORM_THRESHOLD: usize = 64 * 1024;
 const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
 const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
+const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -1398,6 +1401,20 @@ fn linear2d_impl(
         .unwrap_or(1)
         .min(rows);
 
+    if allow_parallel && workers > 1 && estimated_mul_adds >= GEMM_LINEAR_THRESHOLD {
+        fill_linear2d_gemm(
+            &input.data,
+            weight,
+            bias,
+            rows,
+            in_features,
+            out_features,
+            &mut out,
+            workers,
+        );
+        return SdTensor::new([rows, out_features], out);
+    }
+
     if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_MATMUL_THRESHOLD {
         let rows_per_chunk = rows.div_ceil(workers);
         let values_per_chunk = rows_per_chunk * out_features;
@@ -1435,6 +1452,49 @@ fn linear2d_impl(
         }
     }
     SdTensor::new([rows, out_features], out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_linear2d_gemm(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    rows: usize,
+    in_features: usize,
+    out_features: usize,
+    out: &mut [f32],
+    workers: usize,
+) {
+    unsafe {
+        gemm::gemm(
+            rows,
+            out_features,
+            in_features,
+            out.as_mut_ptr(),
+            1,
+            out_features as isize,
+            false,
+            input.as_ptr(),
+            1,
+            in_features as isize,
+            weight.as_ptr(),
+            1,
+            out_features as isize,
+            0.0f32,
+            1.0f32,
+            false,
+            false,
+            false,
+            Parallelism::Rayon(workers),
+        );
+    }
+    if let Some(bias) = bias {
+        for row in out.chunks_mut(out_features) {
+            for (value, bias) in row.iter_mut().zip(bias.iter().copied()) {
+                *value += bias;
+            }
+        }
+    }
 }
 
 fn matmul2d_impl(left: &SdTensor, right: &SdTensor, allow_parallel: bool) -> Result<SdTensor> {
