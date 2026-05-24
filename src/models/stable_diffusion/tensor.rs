@@ -1066,15 +1066,14 @@ fn fill_group_norm_group(
     let channel_start = group * channels_per_group;
     let input_start = (batch * channels + channel_start) * spatial;
     let input_group = &input[input_start..input_start + out.len()];
-    let mean = input_group.iter().sum::<f32>() / input_group.len() as f32;
-    let variance = input_group
-        .iter()
-        .map(|value| {
-            let delta = *value - mean;
-            delta * delta
-        })
-        .sum::<f32>()
-        / input_group.len() as f32;
+    let mut sum = 0.0;
+    let mut square_sum = 0.0;
+    for value in input_group.iter().copied() {
+        sum += value;
+        square_sum += value * value;
+    }
+    let mean = sum / input_group.len() as f32;
+    let variance = (square_sum / input_group.len() as f32 - mean * mean).max(0.0);
     let inv_std = 1.0 / (variance + eps).sqrt();
 
     for local_channel in 0..channels_per_group {
@@ -1161,15 +1160,14 @@ fn layer_norm_last_dim_impl(
 }
 
 fn fill_layer_norm_row(input: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &mut [f32]) {
-    let mean = input.iter().sum::<f32>() / input.len() as f32;
-    let variance = input
-        .iter()
-        .map(|value| {
-            let delta = *value - mean;
-            delta * delta
-        })
-        .sum::<f32>()
-        / input.len() as f32;
+    let mut sum = 0.0;
+    let mut square_sum = 0.0;
+    for value in input.iter().copied() {
+        sum += value;
+        square_sum += value * value;
+    }
+    let mean = sum / input.len() as f32;
+    let variance = (square_sum / input.len() as f32 - mean * mean).max(0.0);
     let inv_std = 1.0 / (variance + eps).sqrt();
     for col in 0..input.len() {
         out[col] = (input[col] - mean) * inv_std * gamma[col] + beta[col];
