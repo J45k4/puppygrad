@@ -12,6 +12,7 @@ const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV1X1_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV3X3_THRESHOLD: usize = 64_000_000;
+const PACKED_SIDE_TAP_MAX_SPATIAL: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -1006,6 +1007,55 @@ fn conv2d_3x3_pad1_gemm_nchw(
             (2usize, 0usize),
             (2usize, 2usize),
         ];
+        if spatial <= PACKED_SIDE_TAP_MAX_SPATIAL {
+            let packed_cols = h * (w - 1);
+            let mut packed_input = vec![0.0; in_channels * packed_cols];
+            let mut packed_out = vec![0.0; out_channels * packed_cols];
+            for (kernel_y, kernel_x) in side_taps {
+                fill_conv2d_3x3_side_tap_input(
+                    input_batch,
+                    in_channels,
+                    h,
+                    w,
+                    kernel_y,
+                    kernel_x,
+                    &mut packed_input,
+                );
+                unsafe {
+                    gemm::gemm(
+                        out_channels,
+                        packed_cols,
+                        in_channels,
+                        packed_out.as_mut_ptr(),
+                        1,
+                        packed_cols as isize,
+                        false,
+                        weight.data.as_ptr().add(kernel_y * 3 + kernel_x),
+                        9,
+                        (in_channels * 9) as isize,
+                        packed_input.as_ptr(),
+                        1,
+                        packed_cols as isize,
+                        0.0f32,
+                        1.0f32,
+                        false,
+                        false,
+                        false,
+                        Parallelism::Rayon(workers),
+                    );
+                }
+                add_conv2d_3x3_side_tap_output(
+                    &packed_out,
+                    out_channels,
+                    h,
+                    w,
+                    kernel_y,
+                    kernel_x,
+                    out_batch,
+                );
+            }
+            continue;
+        }
         for (kernel_y, kernel_x) in side_taps {
             let (out_y_start, out_y_end) = match kernel_y {
                 0 => (1, h),
@@ -1049,6 +1099,75 @@ fn conv2d_3x3_pad1_gemm_nchw(
         }
     }
     SdTensor::new([n, out_channels, h, w], out)
+}
+
+fn fill_conv2d_3x3_side_tap_input(
+    input: &[f32],
+    in_channels: usize,
+    height: usize,
+    width: usize,
+    kernel_y: usize,
+    kernel_x: usize,
+    out: &mut [f32],
+) {
+    let spatial = height * width;
+    let packed_cols = height * (width - 1);
+    let input_x_start = if kernel_x == 0 { 0 } else { 1 };
+    for in_channel in 0..in_channels {
+        let input_plane = &input[in_channel * spatial..(in_channel + 1) * spatial];
+        let out_channel = &mut out[in_channel * packed_cols..(in_channel + 1) * packed_cols];
+        for out_y in 0..height {
+            let input_y = match kernel_y {
+                0 => out_y.checked_sub(1),
+                1 => Some(out_y),
+                _ => (out_y + 1 < height).then_some(out_y + 1),
+            };
+            let out_start = out_y * (width - 1);
+            if let Some(input_y) = input_y {
+                let input_start = input_y * width + input_x_start;
+                out_channel[out_start..out_start + width - 1]
+                    .copy_from_slice(&input_plane[input_start..input_start + width - 1]);
+            } else {
+                out_channel[out_start..out_start + width - 1].fill(0.0);
+            }
+        }
+    }
+}
+
+fn add_conv2d_3x3_side_tap_output(
+    packed: &[f32],
+    out_channels: usize,
+    height: usize,
+    width: usize,
+    kernel_y: usize,
+    kernel_x: usize,
+    out: &mut [f32],
+) {
+    let spatial = height * width;
+    let packed_cols = height * (width - 1);
+    let out_x_start = if kernel_x == 0 { 1 } else { 0 };
+    for out_channel in 0..out_channels {
+        let packed_plane = &packed[out_channel * packed_cols..(out_channel + 1) * packed_cols];
+        let out_plane = &mut out[out_channel * spatial..(out_channel + 1) * spatial];
+        for out_y in 0..height {
+            let valid_y = match kernel_y {
+                0 => out_y > 0,
+                1 => true,
+                _ => out_y + 1 < height,
+            };
+            if valid_y {
+                let packed_start = out_y * (width - 1);
+                let out_start = out_y * width + out_x_start;
+                for (dst, value) in out_plane[out_start..out_start + width - 1].iter_mut().zip(
+                    packed_plane[packed_start..packed_start + width - 1]
+                        .iter()
+                        .copied(),
+                ) {
+                    *dst += value;
+                }
+            }
+        }
+    }
 }
 
 fn conv2d_3x3_pad1_spatial_parallel_nchw(
