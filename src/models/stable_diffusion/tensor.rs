@@ -1525,6 +1525,21 @@ fn scaled_dot_product_attention_impl(
         broadcast_shape(mask.shape(), &[batch, heads, query_len, key_len])?;
     }
 
+    if additive_mask.is_none() && key_len >= 512 && dim >= 64 {
+        return scaled_dot_product_attention_transposed_key_impl(
+            query,
+            key,
+            value,
+            batch,
+            heads,
+            query_len,
+            key_len,
+            dim,
+            value_dim,
+            allow_parallel,
+        );
+    }
+
     let scale = 1.0 / (dim as f32).sqrt();
     let mut out = vec![0.0; batch * heads * query_len * value_dim];
     let query_rows = batch * heads * query_len;
@@ -1607,6 +1622,111 @@ fn scaled_dot_product_attention_impl(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn scaled_dot_product_attention_transposed_key_impl(
+    query: &SdTensor,
+    key: &SdTensor,
+    value: &SdTensor,
+    batch: usize,
+    heads: usize,
+    query_len: usize,
+    key_len: usize,
+    dim: usize,
+    value_dim: usize,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
+    let scale = 1.0 / (dim as f32).sqrt();
+    let mut transposed_key = vec![0.0; batch * heads * dim * key_len];
+    for b in 0..batch {
+        for h in 0..heads {
+            let key_head_base = (b * heads + h) * key_len * dim;
+            let transposed_head_base = (b * heads + h) * dim * key_len;
+            for key_index in 0..key_len {
+                let key_row = &key.data
+                    [key_head_base + key_index * dim..key_head_base + (key_index + 1) * dim];
+                for (d, value) in key_row.iter().copied().enumerate() {
+                    transposed_key[transposed_head_base + d * key_len + key_index] = value;
+                }
+            }
+        }
+    }
+
+    let mut out = vec![0.0; batch * heads * query_len * value_dim];
+    let query_rows = batch * heads * query_len;
+    let estimated_mul_adds = query_rows
+        .saturating_mul(key_len)
+        .saturating_mul(dim + value_dim);
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(query_rows);
+
+    if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_ATTENTION_THRESHOLD {
+        let rows_per_chunk = query_rows.div_ceil(workers);
+        let values_per_chunk = rows_per_chunk * value_dim;
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let first_query_row = chunk_index * rows_per_chunk;
+                let query_data = &query.data;
+                let value_data = &value.data;
+                let transposed_key_data = &transposed_key;
+                scope.spawn(move || {
+                    let mut scores = vec![0.0; key_len];
+                    for (local_query_row, out_row) in out_chunk.chunks_mut(value_dim).enumerate() {
+                        let query_row = first_query_row + local_query_row;
+                        let b = query_row / (heads * query_len);
+                        let within_batch = query_row % (heads * query_len);
+                        let h = within_batch / query_len;
+                        let q = within_batch % query_len;
+                        fill_attention_query_row_transposed_key(
+                            query_data,
+                            transposed_key_data,
+                            value_data,
+                            b,
+                            h,
+                            q,
+                            heads,
+                            query_len,
+                            key_len,
+                            dim,
+                            value_dim,
+                            scale,
+                            &mut scores,
+                            out_row,
+                        );
+                    }
+                });
+            }
+        });
+    } else {
+        let mut scores = vec![0.0; key_len];
+        for b in 0..batch {
+            for h in 0..heads {
+                for q in 0..query_len {
+                    let out_index = nchw_index(b, h, q, 0, heads, query_len, value_dim);
+                    fill_attention_query_row_transposed_key(
+                        &query.data,
+                        &transposed_key,
+                        &value.data,
+                        b,
+                        h,
+                        q,
+                        heads,
+                        query_len,
+                        key_len,
+                        dim,
+                        value_dim,
+                        scale,
+                        &mut scores,
+                        &mut out[out_index..out_index + value_dim],
+                    );
+                }
+            }
+        }
+    }
+    SdTensor::new([batch, heads, query_len, value_dim], out)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn fill_attention_query_row(
     query: &[f32],
     key: &[f32],
@@ -1642,6 +1762,44 @@ fn fill_attention_query_row(
             );
             scores[key_index] += mask.data[mask_index];
         }
+    }
+    softmax_slice_in_place(scores);
+    out.fill(0.0);
+    let value_base = (batch_index * heads + head) * key_len * value_dim;
+    for (key_index, score) in scores.iter().copied().enumerate() {
+        let value_start = value_base + key_index * value_dim;
+        add_scaled_slice(out, &value[value_start..value_start + value_dim], score);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_attention_query_row_transposed_key(
+    query: &[f32],
+    transposed_key: &[f32],
+    value: &[f32],
+    batch_index: usize,
+    head: usize,
+    query_index: usize,
+    heads: usize,
+    query_len: usize,
+    key_len: usize,
+    dim: usize,
+    value_dim: usize,
+    scale: f32,
+    scores: &mut [f32],
+    out: &mut [f32],
+) {
+    scores.fill(0.0);
+    let query_base = ((batch_index * heads + head) * query_len + query_index) * dim;
+    let transposed_key_base = (batch_index * heads + head) * dim * key_len;
+    for d in 0..dim {
+        let query_value = query[query_base + d] * scale;
+        let key_column_start = transposed_key_base + d * key_len;
+        add_scaled_slice(
+            scores,
+            &transposed_key[key_column_start..key_column_start + key_len],
+            query_value,
+        );
     }
     softmax_slice_in_place(scores);
     out.fill(0.0);
@@ -2715,6 +2873,86 @@ mod tests {
 
         assert_eq!(parallel.shape(), serial.shape());
         assert_close(parallel.data(), serial.data(), 1e-5);
+    }
+
+    #[test]
+    fn large_no_mask_attention_matches_masked_reference() {
+        let query = SdTensor::new(
+            [1, 1, 512, 96],
+            (0..512 * 96)
+                .map(|index| ((index % 73) as f32 - 36.0) / 67.0)
+                .collect(),
+        )
+        .unwrap();
+        let key = SdTensor::new(
+            [1, 1, 512, 96],
+            (0..512 * 96)
+                .map(|index| ((index % 67) as f32 - 33.0) / 61.0)
+                .collect(),
+        )
+        .unwrap();
+        let value = SdTensor::new(
+            [1, 1, 512, 96],
+            (0..512 * 96)
+                .map(|index| ((index % 59) as f32 - 29.0) / 53.0)
+                .collect(),
+        )
+        .unwrap();
+        let zero_mask = SdTensor::new([1, 1, 1, 512], vec![0.0; 512]).unwrap();
+
+        let reference =
+            scaled_dot_product_attention_impl(&query, &key, &value, Some(&zero_mask), false)
+                .unwrap();
+        let fast = scaled_dot_product_attention(&query, &key, &value, None).unwrap();
+
+        assert_eq!(fast.shape(), reference.shape());
+        assert_close(fast.data(), reference.data(), 1e-4);
+    }
+
+    #[test]
+    #[ignore]
+    fn large_no_mask_attention_benchmark_smoke() {
+        let query = SdTensor::new(
+            [1, 1, 1024, 128],
+            (0..1024 * 128)
+                .map(|index| ((index % 73) as f32 - 36.0) / 67.0)
+                .collect(),
+        )
+        .unwrap();
+        let key = SdTensor::new(
+            [1, 1, 1024, 128],
+            (0..1024 * 128)
+                .map(|index| ((index % 67) as f32 - 33.0) / 61.0)
+                .collect(),
+        )
+        .unwrap();
+        let value = SdTensor::new(
+            [1, 1, 1024, 128],
+            (0..1024 * 128)
+                .map(|index| ((index % 59) as f32 - 29.0) / 53.0)
+                .collect(),
+        )
+        .unwrap();
+        let zero_mask = SdTensor::new([1, 1, 1, 1024], vec![0.0; 1024]).unwrap();
+
+        let started = std::time::Instant::now();
+        let reference =
+            scaled_dot_product_attention_impl(&query, &key, &value, Some(&zero_mask), true)
+                .unwrap();
+        let reference_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let fast = scaled_dot_product_attention(&query, &key, &value, None).unwrap();
+        let fast_elapsed = started.elapsed();
+
+        assert_eq!(fast.shape(), reference.shape());
+        assert_close(fast.data(), reference.data(), 1e-4);
+        eprintln!(
+            "large no-mask attention benchmark: reference={:.3}s fast={:.3}s speedup={:.2}x",
+            reference_elapsed.as_secs_f64(),
+            fast_elapsed.as_secs_f64(),
+            reference_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
     }
 
     #[test]
