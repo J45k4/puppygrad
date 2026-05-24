@@ -103,18 +103,35 @@ impl StableDiffusionPipeline {
         );
         for (step_index, timestep) in scheduler.timesteps.clone().into_iter().enumerate() {
             let latent_model_input = scheduler.scale_model_input(&latents, timestep)?;
-            let noise_uncond = unet_forward(
-                &latent_model_input,
-                timestep,
-                &negative_embeddings,
-                &self.unet_weights,
-            )?;
-            let noise_cond = unet_forward(
-                &latent_model_input,
-                timestep,
-                &prompt_embeddings,
-                &self.unet_weights,
-            )?;
+            let (noise_uncond, noise_cond) = std::thread::scope(|scope| {
+                let uncond = scope.spawn(|| {
+                    unet_forward(
+                        &latent_model_input,
+                        timestep,
+                        &negative_embeddings,
+                        &self.unet_weights,
+                    )
+                });
+                let cond = scope.spawn(|| {
+                    unet_forward(
+                        &latent_model_input,
+                        timestep,
+                        &prompt_embeddings,
+                        &self.unet_weights,
+                    )
+                });
+                let noise_uncond = uncond.join().map_err(|_| {
+                    StableDiffusionError::Unsupported(
+                        "unconditional UNet worker panicked".to_string(),
+                    )
+                })??;
+                let noise_cond = cond.join().map_err(|_| {
+                    StableDiffusionError::Unsupported(
+                        "conditional UNet worker panicked".to_string(),
+                    )
+                })??;
+                Ok::<_, StableDiffusionError>((noise_uncond, noise_cond))
+            })?;
             let guided =
                 classifier_free_guidance(&noise_uncond, &noise_cond, options.guidance_scale)?;
             latents = scheduler.step(&guided, timestep, &latents)?;
