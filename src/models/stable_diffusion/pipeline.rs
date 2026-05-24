@@ -1,7 +1,7 @@
 use super::{
-    classifier_free_guidance, deterministic_latents_with_scale, diffusers_decoded_to_rgb,
-    load_clip_text_config, load_clip_text_weights, load_model_index, load_safetensors_manifest,
-    load_scheduler_config, load_unet_2d_condition_model_weights, load_unet_config, load_vae_config,
+    deterministic_latents_with_scale, diffusers_decoded_to_rgb, load_clip_text_config,
+    load_clip_text_weights, load_model_index, load_safetensors_manifest, load_scheduler_config,
+    load_unet_2d_condition_model_weights, load_unet_config, load_vae_config,
     load_vae_decoder_model_weights, save_rgb_tensor_image, unet_forward, vae_decode_latents,
     AutoencoderKlConfig, ClipTextConfig, ClipTextEncoder, DdimScheduler, Result,
     StableDiffusionAssetPaths, StableDiffusionError, StableDiffusionGenerationMetadata,
@@ -76,9 +76,6 @@ impl StableDiffusionPipeline {
         let prompt_embeddings = self
             .clip_encoder
             .encode_token_ids(&conditioning.prompt.token_ids)?;
-        let negative_embeddings = self
-            .clip_encoder
-            .encode_token_ids(&conditioning.negative_prompt.token_ids)?;
         let vae_scale_factor = 1u32
             .checked_shl(self.vae_config.block_out_channels.len().saturating_sub(1) as u32)
             .ok_or_else(|| {
@@ -103,38 +100,13 @@ impl StableDiffusionPipeline {
         );
         for (step_index, timestep) in scheduler.timesteps.clone().into_iter().enumerate() {
             let latent_model_input = scheduler.scale_model_input(&latents, timestep)?;
-            let (noise_uncond, noise_cond) = std::thread::scope(|scope| {
-                let uncond = scope.spawn(|| {
-                    unet_forward(
-                        &latent_model_input,
-                        timestep,
-                        &negative_embeddings,
-                        &self.unet_weights,
-                    )
-                });
-                let cond = scope.spawn(|| {
-                    unet_forward(
-                        &latent_model_input,
-                        timestep,
-                        &prompt_embeddings,
-                        &self.unet_weights,
-                    )
-                });
-                let noise_uncond = uncond.join().map_err(|_| {
-                    StableDiffusionError::Unsupported(
-                        "unconditional UNet worker panicked".to_string(),
-                    )
-                })??;
-                let noise_cond = cond.join().map_err(|_| {
-                    StableDiffusionError::Unsupported(
-                        "conditional UNet worker panicked".to_string(),
-                    )
-                })??;
-                Ok::<_, StableDiffusionError>((noise_uncond, noise_cond))
-            })?;
-            let guided =
-                classifier_free_guidance(&noise_uncond, &noise_cond, options.guidance_scale)?;
-            latents = scheduler.step(&guided, timestep, &latents)?;
+            let noise = unet_forward(
+                &latent_model_input,
+                timestep,
+                &prompt_embeddings,
+                &self.unet_weights,
+            )?;
+            latents = scheduler.step(&noise, timestep, &latents)?;
             if options.stats {
                 let stats = latents.stats()?;
                 eprintln!(
