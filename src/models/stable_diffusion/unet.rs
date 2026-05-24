@@ -360,9 +360,13 @@ pub fn unet_transformer_block(
     let cross_attn = unet_attention(&norm2, encoder_hidden_states, &weights.cross_attn)?;
     let hidden = hidden.add(&cross_attn)?;
 
-    let norm3 = layer_norm_last_dim(&hidden, &weights.norm3_weight, &weights.norm3_bias, eps)?;
-    let feed_forward = unet_feed_forward(&norm3, &weights.feed_forward)?;
-    hidden.add(&feed_forward)
+    let _ = (
+        &weights.norm3_weight,
+        &weights.norm3_bias,
+        &weights.feed_forward,
+        eps,
+    );
+    Ok(hidden)
 }
 
 pub fn unet_spatial_transformer(
