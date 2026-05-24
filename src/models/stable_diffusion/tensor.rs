@@ -10,6 +10,7 @@ const PARALLEL_LAYER_NORM_THRESHOLD: usize = 64 * 1024;
 const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
 const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
+const GEMM_CONV1X1_THRESHOLD: usize = 4_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -732,6 +733,28 @@ fn conv2d_1x1_nchw(
     let [n, in_channels, h, w] = shape4(input, "conv2d input")?;
     let [out_channels, _, _, _] = shape4(weight, "conv2d weight")?;
     let spatial = h * w;
+    let estimated_mul_adds = n
+        .saturating_mul(out_channels)
+        .saturating_mul(spatial)
+        .saturating_mul(in_channels);
+    let available_workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    if allow_parallel && available_workers > 1 && estimated_mul_adds >= GEMM_CONV1X1_THRESHOLD {
+        return conv2d_1x1_gemm_nchw(input, weight, bias, available_workers);
+    }
+    conv2d_1x1_direct_nchw(input, weight, bias, allow_parallel)
+}
+
+fn conv2d_1x1_direct_nchw(
+    input: &SdTensor,
+    weight: &SdTensor,
+    bias: &[f32],
+    allow_parallel: bool,
+) -> Result<SdTensor> {
+    let [n, in_channels, h, w] = shape4(input, "conv2d input")?;
+    let [out_channels, _, _, _] = shape4(weight, "conv2d weight")?;
+    let spatial = h * w;
     let output_planes = n * out_channels;
     let mut out = vec![0.0; output_planes * spatial];
     let estimated_mul_adds = output_planes
@@ -787,6 +810,51 @@ fn conv2d_1x1_nchw(
                     &mut out[plane_start..plane_start + spatial],
                 );
             }
+        }
+    }
+    SdTensor::new([n, out_channels, h, w], out)
+}
+
+fn conv2d_1x1_gemm_nchw(
+    input: &SdTensor,
+    weight: &SdTensor,
+    bias: &[f32],
+    workers: usize,
+) -> Result<SdTensor> {
+    let [n, in_channels, h, w] = shape4(input, "conv2d input")?;
+    let [out_channels, _, _, _] = shape4(weight, "conv2d weight")?;
+    let spatial = h * w;
+    let input_batch_len = in_channels * spatial;
+    let output_batch_len = out_channels * spatial;
+    let mut out = vec![0.0; n * output_batch_len];
+    for batch in 0..n {
+        let out_batch = &mut out[batch * output_batch_len..(batch + 1) * output_batch_len];
+        for (row, bias) in out_batch.chunks_mut(spatial).zip(bias.iter().copied()) {
+            row.fill(bias);
+        }
+        let input_batch = &input.data[batch * input_batch_len..(batch + 1) * input_batch_len];
+        unsafe {
+            gemm::gemm(
+                out_channels,
+                spatial,
+                in_channels,
+                out_batch.as_mut_ptr(),
+                1,
+                spatial as isize,
+                true,
+                weight.data.as_ptr(),
+                1,
+                in_channels as isize,
+                input_batch.as_ptr(),
+                1,
+                spatial as isize,
+                1.0f32,
+                1.0f32,
+                false,
+                false,
+                false,
+                Parallelism::Rayon(workers),
+            );
         }
     }
     SdTensor::new([n, out_channels, h, w], out)
@@ -2430,6 +2498,33 @@ mod tests {
 
         assert_eq!(fast.shape(), generic.shape());
         assert_close(fast.data(), generic.data(), 1e-5);
+    }
+
+    #[test]
+    fn conv2d_1x1_gemm_matches_direct_fast_path() {
+        let input = SdTensor::new(
+            [1, 16, 17, 19],
+            (0..16 * 17 * 19)
+                .map(|index| ((index % 41) as f32 - 20.0) / 37.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = SdTensor::new(
+            [13, 16, 1, 1],
+            (0..13 * 16)
+                .map(|index| ((index % 29) as f32 - 14.0) / 23.0)
+                .collect(),
+        )
+        .unwrap();
+        let bias = (0..13)
+            .map(|index| (index as f32 - 6.0) / 23.0)
+            .collect::<Vec<_>>();
+
+        let direct = conv2d_1x1_direct_nchw(&input, &weight, &bias, false).unwrap();
+        let gemm = conv2d_1x1_gemm_nchw(&input, &weight, &bias, 2).unwrap();
+
+        assert_eq!(gemm.shape(), direct.shape());
+        assert_close(gemm.data(), direct.data(), 1e-4);
     }
 
     #[test]
