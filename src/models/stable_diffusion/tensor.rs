@@ -263,8 +263,21 @@ pub fn tensor_stats(data: &[f32]) -> Result<TensorStats> {
 pub fn broadcast_binary(
     left: &SdTensor,
     right: &SdTensor,
-    op: impl Fn(f32, f32) -> f32,
+    op: impl Fn(f32, f32) -> f32 + Copy + Send + Sync,
 ) -> Result<SdTensor> {
+    if left.shape == right.shape {
+        return binary_map_same_shape(left, right, true, op);
+    }
+    if right.data.len() == 1 && right.shape.iter().all(|dim| *dim == 1) {
+        return unary_map(&left.shape, &left.data, true, |value| {
+            op(value, right.data[0])
+        });
+    }
+    if left.data.len() == 1 && left.shape.iter().all(|dim| *dim == 1) {
+        return unary_map(&right.shape, &right.data, true, |value| {
+            op(left.data[0], value)
+        });
+    }
     let shape = broadcast_shape(&left.shape, &right.shape)?;
     let len = tensor_len(&shape)?;
     let mut data = Vec::with_capacity(len);
@@ -275,6 +288,48 @@ pub fn broadcast_binary(
         data.push(op(left.data[left_index], right.data[right_index]));
     }
     SdTensor::new(shape, data)
+}
+
+fn binary_map_same_shape(
+    left: &SdTensor,
+    right: &SdTensor,
+    allow_parallel: bool,
+    op: impl Fn(f32, f32) -> f32 + Copy + Send + Sync,
+) -> Result<SdTensor> {
+    let mut out = vec![0.0; left.data.len()];
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(out.len().max(1));
+
+    if allow_parallel && workers > 1 && out.len() >= PARALLEL_ELEMENTWISE_THRESHOLD {
+        let values_per_chunk = out.len().div_ceil(workers);
+        thread::scope(|scope| {
+            for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+                let first = chunk_index * values_per_chunk;
+                let left_chunk = &left.data[first..first + out_chunk.len()];
+                let right_chunk = &right.data[first..first + out_chunk.len()];
+                scope.spawn(move || {
+                    for ((dst, left), right) in out_chunk
+                        .iter_mut()
+                        .zip(left_chunk.iter().copied())
+                        .zip(right_chunk.iter().copied())
+                    {
+                        *dst = op(left, right);
+                    }
+                });
+            }
+        });
+    } else {
+        for ((dst, left), right) in out
+            .iter_mut()
+            .zip(left.data.iter().copied())
+            .zip(right.data.iter().copied())
+        {
+            *dst = op(left, right);
+        }
+    }
+    SdTensor::new(left.shape.clone(), out)
 }
 
 pub fn broadcast_shape(left: &[usize], right: &[usize]) -> Result<Vec<usize>> {
@@ -1580,6 +1635,23 @@ mod tests {
         SdTensor::new([n, out_channels, out_h, out_w], out).unwrap()
     }
 
+    fn broadcast_binary_generic_reference(
+        left: &SdTensor,
+        right: &SdTensor,
+        op: impl Fn(f32, f32) -> f32,
+    ) -> SdTensor {
+        let shape = broadcast_shape(&left.shape, &right.shape).unwrap();
+        let len = tensor_len(&shape).unwrap();
+        let mut data = Vec::with_capacity(len);
+        for index in 0..len {
+            let out_indices = linear_to_indices(index, &shape);
+            let left_index = broadcast_linear_index(&out_indices, &shape, &left.shape);
+            let right_index = broadcast_linear_index(&out_indices, &shape, &right.shape);
+            data.push(op(left.data[left_index], right.data[right_index]));
+        }
+        SdTensor::new(shape, data).unwrap()
+    }
+
     #[test]
     fn validates_shape_and_stats() {
         let tensor = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1596,10 +1668,77 @@ mod tests {
     fn supports_elementwise_operations_and_broadcasting() {
         let left = SdTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let right = SdTensor::new([2], vec![10.0, 20.0]).unwrap();
+        let same_shape = SdTensor::new([2, 2], vec![5.0, 6.0, 7.0, 8.0]).unwrap();
+        let scalar = SdTensor::new([1], vec![2.0]).unwrap();
 
         assert_eq!(left.add(&right).unwrap().data(), &[11.0, 22.0, 13.0, 24.0]);
+        assert_eq!(
+            left.add(&same_shape).unwrap().data(),
+            &[6.0, 8.0, 10.0, 12.0]
+        );
+        assert_eq!(left.mul(&scalar).unwrap().data(), &[2.0, 4.0, 6.0, 8.0]);
         assert_eq!(left.scale(2.0).unwrap().data(), &[2.0, 4.0, 6.0, 8.0]);
         assert_eq!(left.clamp(1.5, 3.5).unwrap().data(), &[1.5, 2.0, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn same_shape_binary_fast_path_matches_generic_reference() {
+        let left = SdTensor::new(
+            [2, 16, 32, 32],
+            (0..2 * 16 * 32 * 32)
+                .map(|index| ((index % 37) as f32 - 18.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [2, 16, 32, 32],
+            (0..2 * 16 * 32 * 32)
+                .map(|index| ((index % 29) as f32 - 14.0) / 17.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let generic = broadcast_binary_generic_reference(&left, &right, |left, right| left + right);
+        let fast = left.add(&right).unwrap();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-6);
+    }
+
+    #[test]
+    #[ignore]
+    fn same_shape_binary_fast_path_benchmark_smoke() {
+        let left = SdTensor::new(
+            [1, 320, 64, 64],
+            (0..320 * 64 * 64)
+                .map(|index| ((index % 37) as f32 - 18.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+        let right = SdTensor::new(
+            [1, 320, 64, 64],
+            (0..320 * 64 * 64)
+                .map(|index| ((index % 29) as f32 - 14.0) / 17.0)
+                .collect(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let generic = broadcast_binary_generic_reference(&left, &right, |left, right| left + right);
+        let generic_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let fast = left.add(&right).unwrap();
+        let fast_elapsed = started.elapsed();
+
+        assert_eq!(fast.shape(), generic.shape());
+        assert_close(fast.data(), generic.data(), 1e-6);
+        eprintln!(
+            "same-shape binary benchmark: generic={:.3}s fast={:.3}s speedup={:.2}x",
+            generic_elapsed.as_secs_f64(),
+            fast_elapsed.as_secs_f64(),
+            generic_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
     }
 
     #[test]
