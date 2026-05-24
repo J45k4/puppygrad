@@ -758,12 +758,20 @@ fn conv2d_3x3_pad1_nchw(
         .saturating_mul(spatial)
         .saturating_mul(in_channels)
         .saturating_mul(9);
-    let workers = thread::available_parallelism()
+    let available_workers = thread::available_parallelism()
         .map(usize::from)
-        .unwrap_or(1)
-        .min(output_planes);
+        .unwrap_or(1);
     const PARALLEL_CONV2D_THRESHOLD: usize = 1_000_000;
 
+    if allow_parallel
+        && output_planes < available_workers
+        && h >= 16
+        && estimated_mul_adds >= PARALLEL_CONV2D_THRESHOLD
+    {
+        return conv2d_3x3_pad1_spatial_parallel_nchw(input, weight, bias, available_workers);
+    }
+
+    let workers = available_workers.min(output_planes);
     if allow_parallel && workers > 1 && estimated_mul_adds >= PARALLEL_CONV2D_THRESHOLD {
         let planes_per_chunk = output_planes.div_ceil(workers);
         let values_per_chunk = planes_per_chunk * spatial;
@@ -813,6 +821,49 @@ fn conv2d_3x3_pad1_nchw(
     SdTensor::new([n, out_channels, h, w], out)
 }
 
+fn conv2d_3x3_pad1_spatial_parallel_nchw(
+    input: &SdTensor,
+    weight: &SdTensor,
+    bias: &[f32],
+    workers: usize,
+) -> Result<SdTensor> {
+    let [n, in_channels, h, w] = shape4(input, "conv2d input")?;
+    let [out_channels, _, _, _] = shape4(weight, "conv2d weight")?;
+    let spatial = h * w;
+    let output_planes = n * out_channels;
+    let mut out = vec![0.0; output_planes * spatial];
+    let chunks_per_plane = workers.div_ceil(output_planes).clamp(1, h);
+    let rows_per_chunk = h.div_ceil(chunks_per_plane);
+    let values_per_chunk = rows_per_chunk * w;
+
+    thread::scope(|scope| {
+        for (plane, out_plane) in out.chunks_mut(spatial).enumerate() {
+            let batch = plane / out_channels;
+            let out_channel = plane % out_channels;
+            for (chunk_index, out_rows) in out_plane.chunks_mut(values_per_chunk).enumerate() {
+                let input_data = &input.data;
+                let weight_data = &weight.data;
+                let row_start = chunk_index * rows_per_chunk;
+                scope.spawn(move || {
+                    fill_conv2d_3x3_pad1_plane_rows(
+                        input_data,
+                        weight_data,
+                        bias,
+                        batch,
+                        out_channel,
+                        in_channels,
+                        h,
+                        w,
+                        row_start,
+                        out_rows,
+                    );
+                });
+            }
+        }
+    });
+    SdTensor::new([n, out_channels, h, w], out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fill_conv2d_1x1_plane(
     input: &[f32],
@@ -835,6 +886,65 @@ fn fill_conv2d_1x1_plane(
         let input_plane = &input[input_start..input_start + spatial];
         for (dst, src) in out.iter_mut().zip(input_plane.iter().copied()) {
             *dst += src * scale;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_conv2d_3x3_pad1_plane_rows(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    batch: usize,
+    out_channel: usize,
+    in_channels: usize,
+    height: usize,
+    width: usize,
+    row_start: usize,
+    out: &mut [f32],
+) {
+    let spatial = height * width;
+    let row_end = row_start + out.len() / width;
+    out.fill(bias[out_channel]);
+    let input_batch_base = batch * in_channels * spatial;
+    for in_channel in 0..in_channels {
+        let input_start = input_batch_base + in_channel * spatial;
+        let input_plane = &input[input_start..input_start + spatial];
+        let weight_base = (out_channel * in_channels + in_channel) * 9;
+        for kernel_y in 0..3 {
+            let (valid_y_start, valid_y_end) = match kernel_y {
+                0 => (1, height),
+                1 => (0, height),
+                _ => (0, height.saturating_sub(1)),
+            };
+            let out_y_start = valid_y_start.max(row_start);
+            let out_y_end = valid_y_end.min(row_end);
+            if out_y_start >= out_y_end {
+                continue;
+            }
+            for kernel_x in 0..3 {
+                let (out_x_start, out_x_end) = match kernel_x {
+                    0 => (1, width),
+                    1 => (0, width),
+                    _ => (0, width.saturating_sub(1)),
+                };
+                if out_x_start >= out_x_end {
+                    continue;
+                }
+                let scale = weight[weight_base + kernel_y * 3 + kernel_x];
+                let values = out_x_end - out_x_start;
+                for out_y in out_y_start..out_y_end {
+                    let input_y = out_y + kernel_y - 1;
+                    let input_x_start = out_x_start + kernel_x - 1;
+                    let out_start = (out_y - row_start) * width + out_x_start;
+                    let input_start = input_y * width + input_x_start;
+                    add_scaled_slice(
+                        &mut out[out_start..out_start + values],
+                        &input_plane[input_start..input_start + values],
+                        scale,
+                    );
+                }
+            }
         }
     }
 }
@@ -2185,6 +2295,33 @@ mod tests {
     }
 
     #[test]
+    fn conv2d_3x3_pad1_spatial_parallel_matches_fast_path() {
+        let input = SdTensor::new(
+            [1, 4, 13, 11],
+            (0..4 * 13 * 11)
+                .map(|index| ((index % 31) as f32 - 15.0) / 19.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = SdTensor::new(
+            [3, 4, 3, 3],
+            (0..3 * 4 * 3 * 3)
+                .map(|index| ((index % 17) as f32 - 8.0) / 13.0)
+                .collect(),
+        )
+        .unwrap();
+        let bias = (0..3)
+            .map(|index| (index as f32 - 1.0) / 23.0)
+            .collect::<Vec<_>>();
+
+        let fast = conv2d_3x3_pad1_nchw(&input, &weight, &bias, false).unwrap();
+        let spatial = conv2d_3x3_pad1_spatial_parallel_nchw(&input, &weight, &bias, 4).unwrap();
+
+        assert_eq!(spatial.shape(), fast.shape());
+        assert_close(spatial.data(), fast.data(), 1e-5);
+    }
+
+    #[test]
     #[ignore]
     fn conv2d_parallel_benchmark_smoke() {
         let input = SdTensor::new(
@@ -2263,6 +2400,47 @@ mod tests {
             generic_elapsed.as_secs_f64(),
             fast_elapsed.as_secs_f64(),
             generic_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn conv2d_3x3_pad1_spatial_parallel_benchmark_smoke() {
+        let input = SdTensor::new(
+            [1, 128, 128, 128],
+            (0..128 * 128 * 128)
+                .map(|index| ((index % 37) as f32 - 18.0) / 29.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = SdTensor::new(
+            [3, 128, 3, 3],
+            (0..3 * 128 * 3 * 3)
+                .map(|index| ((index % 23) as f32 - 11.0) / 31.0)
+                .collect(),
+        )
+        .unwrap();
+        let bias = vec![0.0; 3];
+
+        let started = std::time::Instant::now();
+        let current = conv2d_3x3_pad1_nchw(&input, &weight, &bias, false).unwrap();
+        let current_elapsed = started.elapsed();
+
+        let workers = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let started = std::time::Instant::now();
+        let spatial =
+            conv2d_3x3_pad1_spatial_parallel_nchw(&input, &weight, &bias, workers).unwrap();
+        let spatial_elapsed = started.elapsed();
+
+        assert_eq!(spatial.shape(), current.shape());
+        assert_close(spatial.data(), current.data(), 1e-4);
+        eprintln!(
+            "conv2d 3x3 spatial parallel benchmark: current={:.3}s spatial={:.3}s speedup={:.2}x",
+            current_elapsed.as_secs_f64(),
+            spatial_elapsed.as_secs_f64(),
+            current_elapsed.as_secs_f64() / spatial_elapsed.as_secs_f64().max(f64::EPSILON)
         );
     }
 
