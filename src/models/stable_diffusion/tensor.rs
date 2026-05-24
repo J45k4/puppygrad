@@ -86,6 +86,20 @@ impl SdTensor {
         Ok(())
     }
 
+    pub fn into_shape(mut self, shape: impl Into<Vec<usize>>) -> Result<Self> {
+        let shape = shape.into();
+        let expected_len = shape.iter().product::<usize>();
+        if expected_len != self.data.len() {
+            return Err(StableDiffusionError::InvalidInput(format!(
+                "cannot reshape tensor with {} values to {:?}",
+                self.data.len(),
+                shape
+            )));
+        }
+        self.shape = shape;
+        Ok(self)
+    }
+
     pub fn is_finite(&self) -> bool {
         self.data.iter().all(|value| value.is_finite())
     }
@@ -1361,6 +1375,30 @@ pub fn linear2d(
     linear2d_impl(input, weight, bias, in_features, out_features, true)
 }
 
+pub fn linear_flattened_last_dim(
+    input: &SdTensor,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_features: usize,
+    out_features: usize,
+) -> Result<SdTensor> {
+    if input.rank() < 2 || input.shape[input.rank() - 1] != in_features {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "linear_flattened_last_dim expected trailing dim {in_features}, got {:?}",
+            input.shape
+        )));
+    }
+    linear_from_data(
+        &input.data,
+        input.data.len() / in_features,
+        weight,
+        bias,
+        in_features,
+        out_features,
+        true,
+    )
+}
+
 fn linear2d_impl(
     input: &SdTensor,
     weight: &[f32],
@@ -1392,6 +1430,26 @@ fn linear2d_impl(
     }
 
     let rows = input.shape[0];
+    linear_from_data(
+        &input.data,
+        rows,
+        weight,
+        bias,
+        in_features,
+        out_features,
+        allow_parallel,
+    )
+}
+
+fn linear_from_data(
+    input: &[f32],
+    rows: usize,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    in_features: usize,
+    out_features: usize,
+    allow_parallel: bool,
+) -> Result<SdTensor> {
     let mut out = vec![0.0; rows * out_features];
     let estimated_mul_adds = rows
         .saturating_mul(out_features)
@@ -1403,7 +1461,7 @@ fn linear2d_impl(
 
     if allow_parallel && workers > 1 && estimated_mul_adds >= GEMM_LINEAR_THRESHOLD {
         fill_linear2d_gemm(
-            &input.data,
+            input,
             weight,
             bias,
             rows,
@@ -1425,7 +1483,7 @@ fn linear2d_impl(
                     for (local_row, out_row) in out_chunk.chunks_mut(out_features).enumerate() {
                         let row = first_row + local_row;
                         fill_linear2d_row(
-                            &input.data,
+                            input,
                             weight,
                             bias,
                             row,
@@ -1441,7 +1499,7 @@ fn linear2d_impl(
         for row in 0..rows {
             let out_start = row * out_features;
             fill_linear2d_row(
-                &input.data,
+                input,
                 weight,
                 bias,
                 row,

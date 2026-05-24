@@ -1,7 +1,7 @@
 use super::{
     concat_tensors, conv2d_nchw, group_norm_nchw, group_norm_silu_nchw, layer_norm_last_dim,
-    linear2d, scaled_dot_product_attention, upsample_nearest2d_nchw, Conv2dOptions, Result,
-    SdTensor, StableDiffusionError,
+    linear2d, linear_flattened_last_dim, scaled_dot_product_attention, upsample_nearest2d_nchw,
+    Conv2dOptions, Result, SdTensor, StableDiffusionError,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -206,6 +206,37 @@ pub fn unet_linear(input: &SdTensor, weights: &UnetLinearWeights) -> Result<SdTe
     )
 }
 
+fn unet_linear_flattened(input: &SdTensor, weights: &UnetLinearWeights) -> Result<SdTensor> {
+    if input.rank() < 2 || input.shape()[input.rank() - 1] != weights.in_features {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "UNet flattened linear expected trailing dim {}, got {:?}",
+            weights.in_features,
+            input.shape()
+        )));
+    }
+    if weights.weight.len() != weights.in_features * weights.out_features {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "UNet linear weight expected {} values, got {}",
+            weights.in_features * weights.out_features,
+            weights.weight.len()
+        )));
+    }
+    if weights.bias.len() != weights.out_features {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "UNet linear bias expected {} values, got {}",
+            weights.out_features,
+            weights.bias.len()
+        )));
+    }
+    linear_flattened_last_dim(
+        input,
+        &weights.weight,
+        Some(&weights.bias),
+        weights.in_features,
+        weights.out_features,
+    )
+}
+
 pub fn unet_resnet_block(
     input: &SdTensor,
     time_embedding: &SdTensor,
@@ -255,8 +286,8 @@ pub fn unet_attention(
     encoder_hidden_states: &SdTensor,
     weights: &UnetAttentionWeights,
 ) -> Result<SdTensor> {
-    let [query_batch, query_len, query_dim] = shape3(query_states, "UNet attention query states")?;
-    let [context_batch, key_len, context_dim] =
+    let [query_batch, query_len, _query_dim] = shape3(query_states, "UNet attention query states")?;
+    let [context_batch, _key_len, _context_dim] =
         shape3(encoder_hidden_states, "UNet attention encoder states")?;
     if query_batch != 1 || context_batch != 1 {
         return Err(StableDiffusionError::Unsupported(
@@ -269,32 +300,32 @@ pub fn unet_attention(
         ));
     }
 
-    let query_rows = SdTensor::new([query_len, query_dim], query_states.data().to_vec())?;
-    let context_rows = SdTensor::new(
-        [key_len, context_dim],
-        encoder_hidden_states.data().to_vec(),
+    let q = split_attention_heads(
+        &unet_linear_flattened(query_states, &weights.to_q)?,
+        weights.heads,
     )?;
-    let q = split_attention_heads(&unet_linear(&query_rows, &weights.to_q)?, weights.heads)?;
-    let k = split_attention_heads(&unet_linear(&context_rows, &weights.to_k)?, weights.heads)?;
-    let v = split_attention_heads(&unet_linear(&context_rows, &weights.to_v)?, weights.heads)?;
+    let k = split_attention_heads(
+        &unet_linear_flattened(encoder_hidden_states, &weights.to_k)?,
+        weights.heads,
+    )?;
+    let v = split_attention_heads(
+        &unet_linear_flattened(encoder_hidden_states, &weights.to_v)?,
+        weights.heads,
+    )?;
     let attended = scaled_dot_product_attention(&q, &k, &v, None)?;
     let attended = merge_attention_heads(&attended)?;
     let out = unet_linear(&attended, &weights.to_out)?;
-    SdTensor::new(
-        [1, query_len, weights.to_out.out_features],
-        out.data().to_vec(),
-    )
+    out.into_shape([1, query_len, weights.to_out.out_features])
 }
 
 pub fn unet_feed_forward(input: &SdTensor, weights: &UnetFeedForwardWeights) -> Result<SdTensor> {
-    let [batch, seq_len, hidden] = shape3(input, "UNet feed-forward input")?;
+    let [batch, seq_len, _hidden] = shape3(input, "UNet feed-forward input")?;
     if batch != 1 {
         return Err(StableDiffusionError::Unsupported(
             "native UNet feed-forward currently supports batch size 1".to_string(),
         ));
     }
-    let rows = SdTensor::new([seq_len, hidden], input.data().to_vec())?;
-    let projected = unet_linear(&rows, &weights.geglu_proj)?;
+    let projected = unet_linear_flattened(input, &weights.geglu_proj)?;
     if projected.shape()[1] % 2 != 0 {
         return Err(StableDiffusionError::InvalidInput(format!(
             "UNet GEGLU projection output width {} must be even",
@@ -312,10 +343,7 @@ pub fn unet_feed_forward(input: &SdTensor, weights: &UnetFeedForwardWeights) -> 
     }
     let gated = SdTensor::new([seq_len, inner], gated)?;
     let out = unet_linear(&gated, &weights.out_proj)?;
-    SdTensor::new(
-        [1, seq_len, weights.out_proj.out_features],
-        out.data().to_vec(),
-    )
+    out.into_shape([1, seq_len, weights.out_proj.out_features])
 }
 
 pub fn unet_transformer_block(
