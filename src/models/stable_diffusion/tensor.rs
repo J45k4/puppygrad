@@ -814,51 +814,52 @@ fn fill_conv2d_3x3_pad1_plane(
     width: usize,
     out: &mut [f32],
 ) {
-    for y in 0..height {
-        for x in 0..width {
-            if y > 0 && y + 1 < height && x > 0 && x + 1 < width {
-                let mut sum = bias[out_channel];
-                for in_channel in 0..in_channels {
-                    let input_base = ((batch * in_channels + in_channel) * height + y) * width + x;
-                    let weight_base = (out_channel * in_channels + in_channel) * 9;
-                    sum += input[input_base - width - 1] * weight[weight_base]
-                        + input[input_base - width] * weight[weight_base + 1]
-                        + input[input_base - width + 1] * weight[weight_base + 2]
-                        + input[input_base - 1] * weight[weight_base + 3]
-                        + input[input_base] * weight[weight_base + 4]
-                        + input[input_base + 1] * weight[weight_base + 5]
-                        + input[input_base + width - 1] * weight[weight_base + 6]
-                        + input[input_base + width] * weight[weight_base + 7]
-                        + input[input_base + width + 1] * weight[weight_base + 8];
+    let spatial = height * width;
+    out.fill(bias[out_channel]);
+    let input_batch_base = batch * in_channels * spatial;
+    for in_channel in 0..in_channels {
+        let input_start = input_batch_base + in_channel * spatial;
+        let input_plane = &input[input_start..input_start + spatial];
+        let weight_base = (out_channel * in_channels + in_channel) * 9;
+        for kernel_y in 0..3 {
+            let (out_y_start, out_y_end) = match kernel_y {
+                0 => (1, height),
+                1 => (0, height),
+                _ => (0, height.saturating_sub(1)),
+            };
+            if out_y_start >= out_y_end {
+                continue;
+            }
+            for kernel_x in 0..3 {
+                let (out_x_start, out_x_end) = match kernel_x {
+                    0 => (1, width),
+                    1 => (0, width),
+                    _ => (0, width.saturating_sub(1)),
+                };
+                if out_x_start >= out_x_end {
+                    continue;
                 }
-                out[y * width + x] = sum;
-            } else {
-                let mut sum = bias[out_channel];
-                for in_channel in 0..in_channels {
-                    for kernel_y in 0..3 {
-                        let raw_y = y + kernel_y;
-                        if raw_y == 0 || raw_y > height {
-                            continue;
-                        }
-                        let in_y = raw_y - 1;
-                        for kernel_x in 0..3 {
-                            let raw_x = x + kernel_x;
-                            if raw_x == 0 || raw_x > width {
-                                continue;
-                            }
-                            let in_x = raw_x - 1;
-                            let input_index =
-                                ((batch * in_channels + in_channel) * height + in_y) * width + in_x;
-                            let weight_index = (out_channel * in_channels + in_channel) * 9
-                                + kernel_y * 3
-                                + kernel_x;
-                            sum += input[input_index] * weight[weight_index];
-                        }
-                    }
+                let scale = weight[weight_base + kernel_y * 3 + kernel_x];
+                let values = out_x_end - out_x_start;
+                for out_y in out_y_start..out_y_end {
+                    let input_y = out_y + kernel_y - 1;
+                    let input_x_start = out_x_start + kernel_x - 1;
+                    let out_start = out_y * width + out_x_start;
+                    let input_start = input_y * width + input_x_start;
+                    add_scaled_slice(
+                        &mut out[out_start..out_start + values],
+                        &input_plane[input_start..input_start + values],
+                        scale,
+                    );
                 }
-                out[y * width + x] = sum;
             }
         }
+    }
+}
+
+fn add_scaled_slice(out: &mut [f32], input: &[f32], scale: f32) {
+    for (dst, src) in out.iter_mut().zip(input.iter().copied()) {
+        *dst += src * scale;
     }
 }
 
