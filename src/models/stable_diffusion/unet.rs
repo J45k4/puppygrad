@@ -146,7 +146,21 @@ pub fn classifier_free_guidance(
             "guidance scale must be finite".to_string(),
         ));
     }
-    unconditional.add(&conditional.sub(unconditional)?.scale(guidance_scale)?)
+    if unconditional.shape() != conditional.shape() {
+        return Err(StableDiffusionError::InvalidInput(format!(
+            "classifier-free guidance shape mismatch: unconditional {:?}, conditional {:?}",
+            unconditional.shape(),
+            conditional.shape()
+        )));
+    }
+    let data = unconditional
+        .data()
+        .iter()
+        .copied()
+        .zip(conditional.data().iter().copied())
+        .map(|(uncond, cond)| uncond + (cond - uncond) * guidance_scale)
+        .collect();
+    SdTensor::new(unconditional.shape().to_vec(), data)
 }
 
 pub fn unet_conv2d(input: &SdTensor, weights: &UnetConv2dWeights) -> Result<SdTensor> {
