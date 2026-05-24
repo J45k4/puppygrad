@@ -11,6 +11,7 @@ const PARALLEL_ATTENTION_THRESHOLD: usize = 1_000_000;
 const PARALLEL_ELEMENTWISE_THRESHOLD: usize = 256 * 1024;
 const GEMM_LINEAR_THRESHOLD: usize = 4_000_000;
 const GEMM_CONV1X1_THRESHOLD: usize = 4_000_000;
+const GEMM_CONV3X3_CENTER_THRESHOLD: usize = 64_000_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SdTensor {
@@ -881,6 +882,15 @@ fn conv2d_3x3_pad1_nchw(
     const PARALLEL_CONV2D_THRESHOLD: usize = 1_000_000;
 
     if allow_parallel
+        && available_workers > 1
+        && out_channels >= 16
+        && in_channels >= 16
+        && estimated_mul_adds >= GEMM_CONV3X3_CENTER_THRESHOLD
+    {
+        return conv2d_3x3_pad1_center_gemm_nchw(input, weight, bias, available_workers);
+    }
+
+    if allow_parallel
         && output_planes < available_workers
         && h >= 16
         && estimated_mul_adds >= PARALLEL_CONV2D_THRESHOLD
@@ -935,6 +945,81 @@ fn conv2d_3x3_pad1_nchw(
             }
         }
     }
+    SdTensor::new([n, out_channels, h, w], out)
+}
+
+fn conv2d_3x3_pad1_center_gemm_nchw(
+    input: &SdTensor,
+    weight: &SdTensor,
+    bias: &[f32],
+    workers: usize,
+) -> Result<SdTensor> {
+    let [n, in_channels, h, w] = shape4(input, "conv2d input")?;
+    let [out_channels, _, _, _] = shape4(weight, "conv2d weight")?;
+    let spatial = h * w;
+    let output_planes = n * out_channels;
+    let input_batch_len = in_channels * spatial;
+    let output_batch_len = out_channels * spatial;
+    let mut out = vec![0.0; output_planes * spatial];
+
+    for batch in 0..n {
+        let out_batch = &mut out[batch * output_batch_len..(batch + 1) * output_batch_len];
+        for (row, bias) in out_batch.chunks_mut(spatial).zip(bias.iter().copied()) {
+            row.fill(bias);
+        }
+        let input_batch = &input.data[batch * input_batch_len..(batch + 1) * input_batch_len];
+        unsafe {
+            gemm::gemm(
+                out_channels,
+                spatial,
+                in_channels,
+                out_batch.as_mut_ptr(),
+                1,
+                spatial as isize,
+                true,
+                weight.data.as_ptr().add(4),
+                9,
+                (in_channels * 9) as isize,
+                input_batch.as_ptr(),
+                1,
+                spatial as isize,
+                1.0f32,
+                1.0f32,
+                false,
+                false,
+                false,
+                Parallelism::Rayon(workers),
+            );
+        }
+    }
+
+    let workers = workers.min(output_planes);
+    let planes_per_chunk = output_planes.div_ceil(workers);
+    let values_per_chunk = planes_per_chunk * spatial;
+    thread::scope(|scope| {
+        for (chunk_index, out_chunk) in out.chunks_mut(values_per_chunk).enumerate() {
+            let input_data = &input.data;
+            let weight_data = &weight.data;
+            let first_plane = chunk_index * planes_per_chunk;
+            scope.spawn(move || {
+                for (local_plane, out_plane) in out_chunk.chunks_mut(spatial).enumerate() {
+                    let plane = first_plane + local_plane;
+                    let batch = plane / out_channels;
+                    let out_channel = plane % out_channels;
+                    add_conv2d_3x3_pad1_plane_except_center(
+                        input_data,
+                        weight_data,
+                        batch,
+                        out_channel,
+                        in_channels,
+                        h,
+                        w,
+                        out_plane,
+                    );
+                }
+            });
+        }
+    });
     SdTensor::new([n, out_channels, h, w], out)
 }
 
@@ -1095,6 +1180,62 @@ fn fill_conv2d_3x3_pad1_plane(
                 continue;
             }
             for kernel_x in 0..3 {
+                let (out_x_start, out_x_end) = match kernel_x {
+                    0 => (1, width),
+                    1 => (0, width),
+                    _ => (0, width.saturating_sub(1)),
+                };
+                if out_x_start >= out_x_end {
+                    continue;
+                }
+                let scale = weight[weight_base + kernel_y * 3 + kernel_x];
+                let values = out_x_end - out_x_start;
+                for out_y in out_y_start..out_y_end {
+                    let input_y = out_y + kernel_y - 1;
+                    let input_x_start = out_x_start + kernel_x - 1;
+                    let out_start = out_y * width + out_x_start;
+                    let input_start = input_y * width + input_x_start;
+                    add_scaled_slice(
+                        &mut out[out_start..out_start + values],
+                        &input_plane[input_start..input_start + values],
+                        scale,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_conv2d_3x3_pad1_plane_except_center(
+    input: &[f32],
+    weight: &[f32],
+    batch: usize,
+    out_channel: usize,
+    in_channels: usize,
+    height: usize,
+    width: usize,
+    out: &mut [f32],
+) {
+    let spatial = height * width;
+    let input_batch_base = batch * in_channels * spatial;
+    for in_channel in 0..in_channels {
+        let input_start = input_batch_base + in_channel * spatial;
+        let input_plane = &input[input_start..input_start + spatial];
+        let weight_base = (out_channel * in_channels + in_channel) * 9;
+        for kernel_y in 0..3 {
+            let (out_y_start, out_y_end) = match kernel_y {
+                0 => (1, height),
+                1 => (0, height),
+                _ => (0, height.saturating_sub(1)),
+            };
+            if out_y_start >= out_y_end {
+                continue;
+            }
+            for kernel_x in 0..3 {
+                if kernel_y == 1 && kernel_x == 1 {
+                    continue;
+                }
                 let (out_x_start, out_x_end) = match kernel_x {
                     0 => (1, width),
                     1 => (0, width),
@@ -2583,6 +2724,33 @@ mod tests {
 
         assert_eq!(spatial.shape(), fast.shape());
         assert_close(spatial.data(), fast.data(), 1e-5);
+    }
+
+    #[test]
+    fn conv2d_3x3_pad1_center_gemm_matches_direct_fast_path() {
+        let input = SdTensor::new(
+            [1, 16, 17, 19],
+            (0..16 * 17 * 19)
+                .map(|index| ((index % 41) as f32 - 20.0) / 37.0)
+                .collect(),
+        )
+        .unwrap();
+        let weight = SdTensor::new(
+            [13, 16, 3, 3],
+            (0..13 * 16 * 3 * 3)
+                .map(|index| ((index % 29) as f32 - 14.0) / 23.0)
+                .collect(),
+        )
+        .unwrap();
+        let bias = (0..13)
+            .map(|index| (index as f32 - 6.0) / 23.0)
+            .collect::<Vec<_>>();
+
+        let direct = conv2d_3x3_pad1_nchw(&input, &weight, &bias, false).unwrap();
+        let gemm = conv2d_3x3_pad1_center_gemm_nchw(&input, &weight, &bias, 2).unwrap();
+
+        assert_eq!(gemm.shape(), direct.shape());
+        assert_close(gemm.data(), direct.data(), 1e-4);
     }
 
     #[test]
