@@ -1364,12 +1364,14 @@ fn fill_matmul2d_row(
     cols: usize,
     out: &mut [f32],
 ) {
-    for col in 0..cols {
-        let mut sum = 0.0;
-        for k in 0..inner {
-            sum += left[row * inner + k] * right[k * cols + col];
+    out.fill(0.0);
+    let left_base = row * inner;
+    for k in 0..inner {
+        let left_value = left[left_base + k];
+        let right_base = k * cols;
+        for col in 0..cols {
+            out[col] += left_value * right[right_base + col];
         }
-        out[col] = sum;
     }
 }
 
@@ -1382,12 +1384,17 @@ fn fill_linear2d_row(
     out_features: usize,
     out: &mut [f32],
 ) {
-    for col in 0..out_features {
-        let mut sum = bias.map_or(0.0, |bias| bias[col]);
-        for k in 0..in_features {
-            sum += input[row * in_features + k] * weight[k * out_features + col];
+    match bias {
+        Some(bias) => out.copy_from_slice(bias),
+        None => out.fill(0.0),
+    }
+    let input_base = row * in_features;
+    for k in 0..in_features {
+        let input_value = input[input_base + k];
+        let weight_base = k * out_features;
+        for col in 0..out_features {
+            out[col] += input_value * weight[weight_base + col];
         }
-        out[col] = sum;
     }
 }
 
@@ -1402,12 +1409,15 @@ fn fill_batched_matmul3d_row(
     cols: usize,
     out: &mut [f32],
 ) {
-    for col in 0..cols {
-        let mut sum = 0.0;
-        for k in 0..inner {
-            sum += left[(batch * rows + row) * inner + k] * right[(batch * inner + k) * cols + col];
+    out.fill(0.0);
+    let left_base = (batch * rows + row) * inner;
+    let right_batch_base = batch * inner * cols;
+    for k in 0..inner {
+        let left_value = left[left_base + k];
+        let right_base = right_batch_base + k * cols;
+        for col in 0..cols {
+            out[col] += left_value * right[right_base + col];
         }
-        out[col] = sum;
     }
 }
 
