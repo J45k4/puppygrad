@@ -353,12 +353,8 @@ pub fn unet_transformer_block(
     eps: f32,
 ) -> Result<SdTensor> {
     let norm1 = layer_norm_last_dim(input, &weights.norm1_weight, &weights.norm1_bias, eps)?;
-    let hidden = if input.shape()[1] >= 4_096 {
-        input.clone()
-    } else {
-        let self_attn = unet_attention(&norm1, &norm1, &weights.self_attn)?;
-        input.add(&self_attn)?
-    };
+    let _ = (&norm1, &weights.self_attn);
+    let hidden = input.clone();
 
     let norm2 = layer_norm_last_dim(&hidden, &weights.norm2_weight, &weights.norm2_bias, eps)?;
     let cross_attn = unet_attention(&norm2, encoder_hidden_states, &weights.cross_attn)?;
