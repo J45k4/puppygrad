@@ -7,6 +7,10 @@ edition = "2021"
 audio-formats = ["dep:claxon"]
 hardware-io = ["dep:cpal", "dep:nokhwa"]
 
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 claxon = { version = "0.4", optional = true }
