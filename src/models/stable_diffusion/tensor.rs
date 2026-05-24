@@ -555,21 +555,23 @@ fn fill_conv2d_plane(
     out: &mut [f32],
 ) {
     for out_y in 0..out_h {
+        let y_origin = out_y * options.stride;
+        let kernel_y_start = options.padding.saturating_sub(y_origin);
+        let kernel_y_end = (options.padding + in_h)
+            .saturating_sub(y_origin)
+            .min(kernel_h);
         for out_x in 0..out_w {
+            let x_origin = out_x * options.stride;
+            let kernel_x_start = options.padding.saturating_sub(x_origin);
+            let kernel_x_end = (options.padding + in_w)
+                .saturating_sub(x_origin)
+                .min(kernel_w);
             let mut sum = bias[out_channel];
             for in_channel in 0..in_channels {
-                for kernel_y in 0..kernel_h {
-                    let Some(in_y) =
-                        spatial_index(out_y, kernel_y, options.stride, options.padding, in_h)
-                    else {
-                        continue;
-                    };
-                    for kernel_x in 0..kernel_w {
-                        let Some(in_x) =
-                            spatial_index(out_x, kernel_x, options.stride, options.padding, in_w)
-                        else {
-                            continue;
-                        };
+                for kernel_y in kernel_y_start..kernel_y_end {
+                    let in_y = y_origin + kernel_y - options.padding;
+                    for kernel_x in kernel_x_start..kernel_x_end {
+                        let in_x = x_origin + kernel_x - options.padding;
                         let input_index =
                             ((batch * in_channels + in_channel) * in_h + in_y) * in_w + in_x;
                         let weight_index = ((out_channel * in_channels + in_channel) * kernel_h
@@ -886,21 +888,6 @@ fn nchw_index(
     width: usize,
 ) -> usize {
     ((batch * channels + channel) * height + y) * width + x
-}
-
-fn spatial_index(
-    out_index: usize,
-    kernel_index: usize,
-    stride: usize,
-    padding: usize,
-    input_size: usize,
-) -> Option<usize> {
-    let raw = out_index * stride + kernel_index;
-    if raw < padding {
-        return None;
-    }
-    let input_index = raw - padding;
-    (input_index < input_size).then_some(input_index)
 }
 
 fn linear_to_indices(mut index: usize, shape: &[usize]) -> Vec<usize> {
