@@ -1,5 +1,5 @@
 use puppygrad::{
-    compiler::{cuda, source},
+    compiler::{cuda, pop::Scalar, source},
     models::pup_llm::Checkpoint,
 };
 use std::{
@@ -25,7 +25,49 @@ fn main() {
         run_ffi(model_dir, source_path);
         return;
     }
+    if args.get(4).is_some_and(|mode| mode == "plan") {
+        let capacity: usize = args[5].parse().unwrap();
+        let sequence_length: usize = args[6].parse().unwrap();
+        let started = Instant::now();
+        let result = (|| -> Result<_, Box<dyn std::error::Error>> {
+            let mut context = Checkpoint::metadata_context(model_dir, sequence_length)?;
+            context
+                .constants
+                .insert("buffer_capacity".into(), Scalar::Int(capacity as i64));
+            let text = std::fs::read_to_string(source_path)?;
+            let p = source::parse_with_context(&text, &context)?;
+            let (code, gemms) = cuda::emit(&p.graph, p.root)?;
+            Ok((code.matches("__global__ void kernel").count(), gemms))
+        })();
+        let output = match result {
+            Ok((kernels, gemms)) => serde_json::json!({"kernel_count":kernels,"gemm_count":gemms}),
+            Err(e) => serde_json::json!({"error":e.to_string()}),
+        };
+        println!(
+            "{}",
+            serde_json::json!({"plan_ms":started.elapsed().as_secs_f64()*1000.,"result":output})
+        );
+        return;
+    }
     let mut checkpoint = Checkpoint::load(model_dir).unwrap();
+    if let Some(capacity) = args.get(4) {
+        let capacity: usize = capacity
+            .parse()
+            .expect("expected positive KV capacity or ffi/plan");
+        assert!(capacity > 0);
+        let limit = match checkpoint.context.constants["n_positions"] {
+            Scalar::Int(n) => n as usize,
+            _ => unreachable!(),
+        };
+        assert!(
+            capacity <= limit,
+            "KV capacity exceeds the checkpoint context limit"
+        );
+        checkpoint
+            .context
+            .constants
+            .insert("buffer_capacity".into(), Scalar::Int(capacity as i64));
+    }
     let source = std::fs::read_to_string(source_path).unwrap();
     let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     let mut executables = HashMap::new();
@@ -60,7 +102,9 @@ fn main() {
             .iter()
             .map(|v| v.as_u64().unwrap() as usize)
             .collect::<Vec<_>>();
-        if !command["retain"].as_bool().unwrap_or(false) { runtime.reset_state().unwrap(); }
+        if !command["retain"].as_bool().unwrap_or(false) {
+            runtime.reset_state().unwrap();
+        }
         checkpoint.bind_tokens(&tokens).unwrap();
         let n = tokens.len();
         let prepare_started = Instant::now();
@@ -74,7 +118,11 @@ fn main() {
             compile_ms = prepare_started.elapsed().as_secs_f64() * 1000.;
         }
         let exe = &executables[&n];
+        if let Some(enabled) = command["graph_replay"].as_bool() {
+            runtime.set_graph_replay(enabled);
+        }
         let before = exe.residency_stats();
+        let execution_before = exe.execution_stats();
         let started = Instant::now();
         let output = exe.run(&checkpoint.inputs).unwrap();
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.;
@@ -96,7 +144,8 @@ fn main() {
             .unwrap();
         }
         let stats = exe.residency_stats();
-        let profile = serde_json::json!({"kernel_count":exe.kernel_count(),"run_allocations":stats.allocations-before.allocations,"run_input_uploads":stats.input_uploads-before.input_uploads,"run_input_uploaded_bytes":stats.input_uploaded_bytes-before.input_uploaded_bytes,"allocations":stats.allocations,"input_uploads":stats.input_uploads,"input_uploaded_bytes":stats.input_uploaded_bytes,"resident_bytes":stats.resident_bytes,"input_bytes":stats.input_bytes,"state_bytes":stats.state_bytes,"arena_bytes":stats.arena_bytes});
+        let execution = exe.execution_stats();
+        let profile = serde_json::json!({"run_graph_builds":execution.graph_builds-execution_before.graph_builds,"run_graph_launches":execution.graph_launches-execution_before.graph_launches,"run_direct_kernel_launches":execution.direct_kernel_launches-execution_before.direct_kernel_launches,"row_fusion_count":exe.row_fusion_count(),"parallel_reduction_count":exe.parallel_reduction_count(),"kernel_count":exe.kernel_count(),"run_allocations":stats.allocations-before.allocations,"run_input_uploads":stats.input_uploads-before.input_uploads,"run_input_uploaded_bytes":stats.input_uploaded_bytes-before.input_uploaded_bytes,"allocations":stats.allocations,"input_uploads":stats.input_uploads,"input_uploaded_bytes":stats.input_uploaded_bytes,"resident_bytes":stats.resident_bytes,"input_bytes":stats.input_bytes,"state_bytes":stats.state_bytes,"arena_bytes":stats.arena_bytes});
         println!(
             "{}",
             serde_json::json!({"elapsed_ms":elapsed_ms,"compile_ms":compile_ms,"argmax":argmax,"cache_hit":exe.cache_hit,"workspace_bytes":exe.workspace_bytes(),"source_path":exe.source_path,"profile":profile})
@@ -114,6 +163,11 @@ fn run_ffi(model_dir: &Path, source_path: &Path) {
     let mut model = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &config) }.unwrap();
     for line in io::stdin().lock().lines() {
         let command: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if command["info"].as_bool() == Some(true) {
+            println!("{}", serde_json::json!({"context_length":model.info.context_length,"vocab_size":model.info.vocab_size,"eos_token":model.info.eos_token}));
+            io::stdout().flush().unwrap();
+            continue;
+        }
         let tokens = command["tokens"]
             .as_array()
             .unwrap()

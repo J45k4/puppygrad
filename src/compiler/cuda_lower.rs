@@ -1,7 +1,11 @@
 //! CUDA scheduling reuses the C backend's view/expression semantics and arena planner.
-//! This first lowering uses one thread per output and sequential reductions.
+//! Contractions and row reductions use shape-selected parallel schedules.
 use super::*;
 use crate::compiler::cuda::{Binding, Kernel, Lowered};
+#[path = "cuda_fuse.rs"]
+mod expression_fusion;
+#[path = "cuda_reduce.rs"]
+mod reduction;
 
 pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
     let outputs = if g.node(root)?.op() == Op::Sink {
@@ -116,6 +120,23 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
             consumers.entry(input).or_default().push(v);
         }
     }
+    let parallel_reductions = std::env::var("PUPPYGRAD_CUDA_REDUCTIONS").as_deref() != Ok("0");
+    let row_fusions = if parallel_reductions
+        && std::env::var("PUPPYGRAD_CUDA_ROW_FUSION").as_deref() != Ok("0")
+    {
+        reduction::plan(g, &order, &outputs, &consumers, &skip)
+    } else {
+        HashMap::new()
+    };
+    for fusion in row_fusions.values() {
+        skip.extend(fusion.inner.iter().copied());
+    }
+    let fuse_expressions = std::env::var("PUPPYGRAD_CUDA_EXPRESSIONS").as_deref() != Ok("0");
+    let epilogues = if fuse_expressions {
+        expression_fusion::epilogues(g, &order, &outputs, &consumers, &mut fused, &mut skip)?
+    } else {
+        HashMap::new()
+    };
     // Shape operands are compile-time metadata, not executable tensor work.
     for &v in &order {
         if g.node(v)?.op() == Op::Stack
@@ -167,8 +188,24 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
     }
     let mut costs = HashMap::<Value, usize>::new();
     let mut inline_values = HashSet::new();
+    let mut constant_values = HashSet::new();
+    let mut ranges = HashMap::new();
     for &v in &order {
         let node = g.node(v)?;
+        let constant = node.op() == Op::Const
+            || (pointwise(node.op())
+                && node.shape().is_some_and(|s| s.is_empty())
+                && node.src().iter().all(|s| constant_values.contains(s)));
+        if constant {
+            constant_values.insert(v);
+        }
+        if fuse_expressions && !outputs.contains(&v) && !skip.contains(&v) {
+            if let Some(range) = expression_fusion::integer_range(g, v) {
+                ranges.insert(v, range);
+                inline_values.insert(v);
+                continue;
+            }
+        }
         let cost = 1 + node
             .src()
             .iter()
@@ -177,11 +214,13 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
             .min(64);
         if pointwise(node.op())
             && cost <= 24
-            && uses.get(&v).copied().unwrap_or(0) <= 1
+            && (uses.get(&v).copied().unwrap_or(0) <= 1 || (fuse_expressions && constant))
             && !outputs.contains(&v)
             && !store_values.contains(&v)
             && !skip.contains(&v)
             && !contraction_inputs.contains(&v)
+            && !row_fusions.contains_key(&v)
+            && !epilogues.contains_key(&v)
         {
             inline_values.insert(v);
             costs.insert(v, cost);
@@ -191,6 +230,16 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
         ) {
             costs.insert(v, cost);
         }
+    }
+    if fuse_expressions {
+        expression_fusion::store_stacks(
+            g,
+            &order,
+            &outputs,
+            &consumers,
+            &skip,
+            &mut inline_values,
+        )?;
     }
     let mut e = Emitter {
         g,
@@ -217,6 +266,15 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
         labels: HashMap::new(),
         kernel_metadata: Vec::new(),
     };
+    for (v, (first, step)) in ranges {
+        e.overrides.insert(
+            v,
+            format!(
+                "(({})(INT64_C({first}) + ((int64_t)($index))*INT64_C({step})))",
+                ctype(g.node(v)?.dtype())
+            ),
+        );
+    }
 
     // A materialized graph result can write directly to the caller output.
     // Duplicate outputs still get a separate copy; views/constants/parameters
@@ -240,6 +298,7 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
         }
     }
     let mut kernels = Vec::new();
+    let mut parallel_reduction_count = 0;
     let mut inputs = std::collections::BTreeMap::new();
     let mut output_specs = Vec::new();
     for &v in &outputs {
@@ -312,11 +371,19 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
         let n = numel(&shape)?;
         e.alloc(&name, dt, n)?;
         let mut tiled_blocks = None;
-        let code = if let Some(&(a, b, ref product)) = fused.get(&v) {
+        let code = if let Some(fusion) = row_fusions.get(&v) {
+            tiled_blocks = Some(fusion.rows.div_ceil(8));
+            fusion.code(&mut e, v, &name)?
+        } else if let Some(&(a, b, ref product)) = fused.get(&v) {
             let rank = product.len();
             let cols = product[rank - 2];
             let m = product[rank - 3];
             let k = product[rank - 1];
+            let original = epilogues.get(&v).copied().unwrap_or(v);
+            e.overrides.insert(original, "acc".into());
+            let epilogue = e.read(v, "i")?;
+            let tiled_epilogue = e.read(v, &format!("((batch*{m}+out_row)*{cols}+out_col)"))?;
+            e.overrides.remove(&original);
             let coords = |value, left| {
                 let sh = e.shape(value);
                 let mut cs = if left {
@@ -367,7 +434,7 @@ for(size_t base=0;base<{k};base+=32) {{
  for(size_t r=0;r<32;r++) {{if(base+r<{k}) acc+=sa[(tid/16)*32+r]*sb[r*16+tid%16];}}
  __syncthreads();
 }}
-if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]=acc;",
+if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={tiled_epilogue};",
                     tiles_m * tiles_n
                 )
             } else if m > 0
@@ -379,9 +446,9 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]=acc
                 // This handles small matrices and vector products using the same
                 // contraction recognition as the tiled matrix path.
                 tiled_blocks = Some(n.div_ceil(8));
-                format!("const size_t lane=threadIdx.x%32,i=(size_t)blockIdx.x*8+threadIdx.x/32; if(i>={n})return; const size_t col=i%{cols},row=(i/{cols})%{m},batch=i/{}; float acc=0; for(size_t r=lane;r<{k};r+=32) acc+=({ar})*({br}); for(int offset=16;offset>0;offset/=2) acc+=__shfl_down_sync(0xffffffff,acc,offset); if(lane==0) {name}[i]=acc;",m*cols)
+                format!("const size_t lane=threadIdx.x%32,i=(size_t)blockIdx.x*8+threadIdx.x/32; if(i>={n})return; const size_t col=i%{cols},row=(i/{cols})%{m},batch=i/{}; float acc=0; for(size_t r=lane;r<{k};r+=32) acc+=({ar})*({br}); for(int offset=16;offset>0;offset/=2) acc+=__shfl_down_sync(0xffffffff,acc,offset); if(lane==0) {name}[i]={epilogue};",m*cols)
             } else {
-                format!("const size_t col=i%{},row=(i/{})%{},batch=i/{}; float acc=0; for(size_t r=0;r<{k};r++) acc+=({ar})*({br}); {name}[i]=acc;", cols.max(1), cols.max(1), m.max(1), (m*cols).max(1))
+                format!("const size_t col=i%{},row=(i/{})%{},batch=i/{}; float acc=0; for(size_t r=0;r<{k};r++) acc+=({ar})*({br}); {name}[i]={epilogue};", cols.max(1), cols.max(1), m.max(1), (m*cols).max(1))
             }
         } else {
             match node.op() {
@@ -439,10 +506,24 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]=acc
                         ReduceOp::Mul => format!("acc*({x})"),
                         ReduceOp::Max => format!("acc>({x})?acc:({x})"),
                     };
-                    format!(
+                    let contiguous = *num_axes == 1
+                        && e.storage_strides(src[0])
+                            .is_some_and(|s| s.first() == Some(&1));
+                    if parallel_reductions
+                        && dt == DType::F32
+                        && count >= 32
+                        && (n < 256 || contiguous)
+                    {
+                        parallel_reduction_count += 1;
+                        tiled_blocks = Some(n.div_ceil(8));
+                        let reduce = reduction::warp_reduce(count, *op, &x, "acc");
+                        format!("const size_t lane=threadIdx.x%32,i=(size_t)blockIdx.x*8+threadIdx.x/32; if(i>={n})return; {reduce} if(lane==0){name}[i]=acc;")
+                    } else {
+                        format!(
                         "{} acc={init}; for(size_t r=0;r<{count};r++) acc={expr}; {name}[i]=acc;",
                         ctype(dt)
                     )
+                    }
                 }
                 Op::Index => {
                     let base = e.shape(src[0]);
@@ -555,6 +636,8 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]=acc
         outputs: output_specs,
         workspace_bytes: e.peak_workspace.max(1),
         gemm_count: fused.len(),
+        row_fusion_count: row_fusions.len(),
+        parallel_reduction_count,
     })
 }
 

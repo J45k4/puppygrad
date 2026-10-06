@@ -58,10 +58,43 @@ tiles and 32-wide shared-memory operand tiles, coalescing B loads according to
 its physical view layout. Smaller contractions with a contiguous B reduction axis
 and K >= 32 use one warp per output; remaining cases use one thread per output.
 Warp shuffles change reduction order; FMA stays disabled. Bounded, single-use
-pointwise expressions fuse through views; shared values and contraction inputs
-remain materialized to avoid recomputation. Materialized results write directly
-to output buffers where possible. Other reductions accumulate sequentially
-within one thread per output.
+pointwise expressions fuse through views; shared tensors and contraction inputs
+remain materialized to avoid recomputation. Shared scalar constant expressions
+are inlined, and literal integer sequences such as `arange` become indexing
+expressions without a device buffer. Materialized results write directly
+to output buffers where possible. F32 reductions with at least 32 input values
+use one warp per output when there are fewer than 256 outputs or the reduced
+axis has contiguous storage. Other layouts and short/integer reductions keep
+the sequential schedule. Sum/product reduction order changes, so numerical
+comparisons use tolerances. Ordered max merges preserve the existing ternary
+comparison behavior for NaNs and equal values, including signed zero.
+
+The compiler recognizes row-local RMS normalization and stable softmax from
+their primitive Pop graphs. For widths 32 through 4096, private reductions and
+their pointwise consumers become one warp-per-row kernel. Softmax keeps each
+lane's exponentials in registers for summation and output; no exponential tensor
+is materialized. Shared intermediate results stay available to other consumers,
+and fusion cannot move reads across writable-state stores. These schedules use
+the existing operations and require no model-source changes.
+
+Contractions absorb bounded pointwise epilogues, including residual additions,
+broadcast bias and activation gates. The planner accepts internal shared uses
+such as `x * sigmoid(x)` while retaining any intermediate exposed to another
+consumer or output. It schedules the fused kernel at the final expression so
+independent tensor operands are ready, and never delays the contraction across
+a state write. Private stacks with two through four inputs can similarly write
+directly into a store through indexing views. This requires immutable buffers
+or already materialized snapshots at the expression's leaves; expressions
+reading writable memory retain their separate stack buffer for overlap safety.
+`PUPPYGRAD_CUDA_EXPRESSIONS=0` disables these epilogues, constant/range inlining
+and stack/store fusion. Set it before compilation to compare schedules.
+
+`PUPPYGRAD_CUDA_REDUCTIONS=0` restores sequential reductions and disables row
+fusion. `PUPPYGRAD_CUDA_ROW_FUSION=0` keeps parallel reductions while disabling
+normalization/softmax fusion. Set these before compilation.
+`row_fusion_count()` and `parallel_reduction_count()` describe the selected
+schedules; the latter counts standalone reductions, excluding fused kernels.
+Warp shuffle participation follows the [NVIDIA CUDA programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html).
 
 Supported output/input buffers are F32, I32, U8, and Bool. Weak scalars and
 compile-time shapes follow existing language semantics. Integer add/subtract,
@@ -76,6 +109,28 @@ stream of the retained primary context. The runtime pushes/pops that context
 around execution and synchronizes before retained storage can be reused, including
 on launch failures. Executables deliberately cannot be shared across Rust
 threads implicitly.
+
+Repeated executions use CUDA driver graph replay by default. An executable
+records its lowered kernels as an ordered dependency chain and submits that
+chain with one `cuGraphLaunch`. Kernel arithmetic and counts are unchanged;
+input uploads, error-flag reset, synchronization and output downloads still
+happen per call. This also applies to programs with retained writable state:
+`STORE`/`AFTER` dependencies and arena reuse keep their existing execution order.
+
+Each executable caches one recorded graph. Any allocation or replacement in the
+shared runtime invalidates it, so changing input shapes, growing scratch/output
+storage, or replacing a state declaration cannot replay stale addresses. New
+input contents and state resets reuse the graph. Recorded graphs are destroyed
+before unloading their kernel modules. GPU storage counters describe retained
+tensor buffers and exclude driver-internal graph allocations.
+
+Set `PUPPYGRAD_CUDA_GRAPH=0` before creating a runtime to use direct kernel
+launches, or call `Runtime::set_graph_replay(false)`. `execution_stats()` exposes
+graph builds, graph launches and direct kernel launches for the shared runtime;
+`kernel_count()` continues to report the number of GPU kernels per execution.
+The driver bindings use the original `cuGraphAddKernelNode` parameter ABI and
+`cuGraphInstantiate_v2`; the driver copies kernel argument values when a node
+is added ([NVIDIA graph API](https://docs.nvidia.com/cuda/archive/11.0/cuda-driver-api/group__CUDA__GRAPH.html)).
 
 A `cuda::Runtime` owns resident inputs, writable state, an arena, output buffers,
 and the device error flag. `compile` creates a private runtime; `compile_with_runtime` shares

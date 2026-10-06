@@ -363,13 +363,54 @@ fn cached_qwen3_cpu_matches_full_prefix_with_chunks_and_reset() {
 fn cached_qwen3_cuda_matches_full_prefix_with_chunks_and_reset() {
     cached_chunks(&Fixture::new(), true);
 }
-#[test]
-fn cached_qwen3_uses_generic_ffi_and_resets_between_inferences() {
+fn cached_provider(gpu: bool) {
     use puppygrad::runtime::llm_ffi::{Generation, Model};
     let f = Fixture::new();
-    let config=serde_json::to_vec(&serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":"cpu","threads":1})).unwrap();
+    if gpu {
+        let config_path = f.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["max_position_embeddings"] = serde_json::json!(8192);
+        std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
+    let config=serde_json::to_vec(&serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":if gpu {"cuda:0"} else {"cpu"},"threads":1,"prefill_chunk":2,"context_budget_mib":1,"context_reserve_mib":0})).unwrap();
     let mut model = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &config) }.unwrap();
-    for prompt in [vec![1usize, 3, 2], vec![4, 1], vec![1, 3, 2]] {
+    if gpu {
+        assert!(model.info.context_length >= 8 && model.info.context_length < 8192);
+        let context = Checkpoint::metadata_context(&f.dir, 1).unwrap();
+        let expected = puppygrad::runtime::llm_capacity::determine(
+            include_str!("../examples/qwen3_cached.pup"),
+            &context,
+            1024 * 1024,
+            0,
+            Some(2),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            model.info.context_length,
+            expected.max_context_tokens as u64
+        );
+        let oversized = vec![1; model.info.context_length as usize + 1];
+        let error = model
+            .infer(
+                &oversized,
+                Generation {
+                    max_new_tokens: 1,
+                    temperature: 0.,
+                    seed: 42,
+                    reserved: 0,
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("context"), "{error}");
+    }
+    for prompt in [
+        vec![1usize, 3, 2, 4, 1, 2, 3],
+        vec![4, 1],
+        vec![1, 3, 2, 4, 1, 2, 3],
+    ] {
         let mut history = prompt.clone();
         let mut expected = vec![];
         for _ in 0..4 {
@@ -386,6 +427,11 @@ fn cached_qwen3_uses_generic_ffi_and_resets_between_inferences() {
                 break;
             }
         }
+        let mut streamed = vec![];
+        let mut callback = |tokens: &[u32]| {
+            streamed.extend_from_slice(tokens);
+            Ok(())
+        };
         let output = model
             .infer(
                 &prompt.iter().map(|&t| t as u32).collect::<Vec<_>>(),
@@ -395,9 +441,20 @@ fn cached_qwen3_uses_generic_ffi_and_resets_between_inferences() {
                     seed: 42,
                     reserved: 0,
                 },
-                None,
+                Some(&mut callback),
             )
             .unwrap();
         assert_eq!(output.tokens, expected);
+        assert_eq!(streamed, expected);
     }
+}
+
+#[test]
+fn cached_qwen3_uses_chunked_ffi_and_resets_between_inferences() {
+    cached_provider(false);
+}
+#[test]
+#[ignore = "requires NVIDIA GPU and NVRTC"]
+fn cached_qwen3_ffi_automatically_limits_context_and_chunks_prefill() {
+    cached_provider(true);
 }

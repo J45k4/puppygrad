@@ -155,6 +155,7 @@ fn gpu_contractions_preserve_tails_and_updated_weights() {
 fn gpu_retains_inputs_across_shapes_and_refreshes_copy_on_write() {
     use std::sync::Arc;
     let runtime = cuda::Runtime::new(0).unwrap();
+    runtime.set_graph_replay(true);
     let cache = Path::new(".cache/pup/cuda-tests/residency");
     let small = program(
         "x = param(0, f32, 2)\nw = param(1, f32, 4)\noutput x + load(index(w, cast(1, i32)))",
@@ -173,6 +174,9 @@ fn gpu_retains_inputs_across_shapes_and_refreshes_copy_on_write() {
     assert_eq!(cold.input_uploaded_bytes, 24);
     a.run(&first_inputs).unwrap();
     let warm = runtime.residency_stats();
+    assert_eq!(runtime.execution_stats().graph_builds, 1);
+    assert_eq!(runtime.execution_stats().graph_launches, 2);
+    assert_eq!(runtime.execution_stats().direct_kernel_launches, 0);
     assert_eq!(warm.allocations, cold.allocations);
     assert_eq!(warm.input_uploads, cold.input_uploads);
     let large_inputs = [floats(&[1., 2., 3., 4., 5.]), weights.clone()];
@@ -185,6 +189,11 @@ fn gpu_retains_inputs_across_shapes_and_refreshes_copy_on_write() {
     assert_eq!(grown.input_uploads - warm.input_uploads, 1);
     a.run(&first_inputs).unwrap();
     let shrunk = runtime.residency_stats();
+    assert_eq!(
+        runtime.execution_stats().graph_builds,
+        3,
+        "small executable must rebuild after shared buffers grow"
+    );
     assert_eq!(shrunk.allocations, grown.allocations);
     assert_eq!(shrunk.input_uploaded_bytes - grown.input_uploaded_bytes, 8);
     // Retaining the host Arc makes replacement/copy-on-write updates observable.
@@ -193,6 +202,11 @@ fn gpu_retains_inputs_across_shapes_and_refreshes_copy_on_write() {
     }
     let changed = a.run(&[first_inputs[0].clone(), weights]).unwrap();
     assert_eq!(changed[0].f32().unwrap(), &[-4., -3.]);
+    assert_eq!(
+        runtime.execution_stats().graph_builds,
+        3,
+        "new input contents reuse recorded addresses"
+    );
     assert_eq!(
         runtime.residency_stats().input_uploaded_bytes - shrunk.input_uploaded_bytes,
         16
@@ -220,6 +234,194 @@ fn emits_generic_tiling_and_bounded_pointwise_fusion() {
     let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
     assert_eq!(code.matches("__global__ void kernel").count(), 1);
     assert!(code.contains("sinf"));
+}
+
+#[test]
+fn fuses_contraction_epilogues_and_literal_ranges() {
+    let p = program("a=reshape(param(0,f32,2489),[19,131])\nb=reshape(param(1,f32,8777),[67,131])\noutput silu(matmul(a,permute(b,[1,0]))+param(2,f32,67))*0.5");
+    let (code, gemms) = cuda::emit(&p.graph, p.root).unwrap();
+    assert_eq!(gemms, 1);
+    assert_eq!(code.matches("__global__ void kernel").count(), 1);
+    assert!(code.contains("exp2f"));
+    let p = program("x=param(0,f32,129)\nr=cast(arange(129),f32)\noutput x+r\noutput x-r");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert_eq!(code.matches("__global__ void kernel").count(), 3);
+    // The shared non-scalar cast stays materialized; its integer range and
+    // shared scalar elements are indexing expressions rather than kernels.
+    assert!(!code.contains("i>=0 && i<1"));
+    let p = program("a=reshape(param(0,f32,64),[2,32])\nb=reshape(param(1,f32,96),[3,32])\ny=matmul(a,permute(b,[1,0]))\noutput y\noutput y+1.0");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert_eq!(code.matches("__global__ void kernel").count(), 2);
+    let p = program("s=state(\"epilogue\",f32,[1,32])\ny=matmul(s,reshape(param(0,f32,32),[32,1]))\nw=store(index(s,cast(stack(0),i32)),reshape(param(1,f32,32),[1,32]))\nb=after(reshape(param(2,f32,1),[1,1]),w)\noutput y+b");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert!(
+        code.contains("=acc;"),
+        "must retain the pre-store contraction"
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU and NVRTC"]
+fn gpu_contraction_epilogues_and_literal_views_match_cpu() {
+    for (m, k, n) in [(2, 3, 2), (3, 33, 9), (19, 131, 67)] {
+        let p = format!("a=reshape(param(0,f32,{}),[{m},{k}])\nb=reshape(param(1,f32,{}),[{n},{k}])\nc=reshape(param(3,f32,{}),[{n},{k}])\nx=matmul(a,permute(b,[1,0]))\nu=matmul(a,permute(c,[1,0]))+0.5\noutput silu(x+param(2,f32,{n}))*u",m*k,n*k,n*k);
+        compare(
+            &p,
+            &[
+                floats(
+                    &(0..m * k)
+                        .map(|i| (i % 13) as f32 / 32. - 0.2)
+                        .collect::<Vec<_>>(),
+                ),
+                floats(
+                    &(0..n * k)
+                        .map(|i| (i % 7) as f32 / 16. - 0.1)
+                        .collect::<Vec<_>>(),
+                ),
+                floats(&(0..n).map(|i| i as f32 / 16.).collect::<Vec<_>>()),
+                floats(
+                    &(0..n * k)
+                        .map(|i| (i % 11) as f32 / 32. - 0.1)
+                        .collect::<Vec<_>>(),
+                ),
+            ],
+        );
+    }
+    let mut text = String::from(
+        "a=reshape(param(0,f32,6),[2,3])\nb=reshape(param(1,f32,6),[3,2])\nx0=matmul(a,b)+0.25\n",
+    );
+    for i in 0..12 {
+        text.push_str(&format!("x{}=x{i}+x{i}\n", i + 1));
+    }
+    text.push_str("output x12");
+    let p = program(&text);
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert!(
+        code.len() < 40000,
+        "repeated internal uses must not explode emitted expressions"
+    );
+    compare(
+        &text,
+        &[
+            floats(&[1., 2., 3., 4., 5., 6.]),
+            floats(&[1., 2., 3., 4., 5., 6.]),
+        ],
+    );
+    compare("r=reshape(cast(arange(129),f32),[3,43])\nx=permute(r,[1,0])\noutput x+param(0,f32,3)\noutput flip(r,[false,true])", &[floats(&[0.5,-1.,2.])]);
+    compare("r=cast(stack(9,6,3,0,-3),i32)\noutput r\noutput cast(stack(1,4,2),i32)\noutput cast(stack(2147483647,2147483648),i32)", &[]);
+}
+
+#[test]
+fn fuses_private_stack_store_without_losing_overlap_snapshots() {
+    let p=program("x=reshape(param(0,f32,6),[2,3])\ns=state(\"stack\",f32,[2,6])\npayload=reshape(permute(stack(x+1.0,x-1.0),[1,0,2]),[2,6])\nw=store(index(s,cast(arange(2),i32)),payload)\noutput after(s,w)");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert_eq!(code.matches("__global__ void kernel").count(), 2, "{code}");
+    let p=program("s=state(\"stack\",f32,[2,3])\npayload=reshape(stack(shrink(s,[0,0],[1,3]),shrink(s,[1,0],[1,3])),[2,3])\nw=store(index(s,cast(stack(1,0),i32)),payload)\noutput after(s,w)");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert!(
+        code.contains("i>=0 && i<3"),
+        "overlapping stack stays materialized"
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU and NVRTC"]
+fn gpu_fused_stores_and_epilogue_state_ordering() {
+    compare("x=reshape(param(0,f32,6),[2,3])\ns=state(\"stack\",f32,[2,6])\npayload=reshape(permute(stack(x+1.0,x-1.0),[1,0,2]),[2,6])\nw=store(index(s,cast(arange(2),i32)),payload)\noutput after(s,w)", &[floats(&[1.,2.,3.,4.,5.,6.])]);
+    compare("x=reshape(param(0,f32,6),[2,3])\ns=state(\"stack\",f32,[2,3])\nw=store(index(s,cast(arange(2),i32)),x)\na=after(s,w)\npayload=reshape(stack(shrink(a,[0,0],[1,3]),shrink(a,[1,0],[1,3])),[2,3])\nc=store(index(a,cast(stack(1,0),i32)),payload)\noutput after(a,c)", &[floats(&[1.,2.,3.,4.,5.,6.])]);
+    // The contraction reads the old state even though its eventual bias is
+    // explicitly dependent on a write. Check against known answers rather
+    // than another backend's fusion planner.
+    let p=program("s=state(\"epilogue\",f32,[1,32])\ny=matmul(s,reshape(param(0,f32,32),[32,1]))\nw=store(index(s,cast(stack(0),i32)),reshape(param(1,f32,32),[1,32]))\nb=after(reshape(param(2,f32,1),[1,1]),w)\noutput y+b");
+    let gpu = cuda::compile(
+        &p.graph,
+        p.root,
+        Path::new(".cache/pup/cuda-tests/epilogue-state"),
+        0,
+    )
+    .unwrap();
+    let inputs = [floats(&[1.; 32]), floats(&[2.; 32]), floats(&[3.])];
+    assert_eq!(gpu.run(&inputs).unwrap()[0].f32().unwrap(), &[3.]);
+    assert_eq!(gpu.run(&inputs).unwrap()[0].f32().unwrap(), &[67.]);
+}
+
+#[test]
+fn fuses_primitive_row_normalization_and_keeps_shared_reductions() {
+    for expression in ["rms_norm(x, param(1, f32, 129), 0.000001)", "softmax(x)"] {
+        let p = program(&format!(
+            "x = reshape(param(0, f32, 1161), [9,129])\noutput {expression}"
+        ));
+        let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+        assert_eq!(code.matches("__global__ void kernel").count(), 1, "{code}");
+        assert!(code.contains("fused row reduction"));
+    }
+    let p = program("x = reshape(param(0, f32, 1161), [9,129])\noutput reduce(permute(x*x,[1,0]),add,1)\noutput rms_norm(x, param(1,f32,129),0.000001)");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert!(!code.contains("fused row reduction"));
+    assert!(code.contains("__shfl_down_sync"));
+    let p = program("s=state(\"row\",f32,[1,33])\nx=s\nw=store(index(s,cast(stack(0),i32)),reshape(cast(arange(33),f32),[1,33]))\nweight=after(param(0,f32,33),w)\noutput rms_norm(x,weight,0.000001)");
+    let (code, _) = cuda::emit(&p.graph, p.root).unwrap();
+    assert!(
+        !code.contains("fused row reduction"),
+        "fusion cannot delay statistics across a store"
+    );
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU and NVRTC"]
+fn gpu_parallel_reductions_and_row_fusions_match_cpu_with_tails() {
+    for (rows, width) in [(1, 32), (3, 33), (9, 129), (2, 1025)] {
+        let input = floats(
+            &(0..rows * width)
+                .map(|i| ((i * 7 % 31) as f32 - 15.) / 32.)
+                .collect::<Vec<_>>(),
+        );
+        let header = format!(
+            "x = reshape(param(0,f32,{}),[{rows},{width}])\n",
+            rows * width
+        );
+        for expression in [
+            "softmax(x)",
+            "rms_norm(x,1.25,0.000001)",
+            "layer_norm(x,1.25,-0.5,0.000001)",
+        ] {
+            compare(&(header.clone() + "output " + expression), &[input.clone()]);
+        }
+        compare(
+            &(header + "output reduce(permute(x,[1,0]),add,1)\noutput reduce(x,add,2)"),
+            &[input],
+        );
+    }
+    let p = program("x = param(0,f32,65)\noutput reduce(x,max,1)");
+    let cpu = cpu::compile(&p.graph, p.root, Path::new(".cache/pup/cuda-tests/cpu")).unwrap();
+    let gpu = cuda::compile(&p.graph, p.root, Path::new(".cache/pup/cuda-tests/gpu"), 0).unwrap();
+    for nan_at in [None, Some(0), Some(31), Some(63), Some(64)] {
+        let mut input = vec![-0.0; 65];
+        input[0] = 100.;
+        input[64] = 0.;
+        if let Some(i) = nan_at {
+            input[i] = f32::NAN;
+        }
+        let input = [floats(&input)];
+        let expected = cpu.run(&input).unwrap()[0].f32().unwrap()[0];
+        let actual = gpu.run(&input).unwrap()[0].f32().unwrap()[0];
+        assert!(
+            if expected.is_nan() {
+                actual.is_nan()
+            } else {
+                actual.to_bits() == expected.to_bits()
+            },
+            "{nan_at:?}: {actual} != {expected}"
+        );
+    }
+    compare(
+        "x=param(0,f32,97)\noutput reduce(x,mul,1)",
+        &[floats(
+            &(0..97)
+                .map(|i| 1. + (i % 3) as f32 / 1024.)
+                .collect::<Vec<_>>(),
+        )],
+    );
 }
 
 #[test]

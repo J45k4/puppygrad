@@ -57,6 +57,55 @@ input slot, even if both tensors are serialized. Qwen3's
 metadata-only emitter produce identical bindings. Sharded safetensors and RoPE
 scaling variants are not implemented by this example.
 
+The official [model card](https://huggingface.co/Qwen/Qwen3-0.6B#model-overview)
+advertises a **32,768-token context window**, shared by prompt and generated
+tokens. The pinned checkpoint config declares `max_position_embeddings: 40960`;
+the provider caps its input/output positions at that config value. CUDA
+automatically selects a smaller limit when device memory requires it. It is not a validation of model quality beyond the advertised 32K window.
+Our original CUDA comparisons covered only 24, 64 and 128 input tokens with
+512 KV slots. Use the [context benchmark](../benchmarks/qwen3-cuda/context.py)
+to measure larger retained capacities and the workspace cost of prefill.
+
+For this architecture, F32 KV requires `2 * 28 * 8 * 128 * 4` bytes per slot:
+224 KiB per token, or 7 GiB at 32K capacity, in addition to approximately
+2.22 GiB of F32 weights. The production provider rounds required KV capacity up
+to a power of two, clipped to the effective FFI context limit (normally at least
+512 slots). Attention currently computes over the entire reserved capacity and
+masks unused rows. CUDA retained providers now prefill in 128-token chunks by
+default. Large single-shot attention tensors can exceed the compiler's 2 GiB
+workspace guards even when retained KV and chunked execution fit on the GPU.
+
+Context sizing is runtime policy. The compiler supplies allocation plans; the
+provider queries live GPU free memory, reserves 512 MiB for modules, graphs and
+transient allocations, and searches for an affordable context within the model's
+position limit. `build_model` publishes the resulting limit in the existing
+`Info.context_length` field. Each inference checks its actual prefill/tail/decode
+buffer requirements against current free memory, accounting for retained buffers
+and transient resize peaks. Plans and compiled shapes are cached. `.pup` still
+owns state layout and updates; chunk orchestration needs no new language syntax.
+
+Inspect the estimate without loading weight values or running inference:
+
+```bash
+target/release/puppygrad llm capacity examples/qwen3_cached.pup \
+  --model-dir models/qwen3-0.6b --device cuda:0 --json
+```
+
+`--single-shot` estimates whole-prompt prefill; `--prefill-chunk N` selects a
+retained chunk size. `--memory-budget-mib N` enables offline planning without a
+GPU, and `--reserve-mib N` changes reserved headroom. This command uses the same
+planner as automatic provider creation. Its result is an allocation estimate,
+not a model-quality test or a guarantee against concurrent GPU allocation.
+Arbitrary source branches can make memory use non-monotonic; actual request
+shapes are checked separately.
+
+At the FFI construction boundary, optional JSON fields `auto_context` (defaults
+to true on CUDA and false on CPU), `prefill_chunk`, `context_reserve_mib` (512),
+and `context_budget_mib` control this provider policy. A configured budget can
+only reduce live available memory. CPU retains its existing context policy;
+explicit CPU chunking is supported for retained programs. Shared-library
+providers continue to publish their own context limits through the same ABI.
+
 `--verify-reference` remains a GPT-2-only check. Qwen is verified by a deterministic
 small BF16 checkpoint against an independent scalar reference, and by full-model
 CUDA logits and greedy token parity against native tinygrad.

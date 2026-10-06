@@ -5,7 +5,7 @@ use super::{
     pop::{numel, DType, Error, Graph, Result, Value},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{hash_map::DefaultHasher, HashMap},
     ffi::{c_char, c_int, c_uint, c_void, CStr, CString},
     hash::{Hash, Hasher},
@@ -13,6 +13,9 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
+
+#[path = "cuda_graph.rs"]
+mod replay;
 
 type Handle = *mut c_void;
 type DevicePtr = u64;
@@ -37,6 +40,8 @@ pub(crate) struct Lowered {
     pub outputs: Vec<(DType, Vec<usize>)>,
     pub workspace_bytes: usize,
     pub gemm_count: usize,
+    pub row_fusion_count: usize,
+    pub parallel_reduction_count: usize,
 }
 pub(crate) fn dtype_bytes(dt: DType) -> usize {
     match dt {
@@ -50,6 +55,123 @@ pub(crate) fn dtype_bytes(dt: DType) -> usize {
 pub fn emit(g: &Graph, root: Value) -> Result<(String, usize)> {
     let x = super::cpu::cuda_lower::emit(g, root)?;
     Ok((x.source, x.gemm_count))
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ParameterMemory {
+    pub bytes: usize,
+    pub state: bool,
+    pub dtype: DType,
+}
+/// Device allocations selected by lowering, without loading NVRTC or weights.
+/// Driver/module/graph storage is additional and needs reserved headroom.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct MemoryPlan {
+    pub parameters: std::collections::BTreeMap<usize, ParameterMemory>,
+    pub output_buffers: Vec<usize>,
+    pub workspace_bytes: usize,
+}
+impl MemoryPlan {
+    fn from_lowered(x: &Lowered) -> Result<Self> {
+        let parameters = x
+            .inputs
+            .iter()
+            .map(|&(slot, dt, n)| {
+                let bytes = n
+                    .checked_mul(dtype_bytes(dt))
+                    .ok_or_else(|| Error("CUDA memory plan overflow".into()))?
+                    .max(1);
+                let state = x.state_slots.contains(&slot);
+                if state && bytes > 2 * 1024 * 1024 * 1024 {
+                    return Err(Error("state allocation exceeds 2 GiB".into()));
+                }
+                Ok((
+                    slot,
+                    ParameterMemory {
+                        bytes,
+                        state,
+                        dtype: dt,
+                    },
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let output_buffers = x
+            .outputs
+            .iter()
+            .map(|(dt, shape)| {
+                numel(shape)?
+                    .checked_mul(dtype_bytes(*dt))
+                    .ok_or_else(|| Error("CUDA memory plan overflow".into()))
+                    .map(|n| n.max(1))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            parameters,
+            output_buffers,
+            workspace_bytes: x.workspace_bytes.max(1),
+        })
+    }
+    /// Combine shapes that share one retained runtime; weights and state slots
+    /// are counted once, scratch and output buffers retain their largest size.
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
+        for (&slot, p) in &other.parameters {
+            if let Some(old) = self.parameters.get_mut(&slot) {
+                if old.state != p.state
+                    || (p.state && (old.bytes != p.bytes || old.dtype != p.dtype))
+                {
+                    return Err(Error(
+                        "retained state layout changes between execution shapes".into(),
+                    ));
+                }
+                old.bytes = old.bytes.max(p.bytes);
+            } else {
+                self.parameters.insert(slot, p.clone());
+            }
+        }
+        self.workspace_bytes = self.workspace_bytes.max(other.workspace_bytes);
+        self.output_buffers
+            .resize(self.output_buffers.len().max(other.output_buffers.len()), 0);
+        for (old, &n) in self.output_buffers.iter_mut().zip(&other.output_buffers) {
+            *old = (*old).max(n);
+        }
+        Ok(())
+    }
+    pub fn input_bytes(&self) -> usize {
+        self.parameters
+            .values()
+            .filter(|p| !p.state)
+            .map(|p| p.bytes)
+            .fold(0, usize::saturating_add)
+    }
+    pub fn state_bytes(&self) -> usize {
+        self.parameters
+            .values()
+            .filter(|p| p.state)
+            .map(|p| p.bytes)
+            .fold(0, usize::saturating_add)
+    }
+    pub fn output_bytes(&self) -> usize {
+        self.output_buffers
+            .iter()
+            .copied()
+            .fold(0, usize::saturating_add)
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.input_bytes()
+            .saturating_add(self.state_bytes())
+            .saturating_add(self.workspace_bytes)
+            .saturating_add(self.output_bytes())
+            .saturating_add(4)
+    }
+}
+pub fn memory_plan(g: &Graph, root: Value) -> Result<MemoryPlan> {
+    MemoryPlan::from_lowered(&super::cpu::cuda_lower::emit(g, root)?)
+}
+
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct DeviceMemory {
+    pub free_bytes: usize,
+    pub total_bytes: usize,
 }
 pub fn device_index(device: &str) -> Result<usize> {
     if device == "cuda" {
@@ -94,10 +216,17 @@ driver_api! {
     function:unsafe extern "C" fn(*mut Handle,Handle,*const c_char)->c_int => "cuModuleGetFunction",
     alloc:unsafe extern "C" fn(*mut DevicePtr,usize)->c_int => "cuMemAlloc_v2",
     free:unsafe extern "C" fn(DevicePtr)->c_int => "cuMemFree_v2",
+    memory_info:unsafe extern "C" fn(*mut usize,*mut usize)->c_int => "cuMemGetInfo_v2",
     upload:unsafe extern "C" fn(DevicePtr,*const c_void,usize)->c_int => "cuMemcpyHtoD_v2",
     memset:unsafe extern "C" fn(DevicePtr,u8,usize)->c_int => "cuMemsetD8_v2",
     download:unsafe extern "C" fn(*mut c_void,DevicePtr,usize)->c_int => "cuMemcpyDtoH_v2",
     launch:unsafe extern "C" fn(Handle,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,Handle,*mut *mut c_void,*mut *mut c_void)->c_int => "cuLaunchKernel",
+    graph_create:unsafe extern "C" fn(*mut Handle,c_uint)->c_int => "cuGraphCreate",
+    graph_destroy:unsafe extern "C" fn(Handle)->c_int => "cuGraphDestroy",
+    graph_add_kernel:unsafe extern "C" fn(*mut Handle,Handle,*const Handle,usize,*const replay::KernelParams)->c_int => "cuGraphAddKernelNode",
+    graph_instantiate:unsafe extern "C" fn(*mut Handle,Handle,*mut Handle,*mut c_char,usize)->c_int => "cuGraphInstantiate_v2",
+    graph_exec_destroy:unsafe extern "C" fn(Handle)->c_int => "cuGraphExecDestroy",
+    graph_launch:unsafe extern "C" fn(Handle,Handle)->c_int => "cuGraphLaunch",
     synchronize:unsafe extern "C" fn()->c_int => "cuCtxSynchronize",
     error_string:unsafe extern "C" fn(c_int,*mut *const c_char)->c_int => "cuGetErrorString",
 }
@@ -231,6 +360,7 @@ struct RuntimeInner {
     device_name: String,
     architecture: String,
     buffers: RefCell<Buffers>,
+    graph_replay: Cell<bool>,
 }
 #[derive(Default)]
 struct Buffers {
@@ -240,6 +370,7 @@ struct Buffers {
     inputs: HashMap<usize, ResidentInput>,
     states: HashMap<usize, (DType, usize, Memory)>,
     allocations: u64,
+    execution: ExecutionStats,
     input_uploads: u64,
     input_uploaded_bytes: u64,
 }
@@ -259,7 +390,83 @@ pub struct ResidencyStats {
     pub arena_bytes: usize,
     pub state_bytes: usize,
 }
+/// Host submission counters; kernel_count still counts GPU kernel work.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutionStats {
+    pub graph_builds: u64,
+    pub graph_launches: u64,
+    pub direct_kernel_launches: u64,
+}
 impl Runtime {
+    pub fn memory_info(&self) -> Result<DeviceMemory> {
+        let context = &self.0.context;
+        let _current = context.driver.enter(context.handle)?;
+        let (mut free_bytes, mut total_bytes) = (0, 0);
+        context.driver.check(
+            unsafe { (context.driver.memory_info)(&mut free_bytes, &mut total_bytes) },
+            "memory info",
+        )?;
+        Ok(DeviceMemory {
+            free_bytes,
+            total_bytes,
+        })
+    }
+    /// Account for buffers already retained by other shapes before allocating.
+    /// This is a preflight estimate; other GPU processes may allocate afterwards.
+    pub fn check_memory(&self, plan: &MemoryPlan, reserve_bytes: usize) -> Result<()> {
+        let info = self.memory_info()?;
+        let b = self.0.buffers.borrow();
+        let mut extra = plan
+            .workspace_bytes
+            .saturating_sub(b.arena.as_ref().map_or(0, |m| m.bytes));
+        // A growing allocation is created before its old buffer is dropped.
+        // Net growth alone would undercount this transient allocation peak.
+        let mut overlap = b
+            .arena
+            .as_ref()
+            .filter(|m| m.bytes < plan.workspace_bytes)
+            .map_or(0, |m| m.bytes);
+        extra =
+            extra.saturating_add(4usize.saturating_sub(b.error.as_ref().map_or(0, |m| m.bytes)));
+        for (&slot, p) in &plan.parameters {
+            let owned = if p.state {
+                b.states.get(&slot).map_or(0, |(_, _, m)| m.bytes)
+            } else {
+                b.inputs.get(&slot).map_or(0, |x| x.memory.bytes)
+            };
+            let replaces = if p.state {
+                b.states
+                    .get(&slot)
+                    .is_some_and(|(dt, _, m)| *dt != p.dtype || m.bytes != p.bytes)
+            } else {
+                owned < p.bytes
+            };
+            if replaces {
+                overlap = overlap.max(owned.min(p.bytes));
+            }
+            extra = extra.saturating_add(p.bytes.saturating_sub(owned));
+        }
+        for (slot, &bytes) in plan.output_buffers.iter().enumerate() {
+            let owned = b.outputs.get(slot).map_or(0, |m| m.bytes);
+            if owned < bytes {
+                overlap = overlap.max(owned);
+            }
+            extra = extra
+                .saturating_add(bytes.saturating_sub(b.outputs.get(slot).map_or(0, |m| m.bytes)));
+        }
+        extra = extra.saturating_add(overlap);
+        if extra.saturating_add(reserve_bytes) > info.free_bytes {
+            return Err(Error(format!("insufficient free GPU memory: need {extra} additional bytes plus {reserve_bytes} reserved, available {}", info.free_bytes)));
+        }
+        Ok(())
+    }
+    /// Select graph replay or direct kernel launches without changing model source.
+    pub fn set_graph_replay(&self, enabled: bool) {
+        self.0.graph_replay.set(enabled);
+    }
+    pub fn execution_stats(&self) -> ExecutionStats {
+        self.0.buffers.borrow().execution
+    }
     pub fn reset_state(&self) -> Result<()> {
         let context = &self.0.context;
         let d = &context.driver;
@@ -284,6 +491,7 @@ impl Runtime {
             device_name,
             architecture,
             buffers: RefCell::new(Buffers::default()),
+            graph_replay: Cell::new(std::env::var("PUPPYGRAD_CUDA_GRAPH").as_deref() != Ok("0")),
         })))
     }
     /// Input counters exclude the four-byte device error flag reset.
@@ -335,6 +543,7 @@ pub struct Executable {
     module: Handle,
     functions: Vec<Handle>,
     lowered: Lowered,
+    replay: RefCell<Option<replay::Replay>>,
     pub source_path: PathBuf,
     pub gemm_count: usize,
     pub cache_hit: bool,
@@ -344,6 +553,8 @@ pub struct Executable {
 }
 impl Drop for Executable {
     fn drop(&mut self) {
+        // Recorded functions must be released before their PTX module.
+        self.replay.get_mut().take();
         let context = &self.runtime.0.context;
         if let Ok(_current) = context.driver.enter(context.handle) {
             unsafe {
@@ -414,6 +625,7 @@ pub fn compile_with_runtime(
         module: handle,
         functions,
         lowered,
+        replay: RefCell::new(None),
         source_path,
         gemm_count,
         cache_hit,
@@ -435,8 +647,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         })
 }
 impl Executable {
+    pub fn execution_stats(&self) -> ExecutionStats {
+        self.runtime.execution_stats()
+    }
     pub fn residency_stats(&self) -> ResidencyStats {
         self.runtime.residency_stats()
+    }
+    pub fn row_fusion_count(&self) -> usize {
+        self.lowered.row_fusion_count
+    }
+    pub fn parallel_reduction_count(&self) -> usize {
+        self.lowered.parallel_reduction_count
     }
     pub fn kernel_count(&self) -> usize {
         self.lowered
@@ -554,48 +775,66 @@ impl Executable {
             }
         }
         let device_outputs = &buffers.outputs;
+        let mut submissions = ExecutionStats::default();
         let launched = (|| {
-            for (id, k) in self.lowered.kernels.iter().enumerate() {
-                if k.elements == 0 {
-                    continue;
+            if self.runtime.0.graph_replay.get() && self.kernel_count() > 0 {
+                let mut cached = self.replay.borrow_mut();
+                // Every allocation/replacement advances this epoch, even when
+                // CUDA recycles a freed address. Other shapes share these buffers.
+                if cached
+                    .as_ref()
+                    .is_none_or(|g| g.epoch != buffers.allocations)
+                {
+                    cached.take();
+                    *cached = Some(replay::Replay::build(
+                        context,
+                        &self.lowered.kernels,
+                        &self.functions,
+                        &device_inputs,
+                        device_outputs,
+                        arena,
+                        error,
+                        buffers.allocations,
+                    )?);
+                    submissions.graph_builds += 1;
                 }
-                let mut values = k
-                    .bindings
-                    .iter()
-                    .map(|b| match b {
-                        Binding::Input(slot) => device_inputs[slot],
-                        Binding::Output(slot) => device_outputs[*slot].ptr,
-                        Binding::Arena(offset) => arena + *offset as u64,
-                    })
-                    .chain(std::iter::once(error))
-                    .collect::<Vec<_>>();
-                let mut args = values
-                    .iter_mut()
-                    .map(|x| (x as *mut u64).cast::<c_void>())
-                    .collect::<Vec<_>>();
-                let grid = c_uint::try_from(k.blocks)
-                    .map_err(|_| Error("CUDA launch exceeds grid limit".into()))?;
-                d.check(
-                    unsafe {
-                        (d.launch)(
-                            self.functions[id],
-                            grid,
-                            1,
-                            1,
-                            256,
-                            1,
-                            1,
-                            0,
-                            std::ptr::null_mut(),
-                            args.as_mut_ptr(),
-                            std::ptr::null_mut(),
-                        )
-                    },
-                    "launch kernel",
-                )?;
+                cached.as_ref().unwrap().launch()?;
+                submissions.graph_launches += 1;
+            } else {
+                for (id, k) in self.lowered.kernels.iter().enumerate() {
+                    if k.elements == 0 {
+                        continue;
+                    }
+                    let mut args =
+                        replay::Arguments::new(k, &device_inputs, device_outputs, arena, error)?;
+                    let p = args.params(self.functions[id]);
+                    d.check(
+                        unsafe {
+                            (d.launch)(
+                                p.func,
+                                p.grid_x,
+                                p.grid_y,
+                                p.grid_z,
+                                p.block_x,
+                                p.block_y,
+                                p.block_z,
+                                p.shared_bytes,
+                                std::ptr::null_mut(),
+                                p.arguments,
+                                p.extra,
+                            )
+                        },
+                        "launch kernel",
+                    )?;
+                    submissions.direct_kernel_launches += 1;
+                }
             }
             Ok(())
         })();
+        buffers.execution.graph_builds += submissions.graph_builds;
+        buffers.execution.graph_launches += submissions.graph_launches;
+        buffers.execution.direct_kernel_launches += submissions.direct_kernel_launches;
+        let device_outputs = &buffers.outputs;
         // Synchronize even on launch failure before retained storage can be reused.
         let synchronized = d.check(unsafe { (d.synchronize)() }, "synchronize");
         launched?;

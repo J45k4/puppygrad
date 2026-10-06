@@ -120,6 +120,8 @@ enum LlmCommand {
     Run(LlmRunArgs),
     /// Benchmark CPU thread counts, with warm-up and repeated measurements.
     Benchmark(puppygrad::runtime::llm_benchmark::Options),
+    /// Estimate context capacity from model metadata, compiler buffers and free VRAM.
+    Capacity(puppygrad::runtime::llm_capacity::Options),
 }
 
 #[derive(Subcommand, Debug)]
@@ -1289,6 +1291,7 @@ fn main() -> Result<()> {
         Command::Llm { command, run } => match command {
             Some(LlmCommand::Run(args)) => args.run(),
             Some(LlmCommand::Benchmark(args)) => puppygrad::runtime::llm_benchmark::run(args),
+            Some(LlmCommand::Capacity(args)) => puppygrad::runtime::llm_capacity::run(args),
             None => run.run(),
         },
         Command::Emit {

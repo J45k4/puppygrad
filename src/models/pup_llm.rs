@@ -4,6 +4,7 @@ mod checkpoint;
 pub use checkpoint::Checkpoint;
 
 use super::generation::{LogitsSampler, TextGenerationConfig};
+use crate::runtime::llm_capacity;
 use crate::{
     compiler::{cpu, cuda, pop::Scalar, source},
     runtime::llm_ffi::{
@@ -29,6 +30,18 @@ struct Config {
     threads: Option<usize>,
     #[serde(default)]
     cpu_target: cpu::CpuTarget,
+    /// CUDA providers plan their context from live device memory by default.
+    #[serde(default)]
+    auto_context: Option<bool>,
+    #[serde(default)]
+    prefill_chunk: Option<usize>,
+    #[serde(default)]
+    context_budget_mib: Option<usize>,
+    #[serde(default = "default_context_reserve")]
+    context_reserve_mib: usize,
+}
+fn default_context_reserve() -> usize {
+    llm_capacity::DEFAULT_RESERVE_MIB
 }
 struct State {
     source: String,
@@ -40,6 +53,9 @@ struct State {
     cuda_runtime: Option<cuda::Runtime>,
     cpu_runtime: cpu::Runtime,
     retained: Option<bool>,
+    prefill_chunk: Option<usize>,
+    auto_context: bool,
+    request_plans: HashMap<(usize, usize, usize), cuda::MemoryPlan>,
     executables: HashMap<(usize, usize), Executable>,
     output: Vec<u32>,
     reference: Option<super::gpt2::Gpt2Runtime>,
@@ -107,7 +123,7 @@ unsafe extern "C" fn build_model(
         }
         config.cpu_target.validate().map_err(|e| e.to_string())?;
         let source = std::fs::read_to_string(&config.source).map_err(|e| e.to_string())?;
-        let checkpoint = Checkpoint::load(&config.model_dir).map_err(|e| e.to_string())?;
+        let mut checkpoint = Checkpoint::load(&config.model_dir).map_err(|e| e.to_string())?;
         let integer = |key: &str| match checkpoint.context.constants.get(key) {
             Some(Scalar::Int(n)) if *n > 0 => Ok(*n as u64),
             _ => Err(format!("missing positive {key} in checkpoint config")),
@@ -122,11 +138,63 @@ unsafe extern "C" fn build_model(
         if eos_token != NO_EOS && eos_token >= vocab_size {
             return Err("EOS token is outside vocabulary".into());
         }
-        let metadata = Info {
+        let mut metadata = Info {
             vocab_size,
             eos_token,
             context_length,
         };
+        let auto_context = config.auto_context.unwrap_or(device.is_some());
+        if auto_context && device.is_none() {
+            return Err("automatic context planning currently requires CUDA".into());
+        }
+        if config.prefill_chunk == Some(0) {
+            return Err("prefill chunk must be positive".into());
+        }
+        let cuda_runtime = device
+            .map(cuda::Runtime::new)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let mut retained = None;
+        let mut prefill_chunk = config.prefill_chunk;
+        if auto_context || prefill_chunk.is_some() {
+            checkpoint.bind_tokens(&[0]).map_err(|e| e.to_string())?;
+            let has_state =
+                llm_capacity::retained(&source, &checkpoint.context).map_err(|e| e.to_string())?;
+            if prefill_chunk.is_some() && !has_state {
+                return Err("chunked prefill requires a program with retained state".into());
+            }
+            retained = Some(has_state);
+            if auto_context {
+                let live_free = cuda_runtime
+                    .as_ref()
+                    .unwrap()
+                    .memory_info()
+                    .map_err(|e| e.to_string())?
+                    .free_bytes;
+                let available = config
+                    .context_budget_mib
+                    .map(|n| n.checked_mul(1024 * 1024).ok_or("context budget overflow"))
+                    .transpose()?
+                    .unwrap_or(live_free)
+                    .min(live_free);
+                let reserve = config
+                    .context_reserve_mib
+                    .checked_mul(1024 * 1024)
+                    .ok_or("context reserve overflow")?;
+                let report = llm_capacity::determine(
+                    &source,
+                    &checkpoint.context,
+                    available,
+                    reserve,
+                    prefill_chunk,
+                    false,
+                )
+                .map_err(|e| e.to_string())?;
+                metadata.context_length = report.max_context_tokens as u64;
+                prefill_chunk = report.prefill_chunk_tokens;
+                eprintln!("automatic context: {} tokens (model positions {}), prefill {}; planned buffers {:.2} GiB, reserve {} MiB", report.max_context_tokens, report.model_position_limit, prefill_chunk.map_or_else(|| "whole prompt".into(), |n| format!("{n}-token chunks")), report.planned_device_bytes as f64 / 2f64.powi(30), config.context_reserve_mib);
+            }
+        }
         let reference = if config.verify_reference {
             if checkpoint
                 .model_type
@@ -148,12 +216,12 @@ unsafe extern "C" fn build_model(
                 cpu_target: config.cpu_target,
             },
             info: metadata,
-            cuda_runtime: device
-                .map(cuda::Runtime::new)
-                .transpose()
-                .map_err(|e| e.to_string())?,
+            cuda_runtime,
             cpu_runtime: cpu::Runtime::default(),
-            retained: None,
+            retained,
+            prefill_chunk,
+            auto_context,
+            request_plans: HashMap::new(),
             executables: HashMap::new(),
             output: vec![],
             reference,
@@ -170,6 +238,73 @@ unsafe extern "C" fn build_model(
     }
 }
 impl State {
+    fn execute(
+        &mut self,
+        chunk: &[usize],
+        capacity: usize,
+        first_program: Option<source::Program>,
+        announce: bool,
+    ) -> ffi::Result<(Vec<cpu::Tensor>, std::time::Duration)> {
+        self.checkpoint
+            .bind_tokens(chunk)
+            .map_err(|e| e.to_string())?;
+        let key = (chunk.len(), capacity);
+        if !self.executables.contains_key(&key) {
+            let program = if let Some(program) = first_program {
+                program
+            } else {
+                source::parse_with_context(&self.source, &self.checkpoint.context)
+                    .map_err(|e| format!("{}:{e}", self.source_path.display()))?
+            };
+            let exe = if let Some(runtime) = &self.cuda_runtime {
+                let e = cuda::compile_with_runtime(
+                    &program.graph,
+                    program.root,
+                    Path::new(".cache/pup/cuda"),
+                    runtime,
+                )
+                .map_err(|e| e.to_string())?;
+                if announce {
+                    eprintln!(
+                        "compiled CUDA: {} contractions, {}; source: {}",
+                        e.gemm_count,
+                        e.device_name,
+                        e.source_path.display()
+                    );
+                }
+                Executable::Cuda(e)
+            } else {
+                let mut e = cpu::compile_with_options(
+                    &program.graph,
+                    program.root,
+                    Path::new(".cache/pup/cpu"),
+                    &self.build_options,
+                )
+                .map_err(|e| e.to_string())?;
+                if announce {
+                    eprintln!(
+                        "compiled {} Pops, {} GEMM contractions, CPU target {}; C source: {}",
+                        program
+                            .graph
+                            .toposort(program.root)
+                            .map_err(|e| e.to_string())?
+                            .len(),
+                        e.gemm_count,
+                        e.build_info.cpu_target,
+                        e.source_path.display()
+                    );
+                }
+                e.share_runtime(&self.cpu_runtime);
+                Executable::Cpu(e)
+            };
+            self.executables.insert(key, exe);
+        }
+        let started = Instant::now();
+        let outputs = self.executables[&key]
+            .run(&self.checkpoint.inputs, self.threads)
+            .map_err(|e| e.to_string())?;
+        Ok((outputs, started.elapsed()))
+    }
     fn generate(
         &mut self,
         input: &[u32],
@@ -193,10 +328,6 @@ impl State {
                 self.info.context_length
             ));
         }
-        if let Some(runtime) = &self.cuda_runtime {
-            runtime.reset_state().map_err(|e| e.to_string())?;
-        }
-        self.cpu_runtime.reset_state().map_err(|e| e.to_string())?;
         let capacity = (required as usize)
             .max(512)
             .checked_next_power_of_two()
@@ -223,6 +354,40 @@ impl State {
             self.retained = Some(!program.states.is_empty());
         }
         let retained = self.retained.unwrap();
+        if let Some(runtime) = self.cuda_runtime.as_ref().filter(|_| self.auto_context) {
+            let planned_tokens = if retained {
+                input.len()
+            } else {
+                required as usize
+            };
+            let main = self
+                .prefill_chunk
+                .unwrap_or(planned_tokens)
+                .min(planned_tokens);
+            let key = (capacity, main, planned_tokens % main);
+            if !self.request_plans.contains_key(&key) {
+                let plan = llm_capacity::request_plan(
+                    &self.source,
+                    &self.checkpoint.context,
+                    capacity,
+                    planned_tokens,
+                    self.prefill_chunk,
+                    retained,
+                )
+                .map_err(|e| e.to_string())?;
+                self.request_plans.insert(key, plan);
+            }
+            // Capacity selection reserved module/graph headroom. Those loaded
+            // resources now already reduce live free memory, so do not charge
+            // that initial overhead twice. This check includes resize peaks.
+            runtime
+                .check_memory(&self.request_plans[&key], 0)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(runtime) = &self.cuda_runtime {
+            runtime.reset_state().map_err(|e| e.to_string())?;
+        }
+        self.cpu_runtime.reset_state().map_err(|e| e.to_string())?;
         let mut history: Vec<usize> = input.iter().map(|&id| id as usize).collect();
         let mut sampling = TextGenerationConfig::new(generation.max_new_tokens as usize);
         sampling.temperature = generation.temperature;
@@ -234,64 +399,19 @@ impl State {
             } else {
                 &history[..]
             };
-            self.checkpoint
-                .bind_tokens(chunk)
-                .map_err(|e| e.to_string())?;
-            let key = (chunk.len(), capacity);
-            if !self.executables.contains_key(&key) {
-                let program = if let Some(program) = first_program.take() {
-                    program
-                } else {
-                    source::parse_with_context(&self.source, &self.checkpoint.context)
-                        .map_err(|e| format!("{}:{e}", self.source_path.display()))?
-                };
-                let exe = if let Some(runtime) = &self.cuda_runtime {
-                    let e = cuda::compile_with_runtime(
-                        &program.graph,
-                        program.root,
-                        Path::new(".cache/pup/cuda"),
-                        runtime,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if step == 0 {
-                        eprintln!(
-                            "compiled CUDA: {} contractions, {}; source: {}",
-                            e.gemm_count,
-                            e.device_name,
-                            e.source_path.display()
-                        );
-                    }
-                    Executable::Cuda(e)
-                } else {
-                    let mut e = cpu::compile_with_options(
-                        &program.graph,
-                        program.root,
-                        Path::new(".cache/pup/cpu"),
-                        &self.build_options,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    if step == 0 {
-                        eprintln!(
-                            "compiled {} Pops, {} GEMM contractions, CPU target {}; C source: {}",
-                            program
-                                .graph
-                                .toposort(program.root)
-                                .map_err(|e| e.to_string())?
-                                .len(),
-                            e.gemm_count,
-                            e.build_info.cpu_target,
-                            e.source_path.display()
-                        );
-                    }
-                    e.share_runtime(&self.cpu_runtime);
-                    Executable::Cpu(e)
-                };
-                self.executables.insert(key, exe);
+            let mut execution_time = std::time::Duration::ZERO;
+            let mut outputs = vec![];
+            let chunk_size = if step == 0 && retained {
+                self.prefill_chunk.unwrap_or(chunk.len())
+            } else {
+                chunk.len()
+            };
+            for part in chunk.chunks(chunk_size) {
+                let (result, elapsed) =
+                    self.execute(part, capacity, first_program.take(), step == 0)?;
+                outputs = result;
+                execution_time += elapsed;
             }
-            let started = Instant::now();
-            let outputs = self.executables[&key]
-                .run(&self.checkpoint.inputs, self.threads)
-                .map_err(|e| e.to_string())?;
             if outputs.len() != 1 {
                 return Err("LLM .pup provider expects one logits output".into());
             }
@@ -337,7 +457,7 @@ impl State {
                 "step {}: {} tokens, {:.3}s execution, next token {next}",
                 step + 1,
                 history.len(),
-                started.elapsed().as_secs_f64()
+                execution_time.as_secs_f64()
             );
             history.push(next as usize);
             self.output.push(next);

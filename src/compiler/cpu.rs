@@ -555,7 +555,9 @@ impl Emitter<'_> {
         let src = node.src();
         let shape = self.shape(v);
         if let Some(expr) = self.overrides.get(&v) {
-            return Ok(expr.clone());
+            // CUDA's literal-range expressions need the consumer's view index;
+            // scalar accumulator overrides do not contain this placeholder.
+            return Ok(expr.replace("$index", i));
         }
         if self.material.contains(&v) || node.op() == Op::Param {
             return Ok(format!("{}[{i}]", self.names[&v]));
@@ -590,6 +592,15 @@ impl Emitter<'_> {
                 }
             }
             Op::Reshape | Op::Load | Op::After => self.read(src[0], i),
+            Op::Stack if self.inline_values.contains(&v) => {
+                let part = numel(&self.shape(src[0]))?.max(1);
+                let mut expression = self.read(*src.last().unwrap(), &format!("(({i})%{part})"))?;
+                for (j, &s) in src[..src.len() - 1].iter().enumerate().rev() {
+                    let x = self.read(s, &format!("(({i})%{part})"))?;
+                    expression = format!("(({i})<{}?({x}):({expression}))", (j + 1) * part);
+                }
+                Ok(expression)
+            }
             Op::Window => {
                 let coords = (0..shape.len())
                     .map(|axis| coord(i, &shape, axis))

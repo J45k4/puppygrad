@@ -78,6 +78,7 @@ fn bounds_checked_writes_and_reset_after_error() {
 fn cuda_state_is_retained_and_reset_without_host_uploads() {
     let p = source::parse(COUNTER).unwrap();
     let runtime = cuda::Runtime::new(0).unwrap();
+    runtime.set_graph_replay(true);
     let exe = cuda::compile_with_runtime(
         &p.graph,
         p.root,
@@ -95,6 +96,17 @@ fn cuda_state_is_retained_and_reset_without_host_uploads() {
     assert_eq!(ints(&exe.run(&[]).unwrap()[0]), &[1]);
     let after = runtime.residency_stats();
     assert_eq!(before.allocations, after.allocations);
+    assert_eq!(runtime.execution_stats().graph_builds, 1);
+    assert_eq!(runtime.execution_stats().graph_launches, 5);
+    runtime.set_graph_replay(false);
+    assert_eq!(ints(&exe.run(&[]).unwrap()[0]), &[2]);
+    assert_eq!(
+        runtime.execution_stats().direct_kernel_launches,
+        exe.kernel_count() as u64
+    );
+    runtime.set_graph_replay(true);
+    assert_eq!(ints(&exe.run(&[]).unwrap()[0]), &[3]);
+    assert_eq!(runtime.execution_stats().graph_builds, 1);
     let p = source::parse(ROWS).unwrap();
     // Independent runtime isolates different state declarations.
     let exe = cuda::compile(
