@@ -8,9 +8,12 @@ pub mod generation;
 pub mod gpt2;
 pub mod onnx;
 pub mod piper;
+pub mod pup_llm;
 pub mod resnet;
 pub mod safetensors;
 pub mod stable_diffusion;
 pub mod streaming;
 pub mod vits;
 pub mod whisper;
+
+pub mod pup_image;

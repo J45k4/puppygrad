@@ -1,0 +1,51 @@
+# Stable Diffusion 1.x building blocks. The image provider specializes the stage
+# call graph from checkpoint metadata; all tensor computation is compiled C.
+def sd_resnet(x, time, n1w, n1b, c1w, c1b, tpw, tpb, n2w, n2b, c2w, c2b, groups, epsilon):
+    h = conv2d(silu(group_norm(x, n1w, n1b, groups, epsilon)), c1w, c1b, 1, 1)
+    projected_time = linear(silu(time), tpw, tpb)
+    timed = h + reshape(projected_time, [1, dim(h, 1), 1, 1])
+    return conv2d(silu(group_norm(timed, n2w, n2b, groups, epsilon)), c2w, c2b, 1, 1)
+
+def sd_transformer(x, context, n1w, n1b, q1w, k1w, v1w, o1w, o1b, n2w, n2b, q2w, k2w, v2w, o2w, o2b, n3w, n3b, f1w, f1b, f2w, f2b, heads):
+    n1 = layer_norm(x, n1w, n1b, 0.00001)
+    a1 = attention(matmul(n1, permute(q1w, [1, 0])), matmul(n1, permute(k1w, [1, 0])), matmul(n1, permute(v1w, [1, 0])), heads)
+    h1 = x + linear(a1, o1w, o1b)
+    n2 = layer_norm(h1, n2w, n2b, 0.00001)
+    a2 = attention(matmul(n2, permute(q2w, [1, 0])), matmul(context, permute(k2w, [1, 0])), matmul(context, permute(v2w, [1, 0])), heads)
+    h2 = h1 + linear(a2, o2w, o2b)
+    projected = linear(layer_norm(h2, n3w, n3b, 0.00001), f1w, f1b)
+    inner = dim(projected, 1) // 2
+    values = shrink(projected, [0, 0], [dim(projected, 0), inner])
+    gates = shrink(projected, [0, inner], [dim(projected, 0), inner])
+    return h2 + linear(values * gelu_erf(gates), f2w, f2b)
+
+def sd_vae_resnet(x, n1w, n1b, c1w, c1b, n2w, n2b, c2w, c2b, groups):
+    h = conv2d(silu(group_norm(x, n1w, n1b, groups, 0.000001)), c1w, c1b, 1, 1)
+    return conv2d(silu(group_norm(h, n2w, n2b, groups, 0.000001)), c2w, c2b, 1, 1)
+
+def sd_clip_attention(x, qw, qb, kw, kb, vw, vb, ow, ob, heads):
+    q = linear(x, qw, qb)
+    k = linear(x, kw, kb)
+    v = linear(x, vw, vb)
+    tokens = dim(x, 0)
+    width = dim(x, 1)
+    hw = width // heads
+    qh = permute(reshape(q, [tokens, heads, hw]), [1, 0, 2])
+    kh = permute(reshape(k, [tokens, heads, hw]), [1, 2, 0])
+    vh = permute(reshape(v, [tokens, heads, hw]), [1, 0, 2])
+    scores = batched_matmul(qh, kh) / sqrt(cast(hw, f32))
+    positions = arange(tokens)
+    future = reshape(positions, [tokens, 1]) < reshape(positions, [1, tokens])
+    probs = reshape(softmax(reshape(where(future, -1e30, scores), [heads * tokens, tokens])), [heads, tokens, tokens])
+    out = reshape(permute(batched_matmul(probs, vh), [1, 0, 2]), [tokens, width])
+    return linear(out, ow, ob)
+
+def sd_ddim(sample, uncond, cond, scale, alpha, previous_alpha):
+    noise = uncond + scale * (cond - uncond)
+    original = (sample - sqrt(1.0 - alpha) * noise) / sqrt(alpha)
+    return sqrt(previous_alpha) * original + sqrt(1.0 - previous_alpha) * noise
+
+def sd_pixels(decoded):
+    rgb = decoded * 0.5 + 0.5
+    clamped = -max(-max(rgb, 0.0), -1.0)
+    return cast(permute(clamped * 255.0 + 0.5, [0, 2, 3, 1]), u8)

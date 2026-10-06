@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "batch_size": 128,
+  "datasets": {
+    "images": {
+      "train": {
+        "path": "../.cache/mnist/data/train-images-idx3-ubyte.gz",
+        "url": "https://storage.googleapis.com/cvdf-datasets/mnist/train-images-idx3-ubyte.gz",
+        "md5": "f68b3c2dcbeaaa9fbdd348bbdeb94873"
+      },
+      "test": {
+        "path": "../.cache/mnist/data/t10k-images-idx3-ubyte.gz",
+        "url": "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-images-idx3-ubyte.gz",
+        "md5": "9fb629c4189551a2d022fa330f9573f3"
+      }
+    },
+    "labels": {
+      "train": {
+        "path": "../.cache/mnist/data/train-labels-idx1-ubyte.gz",
+        "url": "https://storage.googleapis.com/cvdf-datasets/mnist/train-labels-idx1-ubyte.gz",
+        "md5": "d53e105ee54ea40749a09fcbcd1e9432"
+      },
+      "test": {
+        "path": "../.cache/mnist/data/t10k-labels-idx1-ubyte.gz",
+        "url": "https://storage.googleapis.com/cvdf-datasets/mnist/t10k-labels-idx1-ubyte.gz",
+        "md5": "ec29112dd5afa0611ce80d1b7f02629c"
+      }
+    }
+  },
+  "state": [
+    {
+      "input": "w1",
+      "output": "next_w1",
+      "shape": [
+        784,
+        64
+      ],
+      "init": {
+        "kind": "normal",
+        "stddev": 0.050507627227610534
+      }
+    },
+    {
+      "input": "b1",
+      "output": "next_b1",
+      "shape": [
+        64
+      ],
+      "init": {
+        "kind": "zeros"
+      }
+    },
+    {
+      "input": "w2",
+      "output": "next_w2",
+      "shape": [
+        64,
+        10
+      ],
+      "init": {
+        "kind": "normal",
+        "stddev": 0.1767766952966369
+      }
+    },
+    {
+      "input": "b2",
+      "output": "next_b2",
+      "shape": [
+        10
+      ],
+      "init": {
+        "kind": "zeros"
+      }
+    }
+  ],
+  "learning_rate": "learning_rate",
+  "valid": "valid",
+  "loss": "loss",
+  "classification": {
+    "prediction": "logits",
+    "labels": "labels"
+  }
+}

@@ -6,6 +6,57 @@
 cargo build --release
 ```
 
+## Compiler language
+
+`.pup` programs describe Pop graphs, targeting tinygrad's UOp specification. The
+frontend compiles Python-style source to a DAG; the C CPU backend runs GPT-2 and Stable Diffusion 1.5.
+The [CUDA backend](docs/cuda-backend.md) runs GPT-2 and
+[Qwen3-0.6B](docs/qwen3.md) from `.pup` source.
+See [the language and compiler contract](docs/compiler-ir.md) and
+[the LLM runtime and FFI API](docs/llm-runtime.md), and
+[the image runtime and FFI API](docs/image-runtime.md).
+
+```bash
+cargo run -- emit examples/matmul.pup
+cargo run -- emit examples/matmul.pup --backend cuda -o matmul.cu
+cargo run -- emit examples/llm.pup --sequence-length 5 -o llm.c
+cargo run -- check examples/matmul.pup --dump-pops
+cargo run -- check examples/linear.pup --dump-pops
+cargo run --release -- llm examples/llm.pup --device cpu --max-new-tokens 8 --stream
+cargo run --release -- llm benchmark examples/llm.pup --runs 3 --warmups 1
+cargo run --release -- llm examples/qwen3_cached.pup --model-dir models/qwen3-0.6b \
+  --device cuda:0 --prompt "What is a compiler?" --temperature 0 --stream
+cargo run --release -- image examples/image.pup --download --cpu-target native \
+  --prompt "a puppy in a sunny garden" --width 256 --height 256 --output puppy.png
+```
+
+`emit` pretty prints C using `clang-format` (required on PATH). Use `--raw` for
+compact output without a formatter.
+
+## Training and tensor data
+
+```bash
+target/release/puppygrad train examples/mnist.pup --epochs 5 --threads 1
+target/release/puppygrad train examples/mnist_autodiff.pup --epochs 5 --threads 1 --cpu-target native
+```
+
+A generic Rust harness loads IDX, CSV or safetensors into named tensors and runs
+training steps compiled from `.pup` to C. Gzip is decoded automatically. MNIST's
+normalization, one-hot encoding, gradients and SGD update are in `mnist.pup`.
+The host-side `.train.json` contract maps data files and state buffers. Runs save
+checkpoints, loss/accuracy, throughput and per-kernel/packing/memory metrics.
+See [tensor loaders, training contracts and profiling](docs/training.md).
+
+For compiler-generated gradients, run the equivalent
+`examples/mnist_autodiff.pup`. Its `grad(loss, weights)` calls build a backward
+Pop graph at compile time; forward, backward and SGD all execute as generated C.
+See [autodiff support and limitations](docs/autodiff.md).
+
+Generated C supports `--cpu-target generic|native|avx2` on training and LLM run /
+benchmark commands. `generic` is the default; `native` enables host CPU features.
+Compiler settings and CPU targets have separate cache entries. See
+[CPU targets and measured speedups](docs/cpu-targets.md).
+
 ## Models
 
 Implemented:

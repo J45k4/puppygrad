@@ -1,0 +1,21 @@
+# GPT-2: model math expands entirely into the Pop DAG.
+# The host binds checkpoint tensors, config values, and token IDs.
+
+def transformer(x, norm1w, norm1b, qkvw, qkvb, attnw, attnb, norm2w, norm2b, fcw, fcb, projw, projb, heads, epsilon):
+    normalized = layer_norm(x, norm1w, norm1b, epsilon)
+    qkv = dense(normalized, qkvw, qkvb)
+    attended = causal_attention(qkv, heads)
+    residual = x + dense(attended, attnw, attnb)
+    hidden = layer_norm(residual, norm2w, norm2b, epsilon)
+    expanded = gelu(dense(hidden, fcw, fcb))
+    return residual + dense(expanded, projw, projb)
+
+tokens = input("tokens")
+positions = arange(dim(tokens, 0))
+x = load(index(weight("wte.weight"), tokens)) + load(index(weight("wpe.weight"), positions))
+for layer in range(config("n_layer")):
+    x = transformer(x, weight(f"h.{layer}.ln_1.weight"), weight(f"h.{layer}.ln_1.bias"), weight(f"h.{layer}.attn.c_attn.weight"), weight(f"h.{layer}.attn.c_attn.bias"), weight(f"h.{layer}.attn.c_proj.weight"), weight(f"h.{layer}.attn.c_proj.bias"), weight(f"h.{layer}.ln_2.weight"), weight(f"h.{layer}.ln_2.bias"), weight(f"h.{layer}.mlp.c_fc.weight"), weight(f"h.{layer}.mlp.c_fc.bias"), weight(f"h.{layer}.mlp.c_proj.weight"), weight(f"h.{layer}.mlp.c_proj.bias"), config("n_head"), config("layer_norm_epsilon"))
+normalized = layer_norm(x, weight("ln_f.weight"), weight("ln_f.bias"), config("layer_norm_epsilon"))
+last = shrink(normalized, [dim(tokens, 0) - 1, 0], [1, config("n_embd")])
+logits = matmul(last, permute(weight("wte.weight"), [1, 0]))
+output logits

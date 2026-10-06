@@ -36,6 +36,7 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Rust
 target/
 /models/
+/third_party/
 
 # local Python tooling
 .python-packages/

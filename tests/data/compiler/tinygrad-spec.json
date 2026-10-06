@@ -1,0 +1,2976 @@
+{
+  "revision": "1a58c3ae9d5ff5605d81085cf1a364c113e95cf6",
+  "cases": [
+    {
+      "name": "reshape",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "leading_expand",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 4
+            }
+          }
+        },
+        {
+          "op": "EXPAND",
+          "src": [
+            4,
+            5
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            4,
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "leading_reduce_add",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "ADD",
+              "num_axes": 1
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "leading_reduce_mul",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "MUL",
+              "num_axes": 1
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "leading_reduce_max",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "MAX",
+              "num_axes": 1
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "permute",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PERMUTE",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Axes": [
+              1,
+              0
+            ]
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            3,
+            2
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "flip",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "FLIP",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Flip": [
+              true,
+              false
+            ]
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "bad_permute",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PERMUTE",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Axes": [
+              1,
+              1
+            ]
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": 5
+    },
+    {
+      "name": "bad_flip_rank",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "FLIP",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Flip": [
+              true
+            ]
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": 5
+    },
+    {
+      "name": "bad_reduce_rank",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            4
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "ADD",
+              "num_axes": 3
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": 5
+    },
+    {
+      "name": "bad_reshape",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 5
+            }
+          }
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        }
+      ],
+      "failed_at": 2
+    },
+    {
+      "name": "negative_shape",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": -6
+            }
+          }
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        }
+      ],
+      "failed_at": 2
+    },
+    {
+      "name": "weak_int",
+      "nodes": [
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "weakint",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": true
+    },
+    {
+      "name": "weak_float",
+      "nodes": [
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Float": 4612811918334230528
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "weakfloat",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": true
+    },
+    {
+      "name": "bool",
+      "nodes": [
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Bool": true
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "bool",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": true
+    },
+    {
+      "name": "empty_stack",
+      "nodes": [
+        {
+          "op": "STACK",
+          "src": [],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "void",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": true
+    },
+    {
+      "name": "scalar_reshape",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 1
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            1
+          ]
+        },
+        {
+          "dtype": "void",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "typed_constant",
+      "nodes": [
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Float": 4612811918334230528
+            }
+          }
+        },
+        {
+          "op": "CAST",
+          "src": [
+            0
+          ],
+          "arg": {
+            "DType": "f32"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "weakfloat",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": true
+    },
+    {
+      "name": "weak_add",
+      "nodes": [
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "ADD",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "program_add",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Float": 4612811918334230528
+            }
+          }
+        },
+        {
+          "op": "CAST",
+          "src": [
+            1
+          ],
+          "arg": {
+            "DType": "f32"
+          }
+        },
+        {
+          "op": "ADD",
+          "src": [
+            0,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "SINK",
+          "src": [
+            3
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "weakfloat",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "void",
+          "shape": null
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "kernel_parameters",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "f32",
+              "size": 12
+            }
+          }
+        },
+        {
+          "op": "SINK",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            12
+          ]
+        },
+        {
+          "dtype": "void",
+          "shape": null
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": true
+    },
+    {
+      "name": "bad_dtype",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "i32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "ADD",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "i32",
+          "shape": []
+        }
+      ],
+      "failed_at": 2
+    },
+    {
+      "name": "where",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "CMPLT",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "WHERE",
+          "src": [
+            2,
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "bool",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "bad_where",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "WHERE",
+          "src": [
+            0,
+            0,
+            0
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": 1
+    },
+    {
+      "name": "scalar_broadcast",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Float": 4611686018427387904
+            }
+          }
+        },
+        {
+          "op": "MUL",
+          "src": [
+            4,
+            5
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "weakfloat",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "incompatible_broadcast",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 2
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "f32",
+              "size": 3
+            }
+          }
+        },
+        {
+          "op": "MUL",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            3
+          ]
+        }
+      ],
+      "failed_at": 2
+    },
+    {
+      "name": "sub",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "SUB",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "fdiv",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "FDIV",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "index_rows",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "i32",
+              "size": 2
+            }
+          }
+        },
+        {
+          "op": "INDEX",
+          "src": [
+            4,
+            5
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "i32",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "load_rows",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "i32",
+              "size": 2
+            }
+          }
+        },
+        {
+          "op": "INDEX",
+          "src": [
+            4,
+            5
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "LOAD",
+          "src": [
+            6
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "i32",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "index_scalar",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "i32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "INDEX",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "LOAD",
+          "src": [
+            2
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "i32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "bad_index_dtype",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 1,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "INDEX",
+          "src": [
+            0,
+            1
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": 2
+    },
+    {
+      "name": "pad",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 1
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            5,
+            1
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 4
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 6
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            7,
+            8
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PAD",
+          "src": [
+            4,
+            6,
+            9
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            4,
+            6
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "shrink",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 1
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            5,
+            1
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 4
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 6
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            7,
+            8
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PAD",
+          "src": [
+            4,
+            6,
+            9
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "SHRINK",
+          "src": [
+            10,
+            6,
+            3
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            4,
+            6
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "bad_pad",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "PAD",
+          "src": [
+            4,
+            3,
+            3
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": 5
+    },
+    {
+      "name": "bad_shrink",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 6
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 2
+            }
+          }
+        },
+        {
+          "op": "CONST",
+          "src": [],
+          "arg": {
+            "Scalar": {
+              "Int": 3
+            }
+          }
+        },
+        {
+          "op": "STACK",
+          "src": [
+            1,
+            2
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "RESHAPE",
+          "src": [
+            0,
+            3
+          ],
+          "arg": "None"
+        },
+        {
+          "op": "SHRINK",
+          "src": [
+            4,
+            3,
+            3
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            6
+          ]
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": []
+        },
+        {
+          "dtype": "weakint",
+          "shape": [
+            2
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": [
+            2,
+            3
+          ]
+        }
+      ],
+      "failed_at": 5
+    },
+    {
+      "name": "empty_reduce_add",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 0
+            }
+          }
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            0
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "ADD",
+              "num_axes": 1
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            0
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "empty_reduce_mul",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 0
+            }
+          }
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            0
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "MUL",
+              "num_axes": 1
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            0
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "empty_reduce_max",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": 0
+            }
+          }
+        },
+        {
+          "op": "REDUCE",
+          "src": [
+            0
+          ],
+          "arg": {
+            "Reduce": {
+              "op": "MAX",
+              "num_axes": 1
+            }
+          }
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": [
+            0
+          ]
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": false,
+      "kernel_graph": false
+    },
+    {
+      "name": "neg",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "NEG",
+          "src": [
+            0
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "exp2",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "EXP2",
+          "src": [
+            0
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "log2",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "LOG2",
+          "src": [
+            0
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    },
+    {
+      "name": "sqrt",
+      "nodes": [
+        {
+          "op": "PARAM",
+          "src": [],
+          "arg": {
+            "Param": {
+              "slot": 0,
+              "dtype": "f32",
+              "size": null
+            }
+          }
+        },
+        {
+          "op": "SQRT",
+          "src": [
+            0
+          ],
+          "arg": "None"
+        }
+      ],
+      "expected": [
+        {
+          "dtype": "f32",
+          "shape": []
+        },
+        {
+          "dtype": "f32",
+          "shape": []
+        }
+      ],
+      "failed_at": null,
+      "program": true,
+      "kernel_graph": false
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+# Every binding is a Pop. PARAMs describe flat external storage.
+a = param(0, f32, 6)
+b = param(1, f32, 12)
+
+# Shapes can themselves be named Pops; [...] is CONST/STACK shorthand.
+m = const(2)
+k = const(3)
+a_shape = stack(m, k)
+a_matrix = reshape(a, a_shape)
+b_matrix = reshape(b, [3, 4])
+
+# [2,3] @ [3,4], expressed without a MATMUL operation.
+left = reshape(a_matrix, [2, 1, 3])
+transposed = permute(b_matrix, [1, 0])
+right = reshape(transposed, [1, 4, 3])
+products = mul(left, right)
+
+# REDUCE consumes leading axes, so move K to the front.
+contraction = permute(products, [2, 0, 1])
+result = reduce(contraction, add, 1)
+output result

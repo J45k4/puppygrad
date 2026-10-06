@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod compiler;
 pub mod engine;
 pub mod gpu;
 pub mod models;

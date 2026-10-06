@@ -1,0 +1,243 @@
+# Bundled source library. Calls expand to the existing primitive Pop vocabulary.
+# Weights for linear are [outputs, inputs], matching common checkpoint layouts.
+def matmul(a, b):
+    a2 = permute(a, [0, 1])
+    b2 = permute(b, [0, 1])
+    m = dim(a2, 0)
+    k = dim(a2, 1)
+    other_k = dim(b2, 0)
+    n = dim(b2, 1)
+    assert_eq(k, other_k)
+    left = reshape(a2, [m, 1, k])
+    transposed = permute(b2, [1, 0])
+    right = reshape(transposed, [1, n, k])
+    products = mul(left, right)
+    contraction = permute(products, [2, 0, 1])
+    result = reduce(contraction, add, 1)
+    return result
+
+def linear(x, weight, bias):
+    weight2 = permute(weight, [0, 1])
+    bias1 = permute(bias, [0])
+    outputs = dim(weight2, 0)
+    bias_size = dim(bias1, 0)
+    assert_eq(outputs, bias_size)
+    transposed = permute(weight2, [1, 0])
+    projected = matmul(x, transposed)
+    result = add(projected, bias1)
+    return result
+
+# [batch, rows, inner] @ [batch, inner, columns].
+def batched_matmul(a, b):
+    batch = dim(a, 0)
+    m = dim(a, 1)
+    k = dim(a, 2)
+    n = dim(b, 2)
+    assert_eq(batch, dim(b, 0))
+    assert_eq(k, dim(b, 1))
+    left = reshape(a, [batch, m, 1, k])
+    right = reshape(permute(b, [0, 2, 1]), [batch, 1, n, k])
+    return reduce(permute(left * right, [3, 0, 1, 2]), add, 1)
+
+# Conv1D checkpoint weights are [input, output].
+def dense(x, weight, bias):
+    return matmul(x, weight) + bias
+
+def layer_norm(x, weight, bias, epsilon):
+    rows = dim(x, 0)
+    width = dim(x, 1)
+    mean = reshape(reduce(permute(x, [1, 0]), add, 1) / width, [rows, 1])
+    centered = x - mean
+    variance = reshape(reduce(permute(centered * centered, [1, 0]), add, 1) / width, [rows, 1])
+    return centered / sqrt(variance + epsilon) * weight + bias
+
+def exp(x):
+    return exp2(x * 1.4426950408889634)
+
+def gelu(x):
+    inner = 0.7978845608028654 * (x + 0.044715 * x * x * x)
+    tanh_value = 2.0 / (1.0 + exp(-2.0 * inner)) - 1.0
+    return 0.5 * x * (1.0 + tanh_value)
+
+def softmax(x):
+    rows = dim(x, 0)
+    largest = reshape(reduce(permute(x, [1, 0]), max, 1), [rows, 1])
+    exps = exp(x - largest)
+    total = reshape(reduce(permute(exps, [1, 0]), add, 1), [rows, 1])
+    return exps / total
+
+def causal_attention(qkv, heads):
+    tokens = dim(qkv, 0)
+    width = dim(qkv, 1) // 3
+    head_width = width // heads
+    assert_eq(head_width * heads, width)
+    q = permute(reshape(shrink(qkv, [0, 0], [tokens, width]), [tokens, heads, head_width]), [1, 0, 2])
+    k = permute(reshape(shrink(qkv, [0, width], [tokens, width]), [tokens, heads, head_width]), [1, 2, 0])
+    v = permute(reshape(shrink(qkv, [0, width * 2], [tokens, width]), [tokens, heads, head_width]), [1, 0, 2])
+    scores = batched_matmul(q, k) / sqrt(cast(head_width, f32))
+    positions = arange(tokens)
+    future = reshape(positions, [tokens, 1]) < reshape(positions, [1, tokens])
+    masked = where(future, -1e30, scores)
+    probabilities = reshape(softmax(reshape(masked, [heads * tokens, tokens])), [heads, tokens, tokens])
+    attended = batched_matmul(probabilities, v)
+    return reshape(permute(attended, [1, 0, 2]), [tokens, width])
+
+def silu(x):
+    return x / (1.0 + exp(-x))
+
+def quick_gelu(x):
+    return x / (1.0 + exp(-1.702 * x))
+
+def cos(x):
+    return sin(x + 1.5707963267948966)
+
+# NCHW convolution: WINDOW is a view, and matmul reads patches directly.
+def conv2d(x, w, bias, stride, padding):
+    batch = dim(x, 0)
+    channels = dim(x, 1)
+    height = dim(x, 2)
+    width = dim(x, 3)
+    outputs = dim(w, 0)
+    kh = dim(w, 2)
+    kw = dim(w, 3)
+    assert_eq(channels, dim(w, 1))
+    padded = pad(x, [0, 0, padding, padding], [batch, channels, height + 2 * padding, width + 2 * padding])
+    patches = window(padded, [kh, kw], [stride, stride])
+    oh = dim(patches, 2)
+    ow = dim(patches, 3)
+    left = reshape(permute(patches, [0, 2, 3, 1, 4, 5]), [batch * oh * ow, channels * kh * kw])
+    right = permute(reshape(w, [outputs, channels * kh * kw]), [1, 0])
+    result = matmul(left, right) + bias
+    return permute(reshape(result, [batch, oh, ow, outputs]), [0, 3, 1, 2])
+
+def group_norm(x, weight, bias, groups, epsilon):
+    batch = dim(x, 0)
+    channels = dim(x, 1)
+    height = dim(x, 2)
+    width = dim(x, 3)
+    count = channels // groups * height * width
+    assert_eq(channels // groups * groups, channels)
+    rows = reshape(x, [batch * groups, count])
+    mean = reshape(reduce(permute(rows, [1, 0]), add, 1) / count, [batch * groups, 1])
+    centered = rows - mean
+    variance = reshape(reduce(permute(centered * centered, [1, 0]), add, 1) / count, [batch * groups, 1])
+    normalized = reshape(centered / sqrt(variance + epsilon), [batch, channels, height, width])
+    return normalized * reshape(weight, [1, channels, 1, 1]) + reshape(bias, [1, channels, 1, 1])
+
+def upsample2d(x):
+    batch = dim(x, 0)
+    channels = dim(x, 1)
+    height = dim(x, 2)
+    width = dim(x, 3)
+    repeated = permute(expand(x, [2, 2]), [2, 3, 4, 0, 5, 1])
+    return reshape(repeated, [batch, channels, height * 2, width * 2])
+
+def concat_channels(a, b):
+    batch = dim(a, 0)
+    ca = dim(a, 1)
+    cb = dim(b, 1)
+    height = dim(a, 2)
+    width = dim(a, 3)
+    assert_eq(batch, dim(b, 0))
+    assert_eq(height, dim(b, 2))
+    assert_eq(width, dim(b, 3))
+    left = pad(a, [0, 0, 0, 0], [batch, ca + cb, height, width])
+    right = pad(b, [0, ca, 0, 0], [batch, ca + cb, height, width])
+    return left + right
+
+def attention(q, k, v, heads):
+    rows = dim(q, 0)
+    columns = dim(k, 0)
+    width = dim(q, 1)
+    head_width = width // heads
+    qh = permute(reshape(q, [rows, heads, head_width]), [1, 0, 2])
+    kh = permute(reshape(k, [columns, heads, head_width]), [1, 2, 0])
+    vh = permute(reshape(v, [columns, heads, head_width]), [1, 0, 2])
+    scores = batched_matmul(qh, kh) / sqrt(cast(head_width, f32))
+    probabilities = reshape(softmax(reshape(scores, [heads * rows, columns])), [heads, rows, columns])
+    result = batched_matmul(probabilities, vh)
+    return reshape(permute(result, [1, 0, 2]), [rows, width])
+
+def gelu_erf(x):
+    z = x * 0.7071067811865476
+    absolute = max(z, -z)
+    t = 1.0 / (1.0 + 0.3275911 * absolute)
+    polynomial = (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449672) * t + 0.2548296) * t)
+    erf = where(z < 0.0, -1.0, 1.0) * (1.0 - polynomial * exp(-absolute * absolute))
+    return 0.5 * x * (1.0 + erf)
+
+# Normalize matrix rows without subtracting their mean.
+def rms_norm(x, weight, epsilon):
+    rows = dim(x, 0)
+    width = dim(x, 1)
+    square_mean = reshape(reduce(permute(x * x, [1, 0]), add, 1) / width, [rows, 1])
+    return x / sqrt(square_mean + epsilon) * weight
+
+# Half-split rotary positions for [tokens, heads, head_width].
+def rotary_positions(x, theta):
+    return rotary_positions_from(x, theta, cast(0, i32))
+
+def rotary_positions_from(x, theta, start):
+    tokens = dim(x, 0)
+    heads = dim(x, 1)
+    width = dim(x, 2)
+    half = width // 2
+    assert_eq(width, half * 2)
+    exponents = cast(arange(half), f32) * (2.0 / width)
+    frequencies = exp2(-log2(cast(theta, f32)) * exponents)
+    angles = reshape(cast(arange(tokens) + start, f32), [tokens, 1]) * reshape(frequencies, [1, half])
+    c = reshape(cos(angles), [tokens, 1, half])
+    s = reshape(sin(angles), [tokens, 1, half])
+    a = shrink(x, [0, 0, 0], [tokens, heads, half])
+    b = shrink(x, [0, 0, half], [tokens, heads, half])
+    left = a * c - b * s
+    right = b * c + a * s
+    return reshape(permute(stack(left, right), [1, 2, 0, 3]), [tokens, heads, width])
+
+# Q/K/V are [tokens, heads, head_width]; consecutive Q heads share a KV head.
+def grouped_query_attention(q, k, v):
+    tokens = dim(q, 0)
+    heads = dim(q, 1)
+    width = dim(q, 2)
+    kv_heads = dim(k, 1)
+    groups = heads // kv_heads
+    assert_eq(heads, kv_heads * groups)
+    assert_eq(tokens, dim(k, 0))
+    assert_eq(tokens, dim(v, 0))
+    assert_eq(width, dim(k, 2))
+    assert_eq(width, dim(v, 2))
+    assert_eq(kv_heads, dim(v, 1))
+    keys = reshape(permute(expand(k, [groups]), [1, 2, 0, 3]), [tokens, heads, width])
+    values = reshape(permute(expand(v, [groups]), [1, 2, 0, 3]), [tokens, heads, width])
+    queries = permute(q, [1, 0, 2])
+    scores = batched_matmul(queries, permute(keys, [1, 2, 0])) / sqrt(cast(width, f32))
+    positions = arange(tokens)
+    future = reshape(positions, [tokens, 1]) < reshape(positions, [1, tokens])
+    masked = where(future, -1e30, scores)
+    probabilities = reshape(softmax(reshape(masked, [heads * tokens, tokens])), [heads, tokens, tokens])
+    attended = batched_matmul(probabilities, permute(values, [1, 0, 2]))
+    return reshape(permute(attended, [1, 0, 2]), [tokens, heads * width])
+
+# Queries are the current chunk; keys/values may include unused retained rows.
+# The causal mask excludes rows beyond each query's absolute position.
+def grouped_query_attention_from(q, k, v, start):
+    tokens = dim(q, 0)
+    capacity = dim(k, 0)
+    heads = dim(q, 1)
+    width = dim(q, 2)
+    kv_heads = dim(k, 1)
+    groups = heads // kv_heads
+    assert_eq(heads, kv_heads * groups)
+    assert_eq(capacity, dim(v, 0))
+    assert_eq(width, dim(k, 2))
+    assert_eq(width, dim(v, 2))
+    assert_eq(kv_heads, dim(v, 1))
+    keys = reshape(permute(expand(k, [groups]), [1, 2, 0, 3]), [capacity, heads, width])
+    values = reshape(permute(expand(v, [groups]), [1, 2, 0, 3]), [capacity, heads, width])
+    queries = permute(q, [1, 0, 2])
+    scores = batched_matmul(queries, permute(keys, [1, 2, 0])) / sqrt(cast(width, f32))
+    future = reshape(arange(tokens) + start, [tokens, 1]) < reshape(arange(capacity), [1, capacity])
+    masked = where(future, -1e30, scores)
+    probabilities = reshape(softmax(reshape(masked, [heads * tokens, capacity])), [heads, tokens, capacity])
+    attended = batched_matmul(probabilities, permute(values, [1, 0, 2]))
+    return reshape(permute(attended, [1, 0, 2]), [tokens, heads * width])

@@ -1,0 +1,42 @@
+# One training step for a 784 -> 64 -> 10 ReLU digit classifier.
+# Host supplies a batch and parameter buffers; all math, gradients and SGD are C.
+# Reverse-mode differentiation expands to ordinary Pops during compilation.
+# Last batches are padded; valid is 1 for real examples and 0 for padding.
+images = input("images")
+labels = cast(input("labels"), i32)
+x = reshape(cast(images, f32), [128, 784]) / 255.0
+classes = reshape(arange(10), [1, 10])
+label_column = reshape(labels, [128, 1])
+targets = 1.0 - cast(label_column < classes, f32) - cast(classes < label_column, f32)
+w1 = input("w1")
+b1 = input("b1")
+w2 = input("w2")
+b2 = input("b2")
+learning_rate = input("learning_rate")
+valid = input("valid")
+count = reduce(valid, add, 1)
+mask = reshape(valid, [128, 1])
+
+hidden_pre = dense(x, w1, b1)
+hidden = max(hidden_pre, 0.0)
+logits = dense(hidden, w2, b2)
+
+# Stable softmax cross entropy, including a stable loss for very small probabilities.
+largest = reshape(reduce(permute(logits, [1, 0]), max, 1), [128, 1])
+shifted = logits - largest
+exps = exp(shifted)
+total = reshape(reduce(permute(exps, [1, 0]), add, 1), [128, 1])
+log_probabilities = shifted - log2(total) * 0.6931471805599453
+loss = -reduce(reshape(log_probabilities * targets * mask, [1280]), add, 1) / count
+
+# No runtime tape: these calls construct the backward Pop graph.
+grad_w1 = grad(loss, w1)
+grad_b1 = grad(loss, b1)
+grad_w2 = grad(loss, w2)
+grad_b2 = grad(loss, b2)
+
+next_w1 = w1 - learning_rate * grad_w1
+next_b1 = b1 - learning_rate * grad_b1
+next_w2 = w2 - learning_rate * grad_w2
+next_b2 = b2 - learning_rate * grad_b2
+output next_w1, next_b1, next_w2, next_b2, loss, logits

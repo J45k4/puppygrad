@@ -1,0 +1,26 @@
+# Qwen3 dense decoder. Model math expands entirely into ordinary tensor Pops.
+# HF weights use [output, input]; Q head width is independent of hidden_size/heads.
+def qwen3_block(x, norm1, qw, kw, vw, qnorm, knorm, ow, norm2, gatew, upw, downw, heads, kv_heads, head_width, epsilon, theta):
+    tokens = dim(x, 0)
+    h = rms_norm(x, norm1, epsilon)
+    q = matmul(h, permute(qw, [1, 0]))
+    k = matmul(h, permute(kw, [1, 0]))
+    v = matmul(h, permute(vw, [1, 0]))
+    qn = reshape(rms_norm(reshape(q, [tokens * heads, head_width]), qnorm, epsilon), [tokens, heads, head_width])
+    kn = reshape(rms_norm(reshape(k, [tokens * kv_heads, head_width]), knorm, epsilon), [tokens, kv_heads, head_width])
+    qr = rotary_positions(qn, theta)
+    kr = rotary_positions(kn, theta)
+    vr = reshape(v, [tokens, kv_heads, head_width])
+    attended = grouped_query_attention(qr, kr, vr)
+    residual = x + matmul(attended, permute(ow, [1, 0]))
+    normalized = rms_norm(residual, norm2, epsilon)
+    gated = silu(matmul(normalized, permute(gatew, [1, 0]))) * matmul(normalized, permute(upw, [1, 0]))
+    return residual + matmul(gated, permute(downw, [1, 0]))
+
+tokens = input("tokens")
+x = load(index(weight("model.embed_tokens.weight"), tokens))
+for layer in range(config("num_hidden_layers")):
+    x = qwen3_block(x, weight(f"model.layers.{layer}.input_layernorm.weight"), weight(f"model.layers.{layer}.self_attn.q_proj.weight"), weight(f"model.layers.{layer}.self_attn.k_proj.weight"), weight(f"model.layers.{layer}.self_attn.v_proj.weight"), weight(f"model.layers.{layer}.self_attn.q_norm.weight"), weight(f"model.layers.{layer}.self_attn.k_norm.weight"), weight(f"model.layers.{layer}.self_attn.o_proj.weight"), weight(f"model.layers.{layer}.post_attention_layernorm.weight"), weight(f"model.layers.{layer}.mlp.gate_proj.weight"), weight(f"model.layers.{layer}.mlp.up_proj.weight"), weight(f"model.layers.{layer}.mlp.down_proj.weight"), config("num_attention_heads"), config("num_key_value_heads"), config("head_dim"), config("rms_norm_eps"), config("rope_theta"))
+last = shrink(x, [dim(tokens, 0) - 1, 0], [1, config("hidden_size")])
+normalized = rms_norm(last, weight("model.norm.weight"), config("rms_norm_eps"))
+output matmul(normalized, permute(weight("lm_head.weight"), [1, 0]))

@@ -64,8 +64,110 @@ struct Cli {
     cmd: Command,
 }
 
+#[derive(clap::Args, Debug)]
+struct LlmRunArgs {
+    #[arg(required = true)]
+    source: Option<PathBuf>,
+    #[arg(long, default_value = "cpu")]
+    device: String,
+    #[arg(long, default_value = "models/gpt2")]
+    model_dir: PathBuf,
+    #[arg(long, default_value = "The meaning of life is")]
+    prompt: String,
+    #[arg(long, default_value_t = 8)]
+    max_new_tokens: usize,
+    /// CPU GEMM parallelism; defaults to min(available CPUs, 8).
+    #[arg(long)]
+    threads: Option<usize>,
+    /// CPU instruction target for .pup compilation.
+    #[arg(long, value_enum, default_value_t = puppygrad::compiler::cpu::CpuTarget::Generic)]
+    cpu_target: puppygrad::compiler::cpu::CpuTarget,
+    /// Emit text incrementally using the optional on_tokens callback.
+    #[arg(long)]
+    stream: bool,
+    /// Sampling temperature; 0 selects greedy decoding.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    temperature: f32,
+    #[arg(long, default_value_t = 299_792_458)]
+    seed: u64,
+    /// Compare every generated step against the native GPT-2 reference.
+    #[arg(long)]
+    verify_reference: bool,
+}
+impl LlmRunArgs {
+    fn run(self) -> Result<()> {
+        puppygrad::runtime::llm::run(puppygrad::runtime::llm::Options {
+            program: self
+                .source
+                .ok_or("a model source or shared library is required")?,
+            device: self.device,
+            threads: self.threads,
+            cpu_target: self.cpu_target,
+            model_dir: self.model_dir,
+            prompt: self.prompt,
+            max_new_tokens: self.max_new_tokens,
+            stream: self.stream,
+            temperature: self.temperature,
+            seed: self.seed,
+            verify_reference: self.verify_reference,
+        })
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum LlmCommand {
+    /// Run an LLM program.
+    Run(LlmRunArgs),
+    /// Benchmark CPU thread counts, with warm-up and repeated measurements.
+    Benchmark(puppygrad::runtime::llm_benchmark::Options),
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Generate an image through a .pup program or image FFI provider.
+    Image(puppygrad::runtime::image::Options),
+    /// Train a .pup buffer program over named tensor files.
+    Train(puppygrad::runtime::train::Options),
+    /// Run an LLM through a .pup provider or a shared library's LLM FFI contract.
+    Run(LlmRunArgs),
+    /// Run or benchmark an LLM program.
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
+    Llm {
+        #[command(subcommand)]
+        command: Option<LlmCommand>,
+        #[command(flatten)]
+        run: LlmRunArgs,
+    },
+    /// Emit C or CUDA source without compiling, loading, or executing it.
+    Emit {
+        source: PathBuf,
+        /// Write C to this file; omit or use - for stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        /// Source backend: cpu or cuda.
+        #[arg(long, value_enum, default_value_t = EmitBackend::Cpu)]
+        backend: EmitBackend,
+        /// Checkpoint metadata directory (defaults to models/gpt2 when needed).
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+        /// Static length of the external token input; no token values are needed.
+        #[arg(long, default_value_t = 1)]
+        sequence_length: usize,
+        /// Skip pretty printing (does not require clang-format).
+        #[arg(long)]
+        raw: bool,
+        /// Emit optional profiling counters and JSON metadata in the C ABI.
+        #[arg(long)]
+        profile: bool,
+    },
+    /// Validate a .pup Pop graph without allocating tensors or running a model.
+    Check {
+        source: PathBuf,
+        /// Print the reachable Pop DAG with inferred shapes and dtypes.
+        #[arg(long)]
+        dump_pops: bool,
+    },
+
     /// Shared audio utilities for microphone capture and WAV inspection.
     Audio {
         #[command(subcommand)]
@@ -1029,9 +1131,198 @@ enum AutoTuneCommand {
     },
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum EmitBackend {
+    Cpu,
+    Cuda,
+}
+
+fn emit_c_source(
+    source: &Path,
+    output: Option<&Path>,
+    model_dir: Option<&Path>,
+    sequence_length: usize,
+    raw: bool,
+    profile: bool,
+    backend: EmitBackend,
+) -> Result<()> {
+    use puppygrad::compiler::{
+        cpu,
+        pop::{Arg, DType},
+        source::{self as frontend, Context, TensorSpec},
+    };
+    if sequence_length == 0 {
+        return Err("sequence length must be greater than zero".into());
+    }
+    let text = fs::read_to_string(source)?;
+    let mut context = Context::default();
+    context.tensors.insert(
+        "tokens".into(),
+        TensorSpec {
+            slot: 0,
+            dtype: DType::I32,
+            shape: vec![sequence_length],
+        },
+    );
+    let mut parsed = frontend::parse_with_context(&text, &context);
+    // Resolve external bindings lazily: self-contained programs need no checkpoint.
+    let missing_bindings = parsed.as_ref().err().is_some_and(|error| {
+        let message = error.to_string();
+        message.contains("no external tensor binding for ")
+            || message.contains("missing config value ")
+    });
+    if model_dir.is_some() || missing_bindings {
+        let dir = model_dir.unwrap_or_else(|| Path::new("models/gpt2"));
+        context = puppygrad::models::pup_llm::Checkpoint::metadata_context(dir, sequence_length)
+            .map_err(|e| {
+                format!(
+                    "{}: cannot read checkpoint metadata from {}: {e}",
+                    source.display(),
+                    dir.display()
+                )
+            })?;
+        parsed = frontend::parse_with_context(&text, &context);
+    }
+    let program = parsed.map_err(|e| format!("{}:{e}", source.display()))?;
+    let (code, _) = match backend {
+        EmitBackend::Cuda => {
+            if profile {
+                return Err("CUDA profiling emission is not implemented yet".into());
+            }
+            puppygrad::compiler::cuda::emit(&program.graph, program.root)?
+        }
+        EmitBackend::Cpu if profile => cpu::emit_profiled(&program)?,
+        EmitBackend::Cpu => cpu::emit(&program.graph, program.root)?,
+    };
+    let mut header = format!(
+        "// Emitted from {}. Tensor values remain caller-supplied buffers.\n",
+        serde_json::to_string(&source.to_string_lossy())?
+    );
+    let mut inputs = std::collections::BTreeMap::new();
+    for value in program.graph.toposort(program.root)? {
+        if let Arg::Param(param) = program.graph.node(value)?.arg() {
+            inputs.insert(param.slot, (param.dtype, param.size));
+        }
+    }
+    for (slot, (dtype, size)) in inputs {
+        let mut names: Vec<_> = context
+            .tensors
+            .iter()
+            .filter(|(_, spec)| spec.slot == slot && spec.dtype == dtype)
+            .map(|(name, spec)| (name, &spec.shape))
+            .collect();
+        names.sort_by_key(|(name, _)| *name);
+        header += &format!(
+            "// inputs[{slot}]: {dtype:?}, {} elements",
+            size.unwrap_or(1)
+        );
+        for (name, shape) in names {
+            header += &format!(", {} {shape:?}", serde_json::to_string(name)?);
+        }
+        header.push('\n');
+    }
+    let emitted = header + &code;
+    let emitted = if raw {
+        emitted
+    } else {
+        format_emitted_c(&emitted)?
+    };
+    match output.filter(|path| *path != Path::new("-")) {
+        Some(path) => {
+            if path
+                .canonicalize()
+                .ok()
+                .is_some_and(|p| source.canonicalize().ok().as_ref() == Some(&p))
+            {
+                return Err("output must not overwrite the .pup source".into());
+            }
+            fs::write(path, emitted)?;
+        }
+        None => std::io::stdout().lock().write_all(emitted.as_bytes())?,
+    }
+    Ok(())
+}
+
+fn format_emitted_c(source: &str) -> Result<String> {
+    use std::process::{Command, Stdio};
+    // Pin the style instead of inheriting a caller's .clang-format. Do not reorder
+    // includes or rewrite comments: this pass only presents generated C.
+    let mut child = Command::new("clang-format")
+        .args([
+            "--assume-filename=emitted.c",
+            "--style={BasedOnStyle: LLVM, IndentWidth: 4, ColumnLimit: 100, SortIncludes: false, ReflowComments: false, AllowShortFunctionsOnASingleLine: None, AllowShortIfStatementsOnASingleLine: Never, AllowShortLoopsOnASingleLine: false}",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run clang-format: {e}; install clang-format or use --raw"))?;
+    let mut stdin = child.stdin.take().expect("piped formatter stdin");
+    // Drain output while feeding input, including for models larger than pipe buffers.
+    let (output, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(source.as_bytes()));
+        let output = child.wait_with_output();
+        (
+            output,
+            writer.join().expect("formatter input writer panicked"),
+        )
+    });
+    let output = output?;
+    if !output.status.success() {
+        return Err(format!(
+            "clang-format failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    written?;
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Command::Image(options) => puppygrad::runtime::image::run(options),
+        Command::Train(options) => puppygrad::runtime::train::run(options),
+        Command::Run(args) => args.run(),
+        Command::Llm { command, run } => match command {
+            Some(LlmCommand::Run(args)) => args.run(),
+            Some(LlmCommand::Benchmark(args)) => puppygrad::runtime::llm_benchmark::run(args),
+            None => run.run(),
+        },
+        Command::Emit {
+            source,
+            output,
+            model_dir,
+            sequence_length,
+            raw,
+            profile,
+            backend,
+        } => emit_c_source(
+            &source,
+            output.as_deref(),
+            model_dir.as_deref(),
+            sequence_length,
+            raw,
+            profile,
+            backend,
+        ),
+        Command::Check { source, dump_pops } => {
+            let text = fs::read_to_string(&source)?;
+            let program = puppygrad::compiler::source::parse(&text)
+                .map_err(|err| format!("{}:{err}", source.display()))?;
+            println!(
+                "checked {}: {} bindings, {} unique Pops",
+                source.display(),
+                program.bindings.len(),
+                program.graph.len()
+            );
+            if dump_pops {
+                print!("{}", program.graph.dump(program.root)?);
+            }
+            Ok(())
+        }
         Command::Audio { cmd } => run_audio(cmd),
         Command::Video { cmd } => run_video(cmd),
         Command::Gpt2 {
