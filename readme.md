@@ -10,8 +10,9 @@ cargo build --release
 
 `.pup` programs describe Pop graphs, targeting tinygrad's UOp specification. The
 frontend compiles Python-style source to a DAG; the C CPU backend runs GPT-2 and Stable Diffusion 1.5.
-The [CUDA backend](docs/cuda-backend.md) runs GPT-2 and
-[Qwen3-0.6B](docs/qwen3.md) from `.pup` source.
+The [CUDA backend](docs/cuda-backend.md) and [HIP backend](docs/hip-backend.md) support GPT-2 and
+[Qwen3-0.6B](docs/qwen3.md) from `.pup` source. HIP uses ROCm/HIPRTC on AMD GPUs.
+Training and image stage commands also accept `--device cuda:N` or `--device hip:N`.
 See [the language and compiler contract](docs/compiler-ir.md) and
 [the LLM runtime and FFI API](docs/llm-runtime.md), and
 [the image runtime and FFI API](docs/image-runtime.md).
@@ -19,6 +20,7 @@ See [the language and compiler contract](docs/compiler-ir.md) and
 ```bash
 cargo run -- emit examples/matmul.pup
 cargo run -- emit examples/matmul.pup --backend cuda -o matmul.cu
+cargo run -- emit examples/matmul.pup --backend hip --raw -o matmul.hip
 cargo run -- emit examples/llm.pup --sequence-length 5 -o llm.c
 cargo run -- check examples/matmul.pup --dump-pops
 cargo run -- check examples/linear.pup --dump-pops
@@ -46,6 +48,7 @@ normalization, one-hot encoding, gradients and SGD update are in `mnist.pup`.
 The host-side `.train.json` contract maps data files and state buffers. Runs save
 checkpoints, loss/accuracy, throughput and per-kernel/packing/memory metrics.
 See [tensor loaders, training contracts and profiling](docs/training.md).
+Use `--device hip:0` or `--device cuda:0` for GPU training; GPU reports include host-call timings and omit device kernel profiling.
 
 For compiler-generated gradients, run the equivalent
 `examples/mnist_autodiff.pup`. Its `grad(loss, weights)` calls build a backward

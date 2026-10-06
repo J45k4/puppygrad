@@ -1,13 +1,17 @@
 //! CUDA scheduling reuses the C backend's view/expression semantics and arena planner.
 //! Contractions and row reductions use shape-selected parallel schedules.
 use super::*;
-use crate::compiler::cuda::{Binding, Kernel, Lowered};
+use crate::compiler::gpu::{Binding, Kernel, Lowered};
 #[path = "cuda_fuse.rs"]
 mod expression_fusion;
 #[path = "cuda_reduce.rs"]
 mod reduction;
 
-pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
+pub(crate) fn emit_backend(
+    g: &Graph,
+    root: Value,
+    backend: crate::compiler::gpu::Backend,
+) -> Result<Lowered> {
     let outputs = if g.node(root)?.op() == Op::Sink {
         g.node(root)?.src().to_vec()
     } else {
@@ -120,18 +124,18 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
             consumers.entry(input).or_default().push(v);
         }
     }
-    let parallel_reductions = std::env::var("PUPPYGRAD_CUDA_REDUCTIONS").as_deref() != Ok("0");
-    let row_fusions = if parallel_reductions
-        && std::env::var("PUPPYGRAD_CUDA_ROW_FUSION").as_deref() != Ok("0")
-    {
-        reduction::plan(g, &order, &outputs, &consumers, &skip)
-    } else {
-        HashMap::new()
-    };
+    let parallel_reductions = std::env::var(backend.env("REDUCTIONS")).as_deref() != Ok("0");
+    let register_tiles = std::env::var(backend.env("REGISTER_TILES")).as_deref() != Ok("0");
+    let row_fusions =
+        if parallel_reductions && std::env::var(backend.env("ROW_FUSION")).as_deref() != Ok("0") {
+            reduction::plan(g, &order, &outputs, &consumers, &skip)
+        } else {
+            HashMap::new()
+        };
     for fusion in row_fusions.values() {
         skip.extend(fusion.inner.iter().copied());
     }
-    let fuse_expressions = std::env::var("PUPPYGRAD_CUDA_EXPRESSIONS").as_deref() != Ok("0");
+    let fuse_expressions = std::env::var(backend.env("EXPRESSIONS")).as_deref() != Ok("0");
     let epilogues = if fuse_expressions {
         expression_fusion::epilogues(g, &order, &outputs, &consumers, &mut fused, &mut skip)?
     } else {
@@ -405,7 +409,67 @@ pub(crate) fn emit(g: &Graph, root: Value) -> Result<Lowered> {
             };
             let ar = e.read_coordinates(a, &coords(a, true))?;
             let br = e.read_coordinates(b, &coords(b, false))?;
-            if m >= 16 && cols >= 16 && k >= 32 {
+            if register_tiles && m >= 32 && cols >= 64 && k >= 32 {
+                // Eight outputs per thread reuse each shared operand. Pad the
+                // shared rows so transposed loads and row broadcasts do not
+                // collide in the same memory banks on CUDA or HIP hardware.
+                let tiles_m = m.div_ceil(32);
+                let tiles_n = cols.div_ceil(64);
+                tiled_blocks = Some(n / (m * cols) * tiles_m * tiles_n);
+                let contiguous_k = e.storage_strides(b).is_some_and(|st| st[rank - 1] == 1);
+                let b_coords = if contiguous_k {
+                    "size_t col=tile_col+q/32,r=base+q%32;"
+                } else {
+                    "size_t col=tile_col+q%64,r=base+q/64;"
+                };
+                let b_store = if contiguous_k {
+                    "(q%32)*65+q/32"
+                } else {
+                    "(q/64)*65+q%64"
+                };
+                format!(
+                    "// register-tiled contraction: 32 rows, 64 columns\n\
+__shared__ float sa[32*33],sb[32*65];
+const size_t tid=threadIdx.x,tile_col=(blockIdx.x%{tiles_n})*64,
+ tile_row=((blockIdx.x/{tiles_n})%{tiles_m})*32,batch=blockIdx.x/{};
+float sums[2][4]={{}};
+for(size_t base=0;base<{k};base+=32) {{
+ for(size_t q=tid;q<1024;q+=256) {{
+  size_t row=tile_row+q/32,r=base+q%32;
+  sa[(q/32)*33+q%32]=(row<{m} && r<{k})?({ar}):0.0f;
+ }}
+ for(size_t q=tid;q<2048;q+=256) {{
+  {b_coords} sb[{b_store}]=(col<{cols} && r<{k})?({br}):0.0f;
+ }}
+ __syncthreads();
+ #pragma unroll
+ for(size_t r=0;r<32;r++) {{
+  if(base+r<{k}) {{
+   #pragma unroll
+   for(size_t mr=0;mr<2;mr++) {{
+    float av=sa[(tid/16+mr*16)*33+r];
+    #pragma unroll
+    for(size_t nc=0;nc<4;nc++) sums[mr][nc]+=av*sb[r*65+tid%16+nc*16];
+   }}
+  }}
+ }}
+ __syncthreads();
+}}
+#pragma unroll
+for(size_t mr=0;mr<2;mr++) {{
+ const size_t out_row=tile_row+tid/16+mr*16;
+ #pragma unroll
+ for(size_t nc=0;nc<4;nc++) {{
+  const size_t out_col=tile_col+tid%16+nc*16;
+  if(out_row<{m} && out_col<{cols}) {{
+   const float acc=sums[mr][nc];
+   {name}[(batch*{m}+out_row)*{cols}+out_col]={tiled_epilogue};
+  }}
+ }}
+}}",
+                    tiles_m * tiles_n
+                )
+            } else if m >= 16 && cols >= 16 && k >= 32 {
                 let tiles_m = m.div_ceil(16);
                 let tiles_n = cols.div_ceil(16);
                 tiled_blocks = Some(n / (m * cols) * tiles_m * tiles_n);
@@ -595,7 +659,26 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
         bindings.insert(format!("out{slot}"), Binding::Output(slot));
     }
     let mut source=String::from("// Puppygrad CUDA kernels: caller buffers, no framework math.\ntypedef long long int64_t;\ntypedef int int32_t;\ntypedef unsigned char uint8_t;\n#define INT64_C(x) x##LL\n#define INT32_MIN (-2147483647-1)\n#define INT64_MIN (-9223372036854775807LL-1)\n#define INFINITY (__int_as_float(0x7f800000))\n#define NAN (__int_as_float(0x7fffffff))\n");
+    if backend == crate::compiler::gpu::Backend::Hip {
+        // HIPRTC supplies HIP device types and intrinsics. Avoid redeclaring
+        // fixed-width types: HIPRTC headers keep those in an internal namespace.
+        source = String::from("// Puppygrad HIP kernels: caller buffers, no framework math.\n#ifndef __HIPCC_RTC__\n#include <hip/hip_runtime.h>\n#endif\ntypedef long long pup_int64_t;\ntypedef int pup_int32_t;\ntypedef unsigned char pup_uint8_t;\n#ifndef INFINITY\n#define INFINITY (__int_as_float(0x7f800000))\n#endif\n#ifndef NAN\n#define NAN (__int_as_float(0x7fffffff))\n#endif\n#ifndef INT64_C\n#define INT64_C(x) x##LL\n#endif\n#ifndef INT32_MIN\n#define INT32_MIN (-2147483647-1)\n#endif\n#ifndef INT64_MIN\n#define INT64_MIN (-9223372036854775807LL-1)\n#endif\n");
+    }
+    if backend == crate::compiler::gpu::Backend::Hip {
+        source += "template<typename T> __device__ __forceinline__ T pup_shfl_down(T x, unsigned int delta) { return __shfl_down(x, delta, 32); }\ntemplate<typename T> __device__ __forceinline__ T pup_shfl(T x, int lane) { return __shfl(x, lane, 32); }\n";
+    }
     for k in &mut kernels {
+        if backend == crate::compiler::gpu::Backend::Hip {
+            // Explicit width=32 isolates logical subwarps on wave64 as well
+            // as wave32 hardware; HIP's default width is device-dependent.
+            k.code = k
+                .code
+                .replace("int64_t", "pup_int64_t")
+                .replace("int32_t", "pup_int32_t")
+                .replace("uint8_t", "pup_uint8_t")
+                .replace("__shfl_down_sync(0xffffffff,", "pup_shfl_down(")
+                .replace("__shfl_sync(0xffffffff,", "pup_shfl(");
+        }
         for arg in &k.names {
             k.bindings.push(
                 bindings
@@ -609,7 +692,7 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
     let total_outputs = output_specs.iter().try_fold(0usize, |sum, (dt, shape)| {
         sum.checked_add(
             numel(shape)?
-                .checked_mul(crate::compiler::cuda::dtype_bytes(*dt))
+                .checked_mul(crate::compiler::gpu::dtype_bytes(*dt))
                 .ok_or_else(|| Error("CUDA output overflow".into()))?,
         )
         .ok_or_else(|| Error("CUDA output overflow".into()))

@@ -163,7 +163,7 @@ fn image_cli_rejects_unavailable_device_before_loading_assets() {
             "--prompt",
             "test",
             "--device",
-            "cuda:0",
+            "opencl:0",
             "--model-dir",
             "missing-assets",
             "--download",

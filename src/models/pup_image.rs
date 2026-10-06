@@ -1,8 +1,11 @@
-//! Stable Diffusion 1.x checkpoint provider. Every model stage executes compiled C.
+//! Stable Diffusion 1.x checkpoint provider. Every model stage executes compiler-generated CPU or GPU kernels.
 pub mod stages;
 use super::stable_diffusion as sd;
 use crate::{
-    compiler::cpu::{self, Tensor},
+    compiler::{
+        cpu::{self, Tensor},
+        device::{self, Device},
+    },
     runtime::image_ffi::{self as ffi, Api, Callbacks, ErrorBuffer, Info},
 };
 use serde::Deserialize;
@@ -34,7 +37,7 @@ struct Request {
 }
 struct Stage {
     weights: Weights,
-    executable: cpu::Executable,
+    executable: device::Executable,
 }
 impl Stage {
     fn run(&self, threads: usize) -> Result<Tensor> {
@@ -51,13 +54,14 @@ impl Stage {
                 return Err("image stage produced non-finite values".into());
             }
         }
-        eprintln!("  C stage: {:.3}s", start.elapsed().as_secs_f64());
+        eprintln!("  compiled stage: {:.3}s", start.elapsed().as_secs_f64());
         Ok(out)
     }
 }
 struct State {
     template: String,
     options: cpu::BuildOptions,
+    device: Device,
     threads: usize,
     tokenizer: sd::StableDiffusionTokenizer,
     clip: Stage,
@@ -70,14 +74,29 @@ struct State {
     stages: Option<(u32, u32, Stage, Stage, Stage)>,
     output: Option<(Info, Vec<u8>)>,
 }
+fn compile_stage(
+    program: &crate::compiler::source::Program,
+    device: Device,
+    options: &cpu::BuildOptions,
+    label: &str,
+) -> Result<device::Executable> {
+    // Stages use independent runtimes because their weight/input slots overlap.
+    let executable = device::compile_profiled(program, device, options)?;
+    eprintln!(
+        "image {label}: {} {} kernels; source: {}",
+        executable.kernel_count(),
+        device.label(),
+        executable.source_path().display()
+    );
+    Ok(executable)
+}
 fn read_config<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 impl State {
     fn build(c: Config) -> Result<Self> {
-        if !matches!(c.device.as_str(), "cpu" | "cpu:0" | "c" | "c:0") {
-            return Err("image .pup currently supports --device cpu (generated C)".into());
-        }
+        let device = Device::parse(&c.device)?;
+        device.validate_target(c.cpu_target)?;
         let threads = c.threads.unwrap_or_else(cpu::default_threads);
         if threads == 0 {
             return Err("threads must be positive".into());
@@ -168,7 +187,7 @@ impl State {
             Weights::load(&c.model_dir.join("text_encoder/model.safetensors"), false)?;
         let program = stages::clip(&template, &mut weights, &clip_cfg)?;
         let clip = Stage {
-            executable: stages::compile(&program, &options, "CLIP")?,
+            executable: compile_stage(&program, device, &options, "CLIP")?,
             weights,
         };
         eprintln!("loading UNet weights");
@@ -184,6 +203,7 @@ impl State {
         Ok(Self {
             template,
             options,
+            device,
             threads,
             tokenizer,
             clip,
@@ -257,17 +277,17 @@ impl State {
             let (h, w) = ((r.height / scale) as usize, (r.width / scale) as usize);
             let p = stages::unet(&self.template, &mut uw, &self.unet_cfg, h, w, 77)?;
             let u = Stage {
-                executable: stages::compile(&p, &self.options, "UNet")?,
+                executable: compile_stage(&p, self.device, &self.options, "UNet")?,
                 weights: uw,
             };
             let p = stages::vae(&self.template, &mut vw, &self.vae_cfg, h, w, true)?;
             let v = Stage {
-                executable: stages::compile(&p, &self.options, "VAE")?,
+                executable: compile_stage(&p, self.device, &self.options, "VAE")?,
                 weights: vw,
             };
             let (p, weights) = stages::step(&self.template, h, w)?;
             let step = Stage {
-                executable: stages::compile(&p, &self.options, "DDIM")?,
+                executable: compile_stage(&p, self.device, &self.options, "DDIM")?,
                 weights,
             };
             self.stages = Some((r.width, r.height, u, v, step));

@@ -1,7 +1,7 @@
 //! Small deterministic checkpoints exercise the same .pup source as Qwen3-0.6B.
 //! The independent scalar reference deliberately uses head_dim != hidden/heads.
 use puppygrad::{
-    compiler::{cpu, cuda, source},
+    compiler::{cpu, gpu, hip, source},
     models::pup_llm::Checkpoint,
 };
 use safetensors::tensor::{serialize, Dtype, TensorView};
@@ -290,16 +290,19 @@ fn qwen3_provider_exposes_context_eos_and_generates_through_generic_ffi() {
 #[test]
 #[ignore = "requires NVIDIA GPU and NVRTC; run explicitly with --ignored"]
 fn qwen3_cuda_matches_independent_reference_across_prefixes() {
+    qwen3_gpu_reference(gpu::Backend::Cuda);
+}
+fn qwen3_gpu_reference(backend: gpu::Backend) {
     let f = Fixture::new();
     let mut checkpoint = Checkpoint::load(&f.dir).unwrap();
-    let runtime = cuda::Runtime::new(0).unwrap();
+    let runtime = gpu::Runtime::new(backend, 0).unwrap();
     for tokens in [&[1usize][..], &[1, 3, 2][..], &[1, 3, 2, 4][..]] {
         checkpoint.bind_tokens(tokens).unwrap();
         let p =
             source::parse_with_context(include_str!("../examples/qwen3.pup"), &checkpoint.context)
                 .unwrap();
-        let exe =
-            cuda::compile_with_runtime(&p.graph, p.root, &f.dir.join("cuda"), &runtime).unwrap();
+        let exe = gpu::compile_with_runtime(&p.graph, p.root, &f.dir.join(backend.tag()), &runtime)
+            .unwrap();
         let actual = exe.run(&checkpoint.inputs).unwrap();
         assert_logits(actual[0].f32().unwrap(), &f.reference(tokens));
         let before = exe.residency_stats();
@@ -310,7 +313,7 @@ fn qwen3_cuda_matches_independent_reference_across_prefixes() {
     }
 }
 
-fn cached_chunks(f: &Fixture, gpu: bool) {
+fn cached_chunks(f: &Fixture, backend: Option<gpu::Backend>) {
     use puppygrad::compiler::pop::Scalar;
     let mut checkpoint = Checkpoint::load(&f.dir).unwrap();
     checkpoint
@@ -318,11 +321,7 @@ fn cached_chunks(f: &Fixture, gpu: bool) {
         .constants
         .insert("buffer_capacity".into(), Scalar::Int(8));
     let cpu_runtime = cpu::Runtime::default();
-    let gpu_runtime = if gpu {
-        Some(cuda::Runtime::new(0).unwrap())
-    } else {
-        None
-    };
+    let gpu_runtime = backend.map(|backend| gpu::Runtime::new(backend, 0).unwrap());
     for chunks in [
         vec![vec![1, 3], vec![2], vec![4]],
         vec![vec![2], vec![1, 4], vec![3]],
@@ -341,10 +340,15 @@ fn cached_chunks(f: &Fixture, gpu: bool) {
             )
             .unwrap();
             let actual = if let Some(runtime) = &gpu_runtime {
-                cuda::compile_with_runtime(&p.graph, p.root, &f.dir.join("cuda"), runtime)
-                    .unwrap()
-                    .run(&checkpoint.inputs)
-                    .unwrap()
+                gpu::compile_with_runtime(
+                    &p.graph,
+                    p.root,
+                    &f.dir.join(runtime.backend().tag()),
+                    runtime,
+                )
+                .unwrap()
+                .run(&checkpoint.inputs)
+                .unwrap()
             } else {
                 let mut e = cpu::compile(&p.graph, p.root, &f.dir.join("cpu")).unwrap();
                 e.share_runtime(&cpu_runtime);
@@ -356,29 +360,30 @@ fn cached_chunks(f: &Fixture, gpu: bool) {
 }
 #[test]
 fn cached_qwen3_cpu_matches_full_prefix_with_chunks_and_reset() {
-    cached_chunks(&Fixture::new(), false);
+    cached_chunks(&Fixture::new(), None);
 }
 #[test]
 #[ignore = "requires NVIDIA GPU and NVRTC"]
 fn cached_qwen3_cuda_matches_full_prefix_with_chunks_and_reset() {
-    cached_chunks(&Fixture::new(), true);
+    cached_chunks(&Fixture::new(), Some(gpu::Backend::Cuda));
 }
-fn cached_provider(gpu: bool) {
+fn cached_provider(backend: Option<gpu::Backend>) {
     use puppygrad::runtime::llm_ffi::{Generation, Model};
     let f = Fixture::new();
-    if gpu {
+    if backend.is_some() {
         let config_path = f.dir.join("config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
         config["max_position_embeddings"] = serde_json::json!(8192);
         std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     }
-    let config=serde_json::to_vec(&serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":if gpu {"cuda:0"} else {"cpu"},"threads":1,"prefill_chunk":2,"context_budget_mib":1,"context_reserve_mib":0})).unwrap();
+    let config=serde_json::to_vec(&serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":backend.map_or("cpu",gpu::Backend::tag),"threads":1,"prefill_chunk":2,"context_budget_mib":1,"context_reserve_mib":0})).unwrap();
     let mut model = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &config) }.unwrap();
-    if gpu {
+    if backend.is_some() {
         assert!(model.info.context_length >= 8 && model.info.context_length < 8192);
         let context = Checkpoint::metadata_context(&f.dir, 1).unwrap();
-        let expected = puppygrad::runtime::llm_capacity::determine(
+        let expected = puppygrad::runtime::llm_capacity::determine_for_backend(
+            backend.unwrap(),
             include_str!("../examples/qwen3_cached.pup"),
             &context,
             1024 * 1024,
@@ -451,10 +456,47 @@ fn cached_provider(gpu: bool) {
 
 #[test]
 fn cached_qwen3_uses_chunked_ffi_and_resets_between_inferences() {
-    cached_provider(false);
+    cached_provider(None);
 }
 #[test]
 #[ignore = "requires NVIDIA GPU and NVRTC"]
 fn cached_qwen3_ffi_automatically_limits_context_and_chunks_prefill() {
-    cached_provider(true);
+    cached_provider(Some(gpu::Backend::Cuda));
+}
+
+#[test]
+#[ignore = "requires AMD GPU and HIPRTC"]
+fn qwen3_hip_matches_independent_reference_across_prefixes() {
+    qwen3_gpu_reference(gpu::Backend::Hip);
+}
+#[test]
+#[ignore = "requires AMD GPU and HIPRTC"]
+fn cached_qwen3_hip_matches_full_prefix_with_chunks_and_reset() {
+    cached_chunks(&Fixture::new(), Some(gpu::Backend::Hip));
+}
+#[test]
+#[ignore = "requires AMD GPU and HIPRTC"]
+fn cached_qwen3_hip_ffi_limits_context_chunks_prefill_and_resets() {
+    cached_provider(Some(gpu::Backend::Hip));
+}
+#[test]
+#[ignore = "requires HIPRTC, but no GPU"]
+fn hiprtc_compiles_qwen3_full_cached_prefill_and_decode() {
+    let f = Fixture::new();
+    let mut checkpoint = Checkpoint::load(&f.dir).unwrap();
+    for template in [
+        include_str!("../examples/qwen3.pup"),
+        include_str!("../examples/qwen3_cached.pup"),
+    ] {
+        for tokens in [&[1usize][..], &[1, 3, 2][..]] {
+            checkpoint.bind_tokens(tokens).unwrap();
+            let p = source::parse_with_context(template, &checkpoint.context).unwrap();
+            let (code, _) = hip::emit(&p.graph, p.root).unwrap();
+            for arch in ["gfx1100", "gfx90a"] {
+                assert!(hip::compile_source(&code, arch)
+                    .unwrap()
+                    .starts_with(b"\x7fELF"));
+            }
+        }
+    }
 }

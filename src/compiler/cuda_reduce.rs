@@ -50,7 +50,7 @@ fn row_broadcast(g: &Graph, v: Value, rows: usize) -> Option<Value> {
 fn recognize(g: &Graph, root: Value) -> Option<Fusion> {
     let node = g.node(root).ok()?;
     let sh = node.shape()?;
-    if node.dtype() != DType::F32 || sh.len() != 2 || sh[1] < 32 || sh[1] > 4096 {
+    if node.dtype() != DType::F32 || sh.len() != 2 || sh[1] < 32 || sh[1] > 65536 {
         return None;
     }
     let (rows, width) = (sh[0], sh[1]);
@@ -229,6 +229,22 @@ impl Fusion {
             }
             Kind::Softmax { max, sum, exps } => {
                 let x = e.read(e.g.node(max)?.src()[0], &format!("r*{rows}+row"))?;
+                if width > 4096 {
+                    // Stream wide rows rather than spilling a width/32 array
+                    // per lane. The max itself is unobserved inside this fusion:
+                    // any NaN still propagates through the exponential sum to
+                    // every output, and signed-zero ties have identical exp2.
+                    code += &format!("// streaming wide softmax\nfloat row_max=-INFINITY; for(size_t r=lane;r<{width};r+=32) row_max=fmaxf(row_max,({x}));\nfor(int offset=16;offset>0;offset/=2)row_max=fmaxf(row_max,__shfl_down_sync(0xffffffff,row_max,offset)); row_max=__shfl_sync(0xffffffff,row_max,0);\n");
+                    e.overrides.insert(max, "row_max".into());
+                    let exponent = e.read(exps, "i")?;
+                    code += &format!("float row_sum=0; for(size_t col=lane;col<{width};col+=32){{size_t i=row*{width}+col;row_sum+=({exponent});}}\nfor(int offset=16;offset>0;offset/=2)row_sum+=__shfl_down_sync(0xffffffff,row_sum,offset); row_sum=__shfl_sync(0xffffffff,row_sum,0);\n");
+                    e.overrides.insert(sum, "row_sum".into());
+                    let y = e.read(v, "i")?;
+                    e.overrides.remove(&max);
+                    e.overrides.remove(&sum);
+                    code += &format!("for(size_t col=lane;col<{width};col+=32){{size_t i=row*{width}+col;{name}[i]={y};}}\n");
+                    return Ok(code);
+                }
                 code += &warp_reduce(width, ReduceOp::Max, &x, "row_max");
                 e.overrides.insert(max, "row_max".into());
                 let x = e.read(exps, "i")?;

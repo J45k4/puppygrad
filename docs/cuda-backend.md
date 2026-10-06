@@ -53,8 +53,12 @@ The backend consumes the existing Pop DAG and reuses C expression generation,
 view coordinate mapping, and lifetime-based arena planning. Reshape, permute,
 shrink, flip, expand, load, and window remain indexing views. Canonical
 multiply/reduce contractions lower directly to GPU matmul without allocating
-broadcast products. Contractions with M/N >= 16 and K >= 32 use 16x16 output
-tiles and 32-wide shared-memory operand tiles, coalescing B loads according to
+broadcast products. Contractions with M >= 32, N >= 64 and K >= 32 use 32x64
+output tiles with eight accumulator values per thread and padded shared-memory
+operand rows. This reuses loaded operands and avoids shared-memory bank conflicts.
+Set `PUPPYGRAD_CUDA_REGISTER_TILES=0` before compilation to compare the previous
+schedule. Other contractions with M/N >= 16 and K >= 32 use 16x16 output tiles.
+Both schedules use a 32-wide reduction tile and coalesce B loads according to
 its physical view layout. Smaller contractions with a contiguous B reduction axis
 and K >= 32 use one warp per output; remaining cases use one thread per output.
 Warp shuffles change reduction order; FMA stays disabled. Bounded, single-use
@@ -66,14 +70,16 @@ to output buffers where possible. F32 reductions with at least 32 input values
 use one warp per output when there are fewer than 256 outputs or the reduced
 axis has contiguous storage. Other layouts and short/integer reductions keep
 the sequential schedule. Sum/product reduction order changes, so numerical
-comparisons use tolerances. Ordered max merges preserve the existing ternary
+comparisons use tolerances. Standalone ordered max merges preserve the existing ternary
 comparison behavior for NaNs and equal values, including signed zero.
 
 The compiler recognizes row-local RMS normalization and stable softmax from
-their primitive Pop graphs. For widths 32 through 4096, private reductions and
+their primitive Pop graphs. For widths 32 through 65536, private reductions and
 their pointwise consumers become one warp-per-row kernel. Softmax keeps each
-lane's exponentials in registers for summation and output; no exponential tensor
-is materialized. Shared intermediate results stay available to other consumers,
+lane's exponentials in registers through width 4096. Wider softmax rows stream
+coalesced values for max and sum, then recompute exponentials for output, avoiding
+large per-lane arrays and separate exponential tensors. NaNs propagate through
+the exponential sum to the complete softmax row. Shared intermediate results stay available to other consumers,
 and fusion cannot move reads across writable-state stores. These schedules use
 the existing operations and require no model-source changes.
 
@@ -167,16 +173,16 @@ Cache writes replace files atomically. No weights are embedded in emitted code.
 
 ## Current limits and next steps
 
-The LLM `.pup` adapter accepts CUDA. Image generation and the generic training
-harness still select CPU; CUDA profiling, standalone PTX emission, and GPU
-provider-library export are not implemented yet. `emit --backend cuda --profile`
+The LLM, image stage and generic training `.pup` adapters accept CUDA. The
+[HIP backend](hip-backend.md) supports the same graph/compiler path on AMD GPUs.
+GPU training reports host-call timings rather than device kernel counters.
+CUDA profiling, standalone PTX emission, and GPU provider-library export are not implemented yet. `emit --backend cuda --profile`
 reports an explicit error. Existing CPU profiling remains available.
 
 The backend uses shared-memory matmul tiling. Tensor cores and cuBLAS are not
-used, and reductions have no warp-level parallelism. GPT-2 continues
+used. Parallel reductions and row fusion use warp shuffles. GPT-2 continues
 to compile per static prefix length and has no retained GPU KV cache.
-The next improvements are register tiling, parallel reductions, GPU event
-profiling, then image/training integration.
+The next improvements are register tiling and GPU event profiling.
 
 ## Verification
 
@@ -194,7 +200,7 @@ negative/high gather indices, repeated execution after errors, updated inputs,
 and PTX cache reuse. Residency tests cover sharing across shapes, zero allocations
 on warm runs, weight copy-on-write, independent host outputs, and releasing VRAM
 while the primary context remains alive. Run the VRAM release check with
-`cargo test --lib compiler::cuda::ownership_tests -- --ignored --test-threads=1`.
+`cargo test --lib compiler::gpu::ownership_tests -- --ignored --test-threads=1`.
 Real-model GPT-2 verification uses `--verify-reference`.
 
 Validated on this workstation's RTX 2070 with NVRTC 12.6.85: the unchanged

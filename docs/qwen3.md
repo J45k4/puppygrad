@@ -3,7 +3,7 @@
 [examples/qwen3_cached.pup](../examples/qwen3_cached.pup) implements the dense Qwen3 decoder
 using ordinary source functions and primitive tensor Pops. It runs through the
 existing `llm` application and LLM buffer/FFI contract, on generated C CPU kernels
-or generated CUDA kernels. There is no Qwen model computation in Rust or Python.
+or generated CUDA/HIP kernels. There is no Qwen model computation in Rust or Python.
 
 The source includes RMSNorm, per-head query/key normalization, half-split RoPE,
 grouped causal attention, SiLU gated feed-forward blocks and tied output weights.
@@ -37,6 +37,12 @@ PUPPYGRAD_NVRTC=/path/to/libnvrtc.so.12 \
 ```
 
 The [CUDA setup](cuda-backend.md) describes the driver and NVRTC requirements.
+The [HIP backend](hip-backend.md) uses the same sources and checkpoint with
+`--device hip:0`; it includes retained KV state, chunked prefill and automatic
+context planning. HIPRTC compilation, deterministic-checkpoint reference parity
+and full Qwen3-0.6B text generation are verified on an RX 9070 XT. Controlled
+HIP context-throughput measurements use the
+[production generation benchmark](../benchmarks/qwen3-hip/generation.py).
 Use `--device cpu --cpu-target native --threads 8` for generated C instead.
 `emit` only reads checkpoint metadata and requires neither a GPU nor a tokenizer:
 

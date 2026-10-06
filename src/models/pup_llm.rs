@@ -1,12 +1,12 @@
 //! Transitional .pup provider for the LLM ABI. Model math executes through the
-//! compiler's CPU or CUDA backend; checkpoint binding and generation stay outside compiler.
+//! compiler's CPU, CUDA or HIP backend; checkpoint binding and generation stay outside compiler.
 mod checkpoint;
 pub use checkpoint::Checkpoint;
 
 use super::generation::{LogitsSampler, TextGenerationConfig};
 use crate::runtime::llm_capacity;
 use crate::{
-    compiler::{cpu, cuda, pop::Scalar, source},
+    compiler::{cpu, gpu, pop::Scalar, source},
     runtime::llm_ffi::{
         self as ffi, Api, Callbacks, ErrorBuffer, Generation, Info, DONE_EOS, DONE_ERROR,
         DONE_LIMIT, NO_EOS,
@@ -30,7 +30,7 @@ struct Config {
     threads: Option<usize>,
     #[serde(default)]
     cpu_target: cpu::CpuTarget,
-    /// CUDA providers plan their context from live device memory by default.
+    /// GPU providers plan their context from live device memory by default.
     #[serde(default)]
     auto_context: Option<bool>,
     #[serde(default)]
@@ -50,19 +50,19 @@ struct State {
     threads: usize,
     build_options: cpu::BuildOptions,
     info: Info,
-    cuda_runtime: Option<cuda::Runtime>,
+    gpu_runtime: Option<gpu::Runtime>,
     cpu_runtime: cpu::Runtime,
     retained: Option<bool>,
     prefill_chunk: Option<usize>,
     auto_context: bool,
-    request_plans: HashMap<(usize, usize, usize), cuda::MemoryPlan>,
+    request_plans: HashMap<(usize, usize, usize), gpu::MemoryPlan>,
     executables: HashMap<(usize, usize), Executable>,
     output: Vec<u32>,
     reference: Option<super::gpt2::Gpt2Runtime>,
 }
 enum Executable {
     Cpu(cpu::Executable),
-    Cuda(cuda::Executable),
+    Gpu(gpu::Executable),
 }
 impl Executable {
     fn run(
@@ -72,7 +72,7 @@ impl Executable {
     ) -> crate::compiler::pop::Result<Vec<cpu::Tensor>> {
         match self {
             Self::Cpu(e) => e.run_with_threads(inputs, threads),
-            Self::Cuda(e) => e.run(inputs),
+            Self::Gpu(e) => e.run(inputs),
         }
     }
 }
@@ -106,13 +106,8 @@ unsafe extern "C" fn build_model(
             .map_err(|e| e.to_string())?;
         let device = if matches!(config.device.as_str(), "cpu" | "cpu:0" | "c" | "c:0") {
             None
-        } else if config.device == "cuda" || config.device.starts_with("cuda:") {
-            Some(cuda::device_index(&config.device).map_err(|e| e.to_string())?)
         } else {
-            return Err(format!(
-                "unsupported device {:?}; use --device cpu or cuda:<index>",
-                config.device
-            ));
+            Some(gpu::device(&config.device).map_err(|e| e.to_string())?)
         };
         if device.is_some() && config.cpu_target != cpu::CpuTarget::Generic {
             return Err("--cpu-target applies to the CPU backend".into());
@@ -145,13 +140,13 @@ unsafe extern "C" fn build_model(
         };
         let auto_context = config.auto_context.unwrap_or(device.is_some());
         if auto_context && device.is_none() {
-            return Err("automatic context planning currently requires CUDA".into());
+            return Err("automatic context planning currently requires CUDA or HIP".into());
         }
         if config.prefill_chunk == Some(0) {
             return Err("prefill chunk must be positive".into());
         }
-        let cuda_runtime = device
-            .map(cuda::Runtime::new)
+        let gpu_runtime = device
+            .map(|(backend, index)| gpu::Runtime::new(backend, index))
             .transpose()
             .map_err(|e| e.to_string())?;
         let mut retained = None;
@@ -165,7 +160,7 @@ unsafe extern "C" fn build_model(
             }
             retained = Some(has_state);
             if auto_context {
-                let live_free = cuda_runtime
+                let live_free = gpu_runtime
                     .as_ref()
                     .unwrap()
                     .memory_info()
@@ -181,7 +176,8 @@ unsafe extern "C" fn build_model(
                     .context_reserve_mib
                     .checked_mul(1024 * 1024)
                     .ok_or("context reserve overflow")?;
-                let report = llm_capacity::determine(
+                let report = llm_capacity::determine_for_backend(
+                    gpu_runtime.as_ref().unwrap().backend(),
                     &source,
                     &checkpoint.context,
                     available,
@@ -216,7 +212,7 @@ unsafe extern "C" fn build_model(
                 cpu_target: config.cpu_target,
             },
             info: metadata,
-            cuda_runtime,
+            gpu_runtime,
             cpu_runtime: cpu::Runtime::default(),
             retained,
             prefill_chunk,
@@ -256,23 +252,24 @@ impl State {
                 source::parse_with_context(&self.source, &self.checkpoint.context)
                     .map_err(|e| format!("{}:{e}", self.source_path.display()))?
             };
-            let exe = if let Some(runtime) = &self.cuda_runtime {
-                let e = cuda::compile_with_runtime(
+            let exe = if let Some(runtime) = &self.gpu_runtime {
+                let e = gpu::compile_with_runtime(
                     &program.graph,
                     program.root,
-                    Path::new(".cache/pup/cuda"),
+                    &PathBuf::from(format!(".cache/pup/{}", runtime.backend().tag())),
                     runtime,
                 )
                 .map_err(|e| e.to_string())?;
                 if announce {
                     eprintln!(
-                        "compiled CUDA: {} contractions, {}; source: {}",
+                        "compiled {}: {} contractions, {}; source: {}",
+                        runtime.backend().label(),
                         e.gemm_count,
                         e.device_name,
                         e.source_path.display()
                     );
                 }
-                Executable::Cuda(e)
+                Executable::Gpu(e)
             } else {
                 let mut e = cpu::compile_with_options(
                     &program.graph,
@@ -354,7 +351,7 @@ impl State {
             self.retained = Some(!program.states.is_empty());
         }
         let retained = self.retained.unwrap();
-        if let Some(runtime) = self.cuda_runtime.as_ref().filter(|_| self.auto_context) {
+        if let Some(runtime) = self.gpu_runtime.as_ref().filter(|_| self.auto_context) {
             let planned_tokens = if retained {
                 input.len()
             } else {
@@ -366,7 +363,8 @@ impl State {
                 .min(planned_tokens);
             let key = (capacity, main, planned_tokens % main);
             if !self.request_plans.contains_key(&key) {
-                let plan = llm_capacity::request_plan(
+                let plan = llm_capacity::request_plan_for_backend(
+                    runtime.backend(),
                     &self.source,
                     &self.checkpoint.context,
                     capacity,
@@ -384,7 +382,7 @@ impl State {
                 .check_memory(&self.request_plans[&key], 0)
                 .map_err(|e| e.to_string())?;
         }
-        if let Some(runtime) = &self.cuda_runtime {
+        if let Some(runtime) = &self.gpu_runtime {
             runtime.reset_state().map_err(|e| e.to_string())?;
         }
         self.cpu_runtime.reset_state().map_err(|e| e.to_string())?;

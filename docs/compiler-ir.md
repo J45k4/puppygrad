@@ -58,7 +58,9 @@ compares every step's logits and greedy token choice with the existing Rust GPT-
 the weights. `check` remains allocation-free and needs no model assets; programs
 using `input`, `weight`, or `config` require a binding context, supplied by `run`.
 An initial [CUDA backend](cuda-backend.md) runs the same GPT-2 source through
-NVRTC and the NVIDIA driver with `--device cuda:0`. CUDA emission is available
+NVRTC and the NVIDIA driver with `--device cuda:0`. The [HIP backend](hip-backend.md)
+runs the same graph path through HIPRTC and the AMD runtime with `--device hip:0`,
+including retained Qwen state, training and image stages. CUDA emission is available
 without a GPU using `emit --backend cuda`. Standalone PTX, OpenCL, and SASS
 backends remain future work; unsupported devices fail explicitly.
 

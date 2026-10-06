@@ -381,3 +381,77 @@ fn emit_cuda_requires_no_cuda_installation() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("CUDA profiling"));
 }
+
+#[test]
+fn emit_hip_requires_no_hip_installation_and_profile_errors_preserve_output() {
+    let f = EmitFixture::new();
+    std::fs::write(
+        f.0.join("model.pup"),
+        "a=reshape(param(0,f32,6),[2,3])\nb=reshape(param(1,f32,6),[3,2])\noutput matmul(a,b)",
+    )
+    .unwrap();
+    let result = f
+        .emit()
+        .args(["model.pup", "--backend", "hip", "-o", "model.hip"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let code = std::fs::read_to_string(f.0.join("model.hip")).unwrap();
+    assert!(code.contains("Puppygrad HIP kernels"));
+    assert!(code.contains("__global__ void kernel"));
+    let result = f
+        .emit()
+        .args([
+            "model.pup",
+            "--backend",
+            "hip",
+            "--profile",
+            "-o",
+            "model.hip",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("HIP profiling"));
+    assert_eq!(
+        std::fs::read_to_string(f.0.join("model.hip")).unwrap(),
+        code
+    );
+}
+#[test]
+fn gpu_cpu_target_conflicts_are_rejected_before_assets_or_downloads() {
+    for args in [
+        vec![
+            "train",
+            "examples/mnist.pup",
+            "--device",
+            "hip:0",
+            "--cpu-target",
+            "native",
+        ],
+        vec![
+            "image",
+            "examples/image.pup",
+            "--device",
+            "hip:0",
+            "--cpu-target",
+            "native",
+            "--prompt",
+            "test",
+            "--download",
+        ],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+            .args(args)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("--cpu-target applies to the CPU backend"));
+    }
+}

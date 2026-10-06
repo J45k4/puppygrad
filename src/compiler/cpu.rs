@@ -162,7 +162,7 @@ impl Executable {
                 continue;
             }
             let bytes = n
-                .checked_mul(crate::compiler::cuda::dtype_bytes(dt))
+                .checked_mul(crate::compiler::gpu::dtype_bytes(dt))
                 .ok_or_else(|| Error("state size overflow".into()))?;
             if bytes > 2 * 1024 * 1024 * 1024 {
                 return Err(Error("state allocation exceeds 2 GiB".into()));

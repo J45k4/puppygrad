@@ -2,7 +2,7 @@
 //! It never knows attention heads, cache layout or model arithmetic.
 use crate::{
     compiler::{
-        cuda,
+        gpu,
         pop::{Error, Result, Scalar},
         source::{self, Context, TensorSpec},
     },
@@ -66,11 +66,12 @@ pub fn retained(text: &str, context: &Context) -> Result<bool> {
 }
 
 fn shape_plan(
+    backend: gpu::Backend,
     text: &str,
     context: &Context,
     capacity: usize,
     tokens: usize,
-) -> Result<(cuda::MemoryPlan, Vec<source::StateSpec>)> {
+) -> Result<(gpu::MemoryPlan, Vec<source::StateSpec>)> {
     let mut context = context.clone();
     context
         .constants
@@ -88,7 +89,10 @@ fn shape_plan(
         },
     );
     let p = source::parse_with_context(text, &context)?;
-    Ok((cuda::memory_plan(&p.graph, p.root)?, p.states))
+    Ok((
+        gpu::memory_plan_for_backend(&p.graph, p.root, backend)?,
+        p.states,
+    ))
 }
 
 /// Union the actual prefill shapes and decode into one retained allocation plan.
@@ -99,7 +103,26 @@ pub fn request_plan(
     prompt_tokens: usize,
     prefill_chunk: Option<usize>,
     is_retained: bool,
-) -> Result<cuda::MemoryPlan> {
+) -> Result<gpu::MemoryPlan> {
+    request_plan_for_backend(
+        gpu::Backend::Cuda,
+        text,
+        context,
+        capacity,
+        prompt_tokens,
+        prefill_chunk,
+        is_retained,
+    )
+}
+pub fn request_plan_for_backend(
+    backend: gpu::Backend,
+    text: &str,
+    context: &Context,
+    capacity: usize,
+    prompt_tokens: usize,
+    prefill_chunk: Option<usize>,
+    is_retained: bool,
+) -> Result<gpu::MemoryPlan> {
     if prompt_tokens == 0 || capacity == 0 || prefill_chunk == Some(0) {
         return Err(Error("capacity, prompt and chunk must be positive".into()));
     }
@@ -107,9 +130,9 @@ pub fn request_plan(
         return Err(Error("prompt exceeds planned context capacity".into()));
     }
     let chunk = prefill_chunk.unwrap_or(prompt_tokens).min(prompt_tokens);
-    let (mut plan, states) = shape_plan(text, context, capacity, chunk)?;
+    let (mut plan, states) = shape_plan(backend, text, context, capacity, chunk)?;
     let mut merge_shape = |tokens| -> Result<()> {
-        let (next, next_states) = shape_plan(text, context, capacity, tokens)?;
+        let (next, next_states) = shape_plan(backend, text, context, capacity, tokens)?;
         if next_states != states {
             return Err(Error(
                 "retained state layout changes between execution shapes".into(),
@@ -135,6 +158,25 @@ pub fn determine(
     explicit_chunk: Option<usize>,
     single_shot: bool,
 ) -> Result<Report> {
+    determine_for_backend(
+        gpu::Backend::Cuda,
+        text,
+        context,
+        available_bytes,
+        reserve_bytes,
+        explicit_chunk,
+        single_shot,
+    )
+}
+pub fn determine_for_backend(
+    backend: gpu::Backend,
+    text: &str,
+    context: &Context,
+    available_bytes: usize,
+    reserve_bytes: usize,
+    explicit_chunk: Option<usize>,
+    single_shot: bool,
+) -> Result<Report> {
     if explicit_chunk == Some(0) {
         return Err(Error("prefill chunk must be positive".into()));
     }
@@ -153,7 +195,8 @@ pub fn determine(
     let budget = available_bytes
         .checked_sub(reserve_bytes)
         .ok_or_else(|| Error("memory reserve exceeds available budget".into()))?;
-    let evaluate = |n: usize| request_plan(text, context, n, n, chunk, is_retained);
+    let evaluate =
+        |n: usize| request_plan_for_backend(backend, text, context, n, n, chunk, is_retained);
     let budget_reason =
         |bytes| format!("planned device buffers need {bytes} bytes, budget is {budget}");
     let mut best =
@@ -237,7 +280,7 @@ pub fn determine(
 }
 
 pub fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let device = cuda::device_index(&options.device)?;
+    let (backend, device) = gpu::device(&options.device)?;
     if options.source.extension().is_none_or(|e| e != "pup") {
         return Err("capacity planning currently requires a .pup source program".into());
     }
@@ -247,13 +290,16 @@ pub fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Erro
         mib.checked_mul(1024 * 1024)
             .ok_or("memory budget overflow")?
     } else {
-        cuda::Runtime::new(device)?.memory_info()?.free_bytes
+        gpu::Runtime::new(backend, device)?
+            .memory_info()?
+            .free_bytes
     };
     let reserve = options
         .reserve_mib
         .checked_mul(1024 * 1024)
         .ok_or("memory reserve overflow")?;
-    let report = determine(
+    let report = determine_for_backend(
+        backend,
         &text,
         &context,
         available,

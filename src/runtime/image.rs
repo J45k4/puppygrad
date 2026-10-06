@@ -48,9 +48,8 @@ pub fn run(o: Options) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if is_pup {
-        if !matches!(o.device.as_str(), "cpu" | "cpu:0" | "c" | "c:0") {
-            return Err("image .pup currently supports --device cpu (generated C)".into());
-        }
+        let device = crate::compiler::device::Device::parse(&o.device)?;
+        device.validate_target(o.cpu_target)?;
         if o.threads == Some(0) {
             return Err("threads must be positive".into());
         }

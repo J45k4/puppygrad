@@ -1,4 +1,4 @@
-//! CUDA driver graph replay for one lowered executable. The legacy entry point
+//! GPU driver graph replay for one lowered executable. The legacy entry point
 //! cuGraphAddKernelNode uses CUDA_KERNEL_NODE_PARAMS v1 (not the newer v2 ABI).
 use super::*;
 
@@ -72,7 +72,7 @@ struct Graph<'a> {
 impl Drop for Graph<'_> {
     fn drop(&mut self) {
         unsafe {
-            (self.driver.graph_destroy)(self.handle);
+            self.driver.graph_destroy(self.handle);
         }
     }
 }
@@ -95,7 +95,7 @@ impl Replay {
     ) -> Result<Self> {
         let d = &context.driver;
         let mut handle = std::ptr::null_mut();
-        d.check(unsafe { (d.graph_create)(&mut handle, 0) }, "create graph")?;
+        d.check(unsafe { d.graph_create(&mut handle, 0) }, "create graph")?;
         let graph = Graph { driver: d, handle };
         let mut previous: Handle = std::ptr::null_mut();
         for (id, k) in kernels.iter().enumerate() {
@@ -114,7 +114,7 @@ impl Replay {
             // Preserve total order, including STORE/AFTER and reused arena regions.
             d.check(
                 unsafe {
-                    (d.graph_add_kernel)(
+                    d.graph_add_kernel(
                         &mut node,
                         graph.handle,
                         deps,
@@ -129,7 +129,7 @@ impl Replay {
         let mut executable = std::ptr::null_mut();
         d.check(
             unsafe {
-                (d.graph_instantiate)(
+                d.graph_instantiate(
                     &mut executable,
                     graph.handle,
                     std::ptr::null_mut(),
@@ -147,7 +147,11 @@ impl Replay {
     }
     pub fn launch(&self) -> Result<()> {
         self.context.driver.check(
-            unsafe { (self.context.driver.graph_launch)(self.handle, std::ptr::null_mut()) },
+            unsafe {
+                self.context
+                    .driver
+                    .graph_launch(self.handle, std::ptr::null_mut())
+            },
             "launch graph",
         )
     }
@@ -156,7 +160,7 @@ impl Drop for Replay {
     fn drop(&mut self) {
         if let Ok(_current) = self.context.driver.enter(self.context.handle) {
             unsafe {
-                (self.context.driver.graph_exec_destroy)(self.handle);
+                self.context.driver.graph_exec_destroy(self.handle);
             }
         }
     }

@@ -164,3 +164,13 @@ cargo run --release --offline -- train examples/mnist_autodiff.pup --epochs 5 --
 Its `grad(loss, w1)` calls expand into the same Pop vocabulary used by the
 forward model. The training contract, dataset loaders, explicit SGD updates and
 telemetry work unchanged. See [autodiff.md](autodiff.md) for the initial scope.
+
+## GPU devices
+
+The same training contracts and `.pup` sources accept `--device hip:0` or
+`--device cuda:0`. Both manual and autodiff MNIST graphs compile to GPU kernels.
+CPU remains the default; `--cpu-target` applies only to CPU execution.
+GPU runs write `program.hip` / `program.cu` and synchronized host-call timings,
+including transfers. Device kernel/packing counters are omitted. Parameter
+updates retain the host checkpoint contract and upload on the next batch.
+See the [HIP backend](hip-backend.md) for requirements and verification status.

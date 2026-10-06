@@ -1,6 +1,6 @@
 use puppygrad::compiler::{
     cpu::{self, Tensor},
-    cuda, source,
+    gpu, source,
 };
 use std::path::Path;
 
@@ -76,13 +76,16 @@ fn bounds_checked_writes_and_reset_after_error() {
 #[test]
 #[ignore = "requires NVIDIA GPU and NVRTC"]
 fn cuda_state_is_retained_and_reset_without_host_uploads() {
+    gpu_state_retention(gpu::Backend::Cuda);
+}
+fn gpu_state_retention(backend: gpu::Backend) {
     let p = source::parse(COUNTER).unwrap();
-    let runtime = cuda::Runtime::new(0).unwrap();
+    let runtime = gpu::Runtime::new(backend, 0).unwrap();
     runtime.set_graph_replay(true);
-    let exe = cuda::compile_with_runtime(
+    let exe = gpu::compile_with_runtime(
         &p.graph,
         p.root,
-        Path::new(".cache/pup/state-tests/cuda"),
+        &std::path::PathBuf::from(format!(".cache/pup/state-tests/{}", backend.tag())),
         &runtime,
     )
     .unwrap();
@@ -109,11 +112,11 @@ fn cuda_state_is_retained_and_reset_without_host_uploads() {
     assert_eq!(runtime.execution_stats().graph_builds, 1);
     let p = source::parse(ROWS).unwrap();
     // Independent runtime isolates different state declarations.
-    let exe = cuda::compile(
+    let exe = gpu::compile_with_runtime(
         &p.graph,
         p.root,
-        Path::new(".cache/pup/state-tests/cuda"),
-        0,
+        &std::path::PathBuf::from(format!(".cache/pup/state-tests/{}", backend.tag())),
+        &gpu::Runtime::new(backend, 0).unwrap(),
     )
     .unwrap();
     let out = exe
@@ -121,11 +124,11 @@ fn cuda_state_is_retained_and_reset_without_host_uploads() {
         .unwrap();
     assert_eq!(out[0].f32().unwrap(), &[0., 0., 0., 0., 3., 4., 0., 0.]);
     let p=source::parse("s = state(\"x\", f32, [3])\nw = store(index(s,cast(arange(3),i32)),cast(stack(1,2,3),f32))\na = after(s,w)\nc = store(index(a,cast(stack(1,2,0),i32)),reshape(a + 1.0,[3]))\noutput after(a,c)").unwrap();
-    let exe = cuda::compile(
+    let exe = gpu::compile_with_runtime(
         &p.graph,
         p.root,
-        Path::new(".cache/pup/state-tests/cuda"),
-        0,
+        &std::path::PathBuf::from(format!(".cache/pup/state-tests/{}", backend.tag())),
+        &gpu::Runtime::new(backend, 0).unwrap(),
     )
     .unwrap();
     assert_eq!(exe.run(&[]).unwrap()[0].f32().unwrap(), &[4., 2., 3.]);
@@ -180,4 +183,10 @@ fn retained_state_survives_input_shape_specializations() {
             expected
         );
     }
+}
+
+#[test]
+#[ignore = "requires AMD GPU and HIPRTC"]
+fn hip_state_is_retained_and_reset_with_graph_and_direct_launches() {
+    gpu_state_retention(gpu::Backend::Hip);
 }

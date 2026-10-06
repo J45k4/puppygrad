@@ -2,6 +2,14 @@ use serde_json::json;
 use std::{fs, process::Command};
 #[test]
 fn generic_harness_trains_scalar_regression_from_csv_without_mnist() {
+    scalar_regression("cpu");
+}
+#[test]
+#[ignore = "requires AMD GPU and HIPRTC"]
+fn hip_harness_trains_scalar_regression_and_writes_checkpoints() {
+    scalar_regression("hip:0");
+}
+fn scalar_regression(device: &str) {
     let dir = std::env::temp_dir().join(format!(
         "pup-training-{}-{}",
         std::process::id(),
@@ -43,8 +51,10 @@ output updated, loss
         .args([
             "train",
             "regression.pup",
+            "--device",
+            device,
             "--cpu-target",
-            "native",
+            if device == "cpu" { "native" } else { "generic" },
             "--epochs",
             "15",
             "--learning-rate",
@@ -65,12 +75,19 @@ output updated, loss
     assert!(report["final_test"]["loss"].as_f64().unwrap() < 0.001);
     assert_eq!(report["profile"]["invocations"], 30); // includes padded final batch every epoch
     assert!(report["final_test"]["accuracy"].is_null());
-    assert_eq!(report["build"]["cpu_target"], "native");
-    assert!(report["build"]["flags"]
-        .as_array()
-        .unwrap()
-        .contains(&json!("-march=native")));
-    assert!(report["build"]["native_fingerprint"].is_string());
+    if device == "cpu" {
+        assert_eq!(report["build"]["cpu_target"], "native");
+        assert!(report["build"]["flags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("-march=native")));
+        assert!(report["build"]["native_fingerprint"].is_string());
+    } else {
+        assert_eq!(report["build"]["backend"], "hip");
+        assert_eq!(report["profile"]["device_profiling"], false);
+        assert!(report["profile"]["host_call_median_ms"].as_f64().unwrap() > 0.);
+        assert!(dir.join("result/program.hip").exists());
+    }
     let loaded =
         puppygrad::runtime::data::load(&dir.join("result/state.safetensors"), &Default::default())
             .unwrap();

@@ -5,7 +5,8 @@ use super::{
     profile::Profile,
 };
 use crate::compiler::{
-    cpu::{self, Executable, Tensor},
+    cpu::{self, Tensor},
+    device::{self, Device, Executable},
     pop::{DType, Op},
     source::{self, Context, TensorSpec},
 };
@@ -29,6 +30,9 @@ pub struct Options {
     pub epochs: usize,
     #[arg(long, default_value_t = 1)]
     pub threads: usize,
+    /// Execution device: cpu, cuda:N or hip:N.
+    #[arg(long, default_value = "cpu")]
+    pub device: String,
     /// CPU instruction target for generated C.
     #[arg(long, value_enum, default_value_t = cpu::CpuTarget::Generic)]
     pub cpu_target: cpu::CpuTarget,
@@ -476,7 +480,8 @@ pub fn run(options: Options) -> Result<()> {
     {
         return Err("epochs, threads and learning-rate must be positive".into());
     }
-    options.cpu_target.validate()?;
+    let device = Device::parse(&options.device)?;
+    device.validate_target(options.cpu_target)?;
     let config_path = options
         .config
         .clone()
@@ -499,15 +504,15 @@ pub fn run(options: Options) -> Result<()> {
             }
         }
     }
-    let exe = cpu::compile_profiled_with_options(
+    let exe = device::compile_profiled(
         &program,
-        Path::new(".cache/pup/cpu"),
+        device,
         &cpu::BuildOptions {
             cpu_target: options.cpu_target,
         },
     )?;
     let build_seconds = start.elapsed().as_secs_f64();
-    let metadata = exe.profile_metadata.as_ref().unwrap();
+    let metadata = exe.metadata();
     let output = options.output_dir.clone().unwrap_or_else(|| {
         PathBuf::from(format!(
             ".cache/train/run-{}",
@@ -525,9 +530,10 @@ pub fn run(options: Options) -> Result<()> {
     let mut rng = Rng::new(options.seed);
     let count = train.values().next().unwrap().rows()?;
     println!(
-        "{count} training / {} test rows; {} C kernels; {} workspace bytes",
+        "{count} training / {} test rows; {} {} kernels; {} workspace bytes",
         test.values().next().unwrap().rows()?,
-        metadata["kernels"].as_array().unwrap().len(),
+        exe.kernel_count(),
+        device.label(),
         metadata["workspace_bytes"]
     );
     let initial = evaluate(&exe, &test, &state, &config, &bound, options.threads)?;
@@ -541,7 +547,10 @@ pub fn run(options: Options) -> Result<()> {
     for _ in 0..3 {
         exe.run_profiled(&warm, options.threads)?;
     }
-    let mut profile = Profile::new(metadata);
+    let mut profile = matches!(exe, Executable::Cpu(_)).then(|| Profile::new(&metadata));
+    let mut host_call_total_ms = 0.;
+    let mut training_invocations = 0;
+    let mut host_call_ms = Vec::new();
     let mut history = Vec::new();
     let mut indices: Vec<_> = (0..count).collect();
     for epoch in 1..=options.epochs {
@@ -552,19 +561,21 @@ pub fn run(options: Options) -> Result<()> {
         for rows in indices.chunks(config.batch_size) {
             let inputs = batch(&train, rows, &state, &config, options.learning_rate)?;
             let call_start = Instant::now();
-            let result = exe.run_profiled(&inputs, options.threads)?;
-            profile.record(&result.counters, call_start.elapsed());
-            let value = result.outputs[bound.loss].f32()?[0];
+            let (outputs, counters) = exe.run_profiled(&inputs, options.threads)?;
+            let elapsed = call_start.elapsed();
+            host_call_total_ms += elapsed.as_secs_f64() * 1000.;
+            host_call_ms.push(elapsed.as_secs_f64() * 1000.);
+            training_invocations += 1;
+            if let (Some(profile), Some(counters)) = (&mut profile, counters) {
+                profile.record(&counters, elapsed);
+            }
+            let value = outputs[bound.loss].f32()?[0];
             if !value.is_finite() {
                 return Err("non-finite training loss".into());
             }
             loss += value as f64 * rows.len() as f64;
-            correct += score(&result.outputs, &train, rows, &config, &bound, &mut [])?;
-            state = bound
-                .outputs
-                .iter()
-                .map(|&i| result.outputs[i].clone())
-                .collect();
+            correct += score(&outputs, &train, rows, &config, &bound, &mut [])?;
+            state = bound.outputs.iter().map(|&i| outputs[i].clone()).collect();
         }
         let seconds = start.elapsed().as_secs_f64();
         let accuracy = bound.prediction.map(|_| correct as f64 / count as f64);
@@ -580,25 +591,45 @@ pub fn run(options: Options) -> Result<()> {
         write_json(&output.join("epochs.json"), &json!(history))?;
     }
     let final_test = evaluate(&exe, &test, &state, &config, &bound, options.threads)?;
-    let metrics = profile.report();
-    let mut build = serde_json::to_value(&exe.build_info)?;
-    build["cache_hit"] = json!(exe.cache_hit);
+    host_call_ms.sort_by(f64::total_cmp);
+    let percentile = |p: f64| {
+        let index = p * (host_call_ms.len() - 1) as f64;
+        let (lo, hi) = (index.floor() as usize, index.ceil() as usize);
+        host_call_ms[lo] + (host_call_ms[hi] - host_call_ms[lo]) * (index - lo as f64)
+    };
+    let metrics = profile.map_or_else(|| json!({"device_profiling":false,"invocations":training_invocations,"host_call_total_ms":host_call_total_ms,"host_call_median_ms":percentile(0.5),"host_call_p95_ms":percentile(0.95),"kernel_count":exe.kernel_count(),"kernels":[]}), |p|p.report());
+    let mut build = exe.build_info();
     build["parse_compile_load_seconds"] = json!(build_seconds);
-    build["c_source"] = json!(exe.source_path);
-    build["c_source_bytes"] = json!(fs::metadata(&exe.source_path)?.len());
-    let report = json!({"runtime":"generic Rust training host; generated C compute","contract":config,"source":options.source,"epochs":options.epochs,
+    build["source"] = json!(exe.source_path());
+    build["source_bytes"] = json!(fs::metadata(exe.source_path())?.len());
+    if device == Device::Cpu {
+        build["c_source"] = build["source"].clone();
+        build["c_source_bytes"] = build["source_bytes"].clone();
+    }
+    let mut notes=vec![
+        "Training measurements exclude dataset loading, compilation, evaluation and three warmups. Partial batches are zero-padded with a valid-row mask.",
+        "Workspace is the generated tensor arena, excluding caller buffers, host data and thread stacks.",
+        "Evaluation runs the same training graph with learning_rate=0, discards updated state and includes backward work; no inference timing is reported."
+    ];
+    if device == Device::Cpu {
+        notes.extend(["Packing/compute are nested inside kernel elapsed; do not add them again.","Instrumentation overhead is included; host-call timing includes output allocation and FFI."]);
+    } else {
+        notes.push("GPU timings measure synchronized host calls including input uploads and output downloads. Device event/kernel profiling is unavailable; kernel counters are omitted. Updated parameter outputs return to the host and upload on the next batch.");
+    }
+    let report = json!({"runtime":format!("generic Rust training host; generated {} compute",device.label()),"device":options.device,"contract":config,"source":options.source,"epochs":options.epochs,
         "learning_rate":options.learning_rate,"seed":options.seed,"rng":"xorshift64 + Box-Muller","threads":options.threads,"debug_build":cfg!(debug_assertions),
         "dataset_load_seconds":load_seconds,"input_bindings":bound.context.tensors.iter().map(|(name,spec)|json!({"name":name,"slot":spec.slot,"dtype":spec.dtype,"shape":spec.shape})).collect::<Vec<_>>(),
         "cpu":fs::read_to_string("/proc/cpuinfo").ok().and_then(|s|s.lines().find(|l|l.starts_with("model name")).map(str::to_owned)),
         "build":build,
         "initial_test":initial,"final_test":final_test,"history":history,"profile":metrics,
-        "notes":["Training counters exclude dataset loading, compilation, evaluation and three warmups. Partial batches are zero-padded with a valid-row mask.",
-        "Packing/compute are nested inside kernel elapsed; do not add them again.","Workspace is the generated tensor arena, excluding caller buffers, host data and thread stacks.",
-        "Instrumentation overhead is included; host-call timing includes output allocation and FFI.","Evaluation runs the same training graph with learning_rate=0, discards updated state and includes backward work; no inference timing is reported."]});
+        "notes":notes});
     write_json(&output.join("metrics.json"), &report)?;
-    write_json(&output.join("compiler-metadata.json"), metadata)?;
+    write_json(&output.join("compiler-metadata.json"), &metadata)?;
     fs::write(output.join("program.pup"), source_text)?;
-    fs::copy(&exe.source_path, output.join("program.c"))?;
+    fs::copy(
+        exe.source_path(),
+        output.join(format!("program.{}", device.source_extension())),
+    )?;
     write_json(
         &output.join("program.train.json"),
         &serde_json::to_value(&config)?,

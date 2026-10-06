@@ -39,9 +39,10 @@ cargo run --release -- llm ./model.so \
   means at most N executing threads, capped by available output tiles. No Rust
   GEMM callback or Rayon pool participates in generated computation.
 - `--device` is passed to the provider. The `.pup` provider supports CPU/C and
-  `cuda:<index>` (or `cuda` for index 0). The initial [CUDA backend](cuda-backend.md)
+  `cuda:<index>` (or `cuda` for index 0) and `hip:<index>` (or `hip`). The initial [CUDA backend](cuda-backend.md)
   requires an NVIDIA driver and NVRTC at execution time. `--threads` controls CPU
-  execution only; nondefault `--cpu-target` settings are rejected for CUDA.
+  execution only; nondefault `--cpu-target` settings are rejected for GPU execution.
+  The [HIP backend](hip-backend.md) uses HIPRTC and the AMD HIP runtime with the same model graph and retained-state contract.
 - `--cpu-target generic|native|avx2` selects the C compiler's instruction target
   for `.pup` graphs. The default is `generic`; `native` enables this host's CPU
   features and `avx2` enables AVX2 on supporting x86 hosts. The same option is
@@ -125,7 +126,7 @@ silently. All ABI sizes use the host architecture; libraries must match the host
 ## Current .pup integration
 
 `src/models/pup_llm.rs` adapts current `.pup` graphs to this same function table. It
-loads a GPT-2 or Qwen3 safetensors checkpoint, compiles the model's graph to C or CUDA C++, and
+loads a GPT-2 or Qwen3 safetensors checkpoint, compiles the model's graph to C, CUDA C++ or HIP C++, and
 retains weights and compiled shape specializations until `free_model`. CUDA shape
 variants share one runtime: weights remain resident, scratch capacity is reused,
 and each subsequent forward uploads only fresh token IDs. `free_model` releases

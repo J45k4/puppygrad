@@ -2,7 +2,7 @@
 
 The generic image host accepts a prompt and copies a completed RGB8 image from a
 provider. The built-in provider runs Stable Diffusion 1.x through
-[`examples/image.pup`](../examples/image.pup), compiled to self-contained C.
+[`examples/image.pup`](../examples/image.pup), compiled to self-contained C or generated CUDA/HIP kernels.
 
 ```sh
 cargo build --release
@@ -23,7 +23,7 @@ The default size is 512×512, default guidance is 7.5, and default steps are 20.
 The model uses deterministic DDIM, even when its distributed scheduler config
 specifies PNDM. `--negative-prompt` controls the unconditional text conditioning.
 
-The current device is `cpu`. `--cpu-target generic` is the portable default;
+The default device is `cpu`; `cuda:N` and `hip:N` select GPU execution. `--cpu-target generic` is the portable default;
 `native` allows the host's vector instructions. Generated C, shared libraries,
 and compiler manifests are cached under the ignored `.cache/pup/cpu/` directory.
 The command reports each stage's kernel count, arena size, C source path, and
@@ -55,7 +55,7 @@ Supported: SD1 text-to-image, batch 1, CLIP's 77-token context, epsilon predicti
 leading DDIM timesteps, and packed RGB8 output. Dimensions must be divisible by
 64 for the SD1.5 checkpoint. The host caps output at one megapixel; the compiler's
 2 GiB workspace limit can reject large attention graphs before that cap. SDXL,
-ControlNet, LoRA, inpainting, image-to-image, and GPU execution are not implemented
+ControlNet, LoRA, inpainting, and image-to-image are not implemented
 in this provider. Forward convolution is supported; its backward pass still
 requires overlapping scatter-add support.
 
@@ -113,3 +113,12 @@ It compares compiled CLIP, U-Net at two timesteps, and VAE outputs against the
 existing native numerical reference. Normal tests independently check strided
 convolution, padding, view coordinates, normalization, sine gradients, buffer
 ownership, callbacks, malformed metadata, and a real C shared-library provider.
+
+## GPU stages
+
+The built-in `.pup` provider accepts `--device hip:0` and `--device cuda:0`.
+CLIP, UNet, DDIM and VAE stages compile through the selected GPU backend and
+retain their weights in independent stage runtimes. Intermediate results return
+through host tensors. CPU remains the default; `--cpu-target` applies only to
+CPU execution. The [HIP guide](hip-backend.md) documents setup and the current
+hardware verification limits.

@@ -146,7 +146,7 @@ enum Command {
         /// Write C to this file; omit or use - for stdout.
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
-        /// Source backend: cpu or cuda.
+        /// Source backend: cpu, cuda or hip.
         #[arg(long, value_enum, default_value_t = EmitBackend::Cpu)]
         backend: EmitBackend,
         /// Checkpoint metadata directory (defaults to models/gpt2 when needed).
@@ -1137,6 +1137,7 @@ enum AutoTuneCommand {
 enum EmitBackend {
     Cpu,
     Cuda,
+    Hip,
 }
 
 fn emit_c_source(
@@ -1192,6 +1193,12 @@ fn emit_c_source(
                 return Err("CUDA profiling emission is not implemented yet".into());
             }
             puppygrad::compiler::cuda::emit(&program.graph, program.root)?
+        }
+        EmitBackend::Hip => {
+            if profile {
+                return Err("HIP profiling emission is not implemented yet".into());
+            }
+            puppygrad::compiler::hip::emit(&program.graph, program.root)?
         }
         EmitBackend::Cpu if profile => cpu::emit_profiled(&program)?,
         EmitBackend::Cpu => cpu::emit(&program.graph, program.root)?,

@@ -6,7 +6,10 @@
 pub mod autodiff;
 pub mod cpu;
 pub mod cuda;
+pub mod device;
 mod expression;
+pub mod gpu;
+pub mod hip;
 pub mod pop;
 pub mod rewrite;
 pub mod source;
