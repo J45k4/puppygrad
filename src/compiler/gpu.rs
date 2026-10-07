@@ -166,7 +166,7 @@ pub struct MemoryPlan {
     pub workspace_bytes: usize,
 }
 impl MemoryPlan {
-    fn from_lowered(x: &Lowered) -> Result<Self> {
+    pub(crate) fn from_lowered(x: &Lowered) -> Result<Self> {
         let parameters = x
             .inputs
             .iter()
@@ -292,6 +292,8 @@ struct Context {
     driver: Driver,
     handle: Handle,
     device: c_int,
+    memory_limit: Cell<Option<usize>>,
+    allocated_bytes: Cell<usize>,
 }
 impl Context {
     fn new(backend: Backend, index: usize) -> Result<(Self, String, String)> {
@@ -324,6 +326,8 @@ impl Context {
                 driver,
                 handle,
                 device,
+                memory_limit: Cell::new(None),
+                allocated_bytes: Cell::new(0),
             },
             unsafe { CStr::from_ptr(name.as_ptr()) }
                 .to_string_lossy()
@@ -346,16 +350,24 @@ struct Memory {
 }
 impl Memory {
     fn new(context: &Rc<Context>, bytes: usize) -> Result<Self> {
+        let bytes = bytes.max(1);
+        let total = context
+            .allocated_bytes
+            .get()
+            .checked_add(bytes)
+            .ok_or_else(|| Error("GPU allocation size overflow".into()))?;
+        check_buffer_limit(total, context.memory_limit.get())?;
         let driver = &context.driver;
         let mut ptr = 0;
         driver.check(
             unsafe { driver.alloc(&mut ptr, bytes.max(1)) },
             "allocate buffer",
         )?;
+        context.allocated_bytes.set(total);
         Ok(Self {
             context: context.clone(),
             ptr,
-            bytes: bytes.max(1),
+            bytes,
         })
     }
 }
@@ -367,7 +379,22 @@ impl Drop for Memory {
                 self.context.driver.free(self.ptr);
             }
         }
+        self.context.allocated_bytes.set(
+            self.context
+                .allocated_bytes
+                .get()
+                .saturating_sub(self.bytes),
+        );
     }
+}
+
+fn check_buffer_limit(bytes: usize, limit: Option<usize>) -> Result<()> {
+    if let Some(limit) = limit.filter(|limit| bytes > *limit) {
+        return Err(Error(format!(
+            "GPU model buffers need {bytes} bytes, exceeding --max-memory {limit} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Shared device residency for related executables (for example static shapes).
@@ -417,6 +444,16 @@ pub struct ExecutionStats {
     pub direct_kernel_launches: u64,
 }
 impl Runtime {
+    /// Limit this runtime's buffers, including temporary overlap during growth.
+    /// Driver modules and other processes are outside this model buffer budget.
+    pub fn set_memory_limit(&self, limit: Option<usize>) -> Result<()> {
+        if limit == Some(0) {
+            return Err(Error("memory limit must be positive".into()));
+        }
+        check_buffer_limit(self.0.context.allocated_bytes.get(), limit)?;
+        self.0.context.memory_limit.set(limit);
+        Ok(())
+    }
     pub fn backend(&self) -> Backend {
         self.0.context.driver.backend()
     }
@@ -481,6 +518,10 @@ impl Runtime {
                 .saturating_add(bytes.saturating_sub(b.outputs.get(slot).map_or(0, |m| m.bytes)));
         }
         extra = extra.saturating_add(overlap);
+        check_buffer_limit(
+            self.0.context.allocated_bytes.get().saturating_add(extra),
+            self.0.context.memory_limit.get(),
+        )?;
         if extra.saturating_add(reserve_bytes) > info.free_bytes {
             return Err(Error(format!("insufficient free GPU memory: need {extra} additional bytes plus {reserve_bytes} reserved, available {}", info.free_bytes)));
         }
@@ -509,6 +550,49 @@ impl Runtime {
             )?;
         }
         d.check(unsafe { d.synchronize() }, "synchronize state reset")
+    }
+    pub(crate) fn grow_state(
+        &self,
+        slot: usize,
+        dtype: DType,
+        old: &[usize],
+        new: &[usize],
+    ) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let context = &self.0.context;
+        let d = &context.driver;
+        let _current = d.enter(context.handle)?;
+        let mut buffers = self
+            .0
+            .buffers
+            .try_borrow_mut()
+            .map_err(|_| Error("GPU state is executing".into()))?;
+        let Some((dt, n, memory)) = buffers.states.get(&slot) else {
+            return Ok(());
+        };
+        if *dt != dtype || *n != numel(old)? {
+            return Err(Error("retained state metadata changed".into()));
+        }
+        let mut original = vec![0u8; n * dtype_bytes(dtype)];
+        if !original.is_empty() {
+            d.check(
+                unsafe { d.download(original.as_mut_ptr().cast(), memory.ptr, original.len()) },
+                "read state for growth",
+            )?;
+        }
+        let grown = super::state_resize::grow(&original, old, new, dtype_bytes(dtype))?;
+        let memory = Memory::new(context, grown.len())?;
+        if !grown.is_empty() {
+            d.check(
+                unsafe { d.upload(memory.ptr, grown.as_ptr().cast(), grown.len()) },
+                "preserve grown state",
+            )?;
+        }
+        buffers.states.insert(slot, (dtype, numel(new)?, memory));
+        buffers.allocations += 1;
+        Ok(())
     }
     pub fn new(backend: Backend, device: usize) -> Result<Self> {
         let (context, device_name, architecture) = Context::new(backend, device)?;
@@ -598,6 +682,16 @@ pub fn compile_with_runtime(
 ) -> Result<Executable> {
     let backend = runtime.backend();
     let lowered = super::cpu::cuda_lower::emit_backend(g, root, backend)?;
+    compile_lowered_with_runtime(lowered, cache, runtime)
+}
+
+/// Consume the lowering already used to validate a request's memory budget.
+pub(crate) fn compile_lowered_with_runtime(
+    lowered: Lowered,
+    cache: &Path,
+    runtime: &Runtime,
+) -> Result<Executable> {
+    let backend = runtime.backend();
     let context = &runtime.0.context;
     let architecture = &runtime.0.architecture;
     let nvrtc = Rtc::load(backend)?;
@@ -937,6 +1031,9 @@ impl Rtc {
                     "libnvrtc.so.13",
                     "/opt/cuda/lib64/libnvrtc.so",
                     "/usr/local/cuda/lib64/libnvrtc.so",
+                    ".cache/cuda-toolchain/nvidia/cuda_nvrtc/lib/libnvrtc.so",
+                    ".cache/cuda-toolchain/nvidia/cuda_nvrtc/lib/libnvrtc.so.12",
+                    ".cache/cuda-toolchain/nvidia/cuda_nvrtc/lib/libnvrtc.so.13",
                 ],
                 "NVRTC",
             )?,

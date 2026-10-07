@@ -23,6 +23,40 @@ use std::{
 #[derive(Clone, Default)]
 pub struct Runtime(Rc<RefCell<HashMap<usize, (DType, usize, Vec<u32>)>>>);
 impl Runtime {
+    pub(crate) fn grow_state(
+        &self,
+        slot: usize,
+        dtype: DType,
+        old: &[usize],
+        new: &[usize],
+    ) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let mut buffers = self
+            .0
+            .try_borrow_mut()
+            .map_err(|_| Error("CPU state is executing".into()))?;
+        let Some(entry) = buffers.get_mut(&slot) else {
+            return Ok(());
+        };
+        if entry.0 != dtype || entry.1 != numel(old)? {
+            return Err(Error("retained state metadata changed".into()));
+        }
+        let bytes = entry.1 * super::gpu::dtype_bytes(dtype);
+        let original = unsafe { std::slice::from_raw_parts(entry.2.as_ptr().cast::<u8>(), bytes) };
+        let grown = super::state_resize::grow(original, old, new, super::gpu::dtype_bytes(dtype))?;
+        let mut words = vec![0u32; grown.len().div_ceil(4).max(1)];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                grown.as_ptr(),
+                words.as_mut_ptr().cast::<u8>(),
+                grown.len(),
+            );
+        }
+        *entry = (dtype, numel(new)?, words);
+        Ok(())
+    }
     pub fn reset_state(&self) -> Result<()> {
         let mut buffers = self
             .0

@@ -11,6 +11,116 @@ settings and chooses whether to register a token callback.
 
 ## Command line
 
+Running `puppygrad` with no arguments in a terminal opens the interactive UI
+(`cargo run --release` from a checkout). Explicit `puppygrad tui` accepts
+`--device`, `--cache-dir`, and `--catalog`. Without a terminal, the no-argument
+command prints help; existing command-line operations remain available for scripts.
+
+Type `/model` to browse GPT-2 small and Qwen3-0.6B. The list distinguishes downloaded,
+partial, and missing checkpoints. Use arrow keys to choose an entry; Enter downloads
+missing files or selects a downloaded model. `d` downloads the highlighted model.
+Downloads run in the background with file/byte progress, and completed files are
+published atomically. `/download [id]` also downloads assets directly.
+
+Enter a prompt to stream its response. The selected model stays loaded between
+requests, while each prompt is currently independent (conversation history is not
+added automatically). Changing the model or device frees the previous provider
+before loading the next one. `/device cpu|cuda:0|hip:0`, `/temperature N`, and
+`/tokens auto|N` adjust execution; `/help` lists commands. Esc stops an operation between
+download progress updates or generation callbacks, and `/quit` or Ctrl-C without
+a composer selection exits
+after the current operation returns. The terminal is restored on normal exit and
+errors. First-response time and overall tokens/sec include model loading and cold
+compilation where applicable.
+
+Enter sends the prompt; Shift+Enter inserts a newline. The composer grows up to
+six lines and scrolls to keep the cursor visible. Pasting preserves line breaks.
+Modified keys use the terminal's enhanced keyboard protocol; Ctrl+J also inserts
+a newline on terminals that cannot distinguish Shift+Enter.
+Arrow keys move the composer cursor, including between wrapped lines. Home/End
+move to the current displayed line's edges; Ctrl+Home/End move to the whole
+prompt's start/end. Typing, pasting, Backspace and Delete edit at the cursor.
+Shift+arrows extend a selection, and Ctrl+A selects the entire prompt. Ctrl+Left
+stops at word boundaries, including the previous word's end when starting at a
+word's start; Ctrl+Right moves to a word's end. Adding Shift selects to that point.
+Backspace/Delete removes selected text, and typing or pasting replaces it.
+Ctrl+C copies selected text, Ctrl+X cuts it, and Ctrl+V pastes from the desktop
+clipboard. Esc cancels a selection when idle. Clipboard shortcuts use `wl-copy`
+and `wl-paste` on Wayland, `xclip` on X11, or `pbcopy`/`pbpaste` on macOS. Terminal
+paste with Ctrl+Shift+V also works, including without these clipboard tools.
+
+The loaded model's tokenizer is also reused between prompts.
+When the TUI opens, it warms the selected downloaded model in the background:
+tokenizer and weight loading, kernel compilation, and small decode/prefill runs.
+Warmup output is discarded. You can type immediately and submit a prompt to wait
+behind warmup. Selecting another model or device starts its warmup as well; no
+assets are downloaded automatically. Esc stops warmup. `--no-warmup` keeps model
+loading deferred until the first prompt. Warmup uses the same live-memory checks
+and `--max-memory` limit as normal inference. Optional prefill warmup is best-effort;
+a failed larger dummy shape does not discard a working decode provider.
+Retained TUI models automatically reuse 1-, 8-, and 128-token prefill programs.
+A 17-token prompt runs as 8 + 8 + 1; tails consume only real tokens, with no
+padding or extra position advances. Short requests reuse the warmed 8-token and
+decode programs. Longer requests can compile the 128-token program once per
+context capacity; cache growth may also require new programs. Allocation plans
+are cached per execution shape, so another prompt length using the same shapes
+does not rebuild the graph. Explicit provider prefill chunks keep their previous
+behavior; models without retained state still use complete-prefix execution.
+
+Responses have no default output-token cap in the TUI. They continue until EOS,
+Esc, or the model's context or device-memory limit. `/tokens N` sets an explicit
+response cap; `/tokens auto` removes it. The footer distinguishes token, context,
+and memory exhaustion from normal completion. Partial text remains visible when
+available memory prevents further growth.
+
+The UI initially plans a 512-token bucket for the prompt, reducing optional
+headroom and automatic prefill chunks if necessary. Generation grows buffers on
+demand without reloading weights or recomputing earlier tokens. Retained tensor
+coordinates and contents survive growth; model source still owns the cache layout
+and position updates. GPU growth currently stages one retained tensor through host
+memory at a time, so crossing a capacity boundary can briefly pause streaming.
+The next request resets retained contents but reuses the grown capacity.
+
+Providers check live GPU memory before requests and allocation growth. The
+`--max-memory` buffer limit includes replacement overlap, and initial planning
+reserves space for modules and other runtime overhead. The complete prompt must
+fit; optional output stops gracefully when the next context allocation cannot fit.
+Reducing context cannot make oversized model weights fit.
+It does not run the maximum-context search before a short prompt;
+`llm capacity` remains the explicit way to probe that limit. Request allocation
+planning retains the lowered kernels for compilation instead of lowering twice.
+Checkpoint loading reads and converts one tensor at a time to avoid keeping a
+second full checkpoint in host memory.
+
+Set `PUPPYGRAD_STARTUP_PROFILE=1` to record checkpoint loading, context planning,
+request planning and per-shape compilation times in `tui.log`. Release builds are
+still recommended; ordinary development builds now optimize Puppygrad's graph
+and checkpoint code as well.
+
+`puppygrad --max-memory 10` opens the UI with a 10 GiB GPU model-buffer budget.
+The global flag also works with `tui`, `run`, `llm run` and `llm capacity`, before
+or after the command. Bare numbers are GiB; explicit sizes such as `2.5GiB`,
+`512MiB` and `2GB` are accepted. The cap covers this provider's weights, retained
+state, scratch and output buffers, including temporary overlap during resizing.
+Physical free memory remains an additional constraint. Driver modules, other
+GPU applications and host RAM are outside the cap; the capacity planner's
+driver reserve is separate. CPU providers and external shared libraries currently
+reject this flag rather than silently ignoring it.
+
+Checkpoint metadata lives beside its program in
+[llm.model.json](../examples/llm.model.json) and
+[qwen3-0.6b.model.json](../examples/qwen3-0.6b.model.json), with repository, pinned
+revision, and required filenames. The runtime builds Hugging Face URLs; `.pup`
+contains only the computation. Built-in manifests and programs are embedded in the
+binary, so the UI also works outside the checkout. `--catalog DIR` reads custom
+`*.model.json` files and their relative `.pup` programs (for example `--catalog examples`).
+
+Existing `models/<id>` directories are reused when present. Otherwise checkpoints
+live under `$XDG_CACHE_HOME/puppygrad/models/<id>/<revision>`, falling back to
+`~/.cache/puppygrad`. Programs, compiled kernels, and `tui.log` diagnostics use the
+same UI cache root; `--cache-dir` overrides it. An existing local directory is
+treated as caller-provided assets; its revision is not independently verified.
+
 `llm MODEL`, `llm run MODEL`, and `run MODEL` execute the same runtime.
 `llm benchmark [MODEL]` measures CPU thread scaling:
 
@@ -99,9 +209,11 @@ There are no hidden background workers left running when `infer` returns.
   same sequence for `read_output`. The callback has no ownership of model memory.
 - `on_done` is optional for native callers; the Rust wrapper always registers it.
   With valid ABI pointers it fires exactly once, after all token callbacks, including
-  on validation/execution failure. Reasons are limit reached, EOS, or error.
+  on validation/execution failure. Reasons are token limit (0), EOS (1), error (2),
+  model context exhausted (3), or device-memory budget exhausted (4).
 - Completion with an error also requires a nonzero `infer` return status. Successful
-  completion requires output ending in EOS or reaching the requested token limit.
+  completion requires EOS, the requested token limit, the model context limit, or
+  a memory stop retaining the partial output. ABI structure layouts are unchanged.
 - `user` is an opaque caller pointer, passed through unchanged. It and all borrowed
   arguments must remain valid until `infer` returns. Callbacks must not unwind across
   the C ABI. Rust callback panics are caught and reported by the wrapper.
@@ -118,6 +230,10 @@ The Rust wrapper checks callback ordering, completion, token IDs, token limits, 
 streamed/retained output agreement. It keeps the shared library loaded until
 `free_model` returns. A bad native pointer or memory overwrite cannot be repaired by
 these protocol checks; providers must honor the C memory contract.
+
+The built-in .pup provider cooperatively stops after a Rust host token callback
+fails (including TUI cancellation). Foreign providers still own their execution
+loop; the native void callback has no cancellation return value.
 
 Asynchronous completion, cancellation, reset, and per-request handles are not part
 of v1. They require an explicit future contract rather than changing these lifetimes

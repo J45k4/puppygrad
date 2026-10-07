@@ -136,6 +136,13 @@ fn device_plan_matches_actual_allocations_and_checks_live_memory() {
     assert!(free.free_bytes > 0 && free.free_bytes <= free.total_bytes);
     rt.check_memory(&plan, 0).unwrap();
     assert!(rt.check_memory(&plan, free.total_bytes).is_err());
+    rt.set_memory_limit(Some(plan.total_bytes() - 1)).unwrap();
+    assert!(rt
+        .check_memory(&plan, 0)
+        .unwrap_err()
+        .to_string()
+        .contains("--max-memory"));
+    rt.set_memory_limit(Some(plan.total_bytes())).unwrap();
     let e = cuda::compile_with_runtime(
         &p.graph,
         p.root,
@@ -146,4 +153,20 @@ fn device_plan_matches_actual_allocations_and_checks_live_memory() {
     e.run(&[Tensor::F32(vec![1.; 17].into())]).unwrap();
     assert_eq!(plan.total_bytes(), rt.residency_stats().resident_bytes);
     rt.check_memory(&plan, 0).unwrap();
+    assert!(rt.set_memory_limit(Some(plan.total_bytes() - 1)).is_err());
+    // Bypass the planner to prove allocations themselves enforce the cap.
+    let large = source::parse("output param(0, f32, 1024) + 1").unwrap();
+    let grow = cuda::compile_with_runtime(
+        &large.graph,
+        large.root,
+        std::path::Path::new(".cache/pup/capacity-tests"),
+        &rt,
+    )
+    .unwrap();
+    let error = grow.run(&[Tensor::F32(vec![1.; 1024].into())]).unwrap_err();
+    assert!(error.to_string().contains("--max-memory"));
+    assert!(rt.residency_stats().resident_bytes <= plan.total_bytes());
+    rt.set_memory_limit(None).unwrap();
+    let output = grow.run(&[Tensor::F32(vec![1.; 1024].into())]).unwrap();
+    assert_eq!(output[0].f32().unwrap(), &[2.; 1024]);
 }

@@ -1,6 +1,59 @@
 use std::process::Command;
 
 #[test]
+fn max_memory_is_global_validated_and_never_silently_ignored() {
+    for args in [vec!["--max-memory", "0"], vec!["--max-memory", "NaN"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("memory"));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+        .args(["--max-memory", "10"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--max-memory"));
+    let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+        .args(["check", "examples/matmul.pup", "--max-memory", "512MiB"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("currently applies"));
+    for prefix in [&["run"][..], &["llm"][..], &["llm", "run"][..]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+            .args(prefix)
+            .args(["missing.pup", "--device", "cpu", "--max-memory", "10"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("GPU model buffers"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn no_arguments_print_help_for_pipes_and_explicit_tui_requires_a_terminal() {
+    let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("tui"));
+    assert!(output.stderr.is_empty());
+    let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
+        .arg("tui")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
+}
+
+#[test]
 fn checks_pup_and_prints_primitive_graph() {
     let output = Command::new(env!("CARGO_BIN_EXE_puppygrad"))
         .args(["check", "examples/matmul.pup", "--dump-pops"])

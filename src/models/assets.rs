@@ -151,62 +151,95 @@ pub fn prepare_huggingface_model_dir(
     check_required_files(model_dir, &filenames)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DownloadProgress<'a> {
+    pub filename: &'a str,
+    pub bytes: u64,
+    pub total: Option<u64>,
+}
+
 pub fn download_huggingface_file(
     model_id: &str,
     revision: &str,
     filename: &str,
     dst: &Path,
 ) -> Result<()> {
-    if dst.exists() {
-        return Ok(());
-    }
+    download_huggingface_file_with_progress(model_id, revision, filename, dst, &mut |progress| {
+        match progress.total {
+            Some(total) => eprintln!(
+                "download: {} {} / {} bytes",
+                progress.filename, progress.bytes, total
+            ),
+            None => eprintln!("download: {} {} bytes", progress.filename, progress.bytes),
+        }
+        Ok(())
+    })
+}
 
+/// Callbacks can return an error to cancel. Only complete files become visible at dst.
+pub fn download_huggingface_file_with_progress(
+    model_id: &str,
+    revision: &str,
+    filename: &str,
+    dst: &Path,
+    on_progress: &mut dyn FnMut(DownloadProgress<'_>) -> io::Result<()>,
+) -> Result<()> {
+    if let Ok(metadata) = fs::metadata(dst) {
+        if metadata.is_file() && metadata.len() > 0 {
+            on_progress(DownloadProgress {
+                filename,
+                bytes: metadata.len(),
+                total: Some(metadata.len()),
+            })
+            .map_err(|source| AssetError::WriteDownload {
+                path: dst.display().to_string(),
+                source,
+            })?;
+            return Ok(());
+        }
+    }
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).map_err(|source| AssetError::CreateParentDir {
             path: dst.display().to_string(),
             source,
         })?;
     }
-
-    let tmp = dst.with_extension("download");
     let url = format!("https://huggingface.co/{model_id}/resolve/{revision}/{filename}");
-    eprintln!("download: {url} -> {}", dst.display());
     let client = reqwest::blocking::Client::builder()
         .user_agent("puppygrad/0.1")
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(3600))
         .build()
         .map_err(AssetError::BuildHttpClient)?;
     let mut response = client
         .get(&url)
         .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|source| AssetError::Download {
-            url: url.clone(),
-            source,
-        })?;
-    let expected_len = response.content_length();
+        .and_then(|r| r.error_for_status())
+        .map_err(|source| AssetError::Download { url, source })?;
+    let total = response.content_length();
+    let tmp = dst.with_extension("download");
     let mut file = File::create(&tmp).map_err(|source| AssetError::CreateTempFile {
         path: tmp.display().to_string(),
         source,
     })?;
-    let bytes =
-        copy_with_progress(&mut response, &mut file, filename, expected_len).map_err(|source| {
-            AssetError::WriteDownload {
-                path: tmp.display().to_string(),
-                source,
-            }
-        })?;
+    let copied = copy_with_progress(&mut response, &mut file, filename, total, on_progress)
+        .and_then(|bytes| {
+            file.flush()?;
+            Ok(bytes)
+        });
+    drop(file);
+    if let Err(source) = copied {
+        let _ = fs::remove_file(&tmp);
+        return Err(AssetError::WriteDownload {
+            path: tmp.display().to_string(),
+            source,
+        });
+    }
     fs::rename(&tmp, dst).map_err(|source| AssetError::RenameDownload {
         from: tmp.display().to_string(),
         to: dst.display().to_string(),
         source,
     })?;
-    match expected_len {
-        Some(total) => eprintln!(
-            "download: wrote {} bytes for {} (expected {})",
-            bytes, filename, total
-        ),
-        None => eprintln!("download: wrote {} bytes for {}", bytes, filename),
-    }
     Ok(())
 }
 
@@ -215,35 +248,44 @@ fn copy_with_progress(
     writer: &mut impl Write,
     filename: &str,
     expected_len: Option<u64>,
+    on_progress: &mut dyn FnMut(DownloadProgress<'_>) -> io::Result<()>,
 ) -> io::Result<u64> {
-    const BUFFER_SIZE: usize = 1024 * 1024;
-    const REPORT_EVERY_BYTES: u64 = 64 * 1024 * 1024;
-
-    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     let mut written = 0_u64;
-    let mut next_report = REPORT_EVERY_BYTES;
-
+    let mut reported = std::time::Instant::now();
+    on_progress(DownloadProgress {
+        filename,
+        bytes: 0,
+        total: expected_len,
+    })?;
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
-            return Ok(written);
+            break;
         }
         writer.write_all(&buffer[..read])?;
         written += read as u64;
-        if written >= next_report {
-            match expected_len {
-                Some(total) => eprintln!(
-                    "download: {} {} / {} bytes ({:.1}%)",
-                    filename,
-                    written,
-                    total,
-                    (written as f64 / total.max(1) as f64) * 100.0
-                ),
-                None => eprintln!("download: {} {} bytes", filename, written),
-            }
-            next_report = written.saturating_add(REPORT_EVERY_BYTES);
+        if reported.elapsed() >= std::time::Duration::from_millis(100) {
+            on_progress(DownloadProgress {
+                filename,
+                bytes: written,
+                total: expected_len,
+            })?;
+            reported = std::time::Instant::now();
         }
     }
+    if expected_len.is_some_and(|length| length != written) || written == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "download length does not match response",
+        ));
+    }
+    on_progress(DownloadProgress {
+        filename,
+        bytes: written,
+        total: expected_len,
+    })?;
+    Ok(written)
 }
 
 fn sanitize_cache_component(value: &str) -> String {
@@ -259,6 +301,42 @@ fn sanitize_cache_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_copy_rejects_truncation_and_can_be_cancelled() {
+        let mut output = Vec::new();
+        let result = copy_with_progress(
+            &mut &b"abc"[..],
+            &mut output,
+            "weights",
+            Some(4),
+            &mut |_| Ok(()),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        let mut output = Vec::new();
+        let result = copy_with_progress(
+            &mut &b"abc"[..],
+            &mut output,
+            "weights",
+            Some(3),
+            &mut |_| Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(output.is_empty());
+        let mut progress = vec![];
+        let result = copy_with_progress(
+            &mut &b"abc"[..],
+            &mut output,
+            "weights",
+            Some(3),
+            &mut |p| {
+                progress.push(p.bytes);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap(), 3);
+        assert_eq!(progress, [0, 3]);
+    }
 
     #[test]
     fn reports_missing_required_files() {

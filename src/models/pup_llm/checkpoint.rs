@@ -4,7 +4,10 @@ use crate::compiler::{
     pop::{DType, Scalar},
     source::{Context, TensorSpec},
 };
-use std::{io::Read, path::Path};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub struct Checkpoint {
     pub context: Context,
@@ -16,19 +19,26 @@ impl Checkpoint {
         let mut context = config_context(dir)?;
         let model_type = model_type(dir)?;
         let tied = tied_embeddings(&context);
-        let bytes = std::fs::read(dir.join("model.safetensors"))?;
-        let store = safetensors::SafeTensors::deserialize(&bytes)?;
-        let mut names = store.names();
+        let (mut file, metadata, payload_start) = checkpoint_file(dir)?;
+        let tensors = metadata.tensors();
+        let mut names: Vec<_> = tensors.keys().collect();
         names.sort();
         let mut inputs = vec![Tensor::I32(Vec::new().into())];
         for name in names {
-            let tensor = store.tensor(name)?;
             let Some(key) = weight_key(name) else {
                 continue;
             };
             if tied && key == "lm_head.weight" {
                 continue;
             }
+            let info = tensors[name];
+            let (start, end) = info.data_offsets;
+            file.seek(SeekFrom::Start(payload_start + start as u64))?;
+            // Do not keep a second full checkpoint in RAM during conversion.
+            let mut bytes = vec![0; end - start];
+            file.read_exact(&mut bytes)?;
+            let tensor =
+                safetensors::tensor::TensorView::new(info.dtype, info.shape.clone(), &bytes)?;
             let values = crate::models::safetensors::tensor_data_as_f32(name, &tensor)?;
             bind_weight(&mut context, key, inputs.len(), tensor.shape())?;
             inputs.push(Tensor::F32(values.into()));
@@ -47,25 +57,7 @@ impl Checkpoint {
         }
         let mut context = config_context(dir)?;
         let tied = tied_embeddings(&context);
-        let mut file = std::fs::File::open(dir.join("model.safetensors"))?;
-        let mut size = [0; 8];
-        file.read_exact(&mut size)?;
-        let size = u64::from_le_bytes(size);
-        // Match safetensors' header limit, and reject truncated files before allocating.
-        let file_len = file.metadata()?.len();
-        if size > 100_000_000 || size > file_len.saturating_sub(8) {
-            return Err("invalid safetensors header length".into());
-        }
-        let mut header = vec![0; usize::try_from(size)?];
-        file.read_exact(&mut header)?;
-        let metadata: safetensors::tensor::Metadata = serde_json::from_slice(&header)?;
-        if size
-            .checked_add(8)
-            .and_then(|n| n.checked_add(metadata.data_len() as u64))
-            != Some(file_len)
-        {
-            return Err("safetensors payload size does not match metadata".into());
-        }
+        let (_, metadata, _) = checkpoint_file(dir)?;
         let tensors = metadata.tensors();
         let mut names: Vec<_> = tensors.keys().collect();
         names.sort();
@@ -121,6 +113,28 @@ impl Checkpoint {
         );
         Ok(())
     }
+}
+
+fn checkpoint_file(dir: &Path) -> Result<(std::fs::File, safetensors::tensor::Metadata, u64)> {
+    let mut file = std::fs::File::open(dir.join("model.safetensors"))?;
+    let mut size = [0; 8];
+    file.read_exact(&mut size)?;
+    let size = u64::from_le_bytes(size);
+    let file_len = file.metadata()?.len();
+    if size > 100_000_000 || size > file_len.saturating_sub(8) {
+        return Err("invalid safetensors header length".into());
+    }
+    let mut header = vec![0; usize::try_from(size)?];
+    file.read_exact(&mut header)?;
+    let metadata: safetensors::tensor::Metadata = serde_json::from_slice(&header)?;
+    if size
+        .checked_add(8)
+        .and_then(|n| n.checked_add(metadata.data_len() as u64))
+        != Some(file_len)
+    {
+        return Err("safetensors payload size does not match metadata".into());
+    }
+    Ok((file, metadata, size + 8))
 }
 
 fn config_context(dir: &Path) -> Result<Context> {

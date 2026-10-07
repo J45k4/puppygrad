@@ -367,7 +367,7 @@ fn cached_qwen3_cpu_matches_full_prefix_with_chunks_and_reset() {
 fn cached_qwen3_cuda_matches_full_prefix_with_chunks_and_reset() {
     cached_chunks(&Fixture::new(), Some(gpu::Backend::Cuda));
 }
-fn cached_provider(backend: Option<gpu::Backend>) {
+fn cached_provider(backend: Option<gpu::Backend>, request_sized: bool) {
     use puppygrad::runtime::llm_ffi::{Generation, Model};
     let f = Fixture::new();
     if backend.is_some() {
@@ -377,9 +377,18 @@ fn cached_provider(backend: Option<gpu::Backend>) {
         config["max_position_embeddings"] = serde_json::json!(8192);
         std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     }
-    let config=serde_json::to_vec(&serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":backend.map_or("cpu",gpu::Backend::tag),"threads":1,"prefill_chunk":2,"context_budget_mib":1,"context_reserve_mib":0})).unwrap();
-    let mut model = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &config) }.unwrap();
-    if backend.is_some() {
+    let mut config = serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":backend.map_or("cpu",gpu::Backend::tag),"threads":1,"prefill_chunk":2,"context_budget_mib":1,"context_reserve_mib":0});
+    if request_sized {
+        config["context_request"] = serde_json::json!({"capacity":16,"prompt_tokens":7});
+        if backend.is_some() {
+            config["max_memory"] = serde_json::json!(1024 * 1024);
+        }
+    }
+    let encoded = serde_json::to_vec(&config).unwrap();
+    let mut model = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &encoded) }.unwrap();
+    if request_sized {
+        assert_eq!(model.info.context_length, 16);
+    } else if backend.is_some() {
         assert!(model.info.context_length >= 8 && model.info.context_length < 8192);
         let context = Checkpoint::metadata_context(&f.dir, 1).unwrap();
         let expected = puppygrad::runtime::llm_capacity::determine_for_backend(
@@ -452,16 +461,129 @@ fn cached_provider(backend: Option<gpu::Backend>) {
         assert_eq!(output.tokens, expected);
         assert_eq!(streamed, expected);
     }
+    if request_sized && backend.is_some() {
+        drop(model);
+        config["max_memory"] = serde_json::json!(1);
+        let encoded = serde_json::to_vec(&config).unwrap();
+        let error = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &encoded) }
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("requested context") && error.contains("budget is 1"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
 fn cached_qwen3_uses_chunked_ffi_and_resets_between_inferences() {
-    cached_provider(None);
+    cached_provider(None, false);
+}
+#[test]
+fn cached_qwen3_request_context_preserves_sampling_streaming_and_reset() {
+    cached_provider(None, true);
+}
+#[test]
+fn requested_context_validates_lengths_and_keeps_model_position_limit() {
+    use puppygrad::runtime::llm_ffi::Model;
+    let f = Fixture::new();
+    for (capacity, prompt_tokens, minimum_capacity, valid) in [
+        (0, 1, None, false),
+        (16, 0, None, false),
+        (16, 17, None, false),
+        (64, 33, None, false),
+        (64, 7, None, true),
+        (64, 7, Some(33), false),
+        (64, 7, Some(6), false),
+        (16, 7, Some(17), false),
+        (64, 7, Some(32), true),
+    ] {
+        let config = serde_json::to_vec(&serde_json::json!({
+            "source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),
+            "model_dir":f.dir,"device":"cpu",
+            "context_request":{"capacity":capacity,"prompt_tokens":prompt_tokens,"minimum_capacity":minimum_capacity}
+        }))
+        .unwrap();
+        let result = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &config) };
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "capacity={capacity}, prompt={prompt_tokens}"
+        );
+        if let Ok(model) = result {
+            assert_eq!(model.info.context_length, 32);
+        }
+    }
+}
+#[test]
+#[ignore = "requires NVIDIA GPU and NVRTC"]
+fn cached_qwen3_cuda_request_context_reuses_planned_prefill_tail_and_decode() {
+    cached_provider(Some(gpu::Backend::Cuda), true);
+}
+
+#[test]
+#[ignore = "requires NVIDIA GPU and NVRTC; uses a tiny checkpoint and bounded device buffers"]
+fn cached_qwen3_cuda_shrinks_preferred_context_to_request_under_memory_pressure() {
+    use puppygrad::runtime::{
+        llm_capacity,
+        llm_ffi::{Generation, Model},
+    };
+    let f = Fixture::new();
+    let text = include_str!("../examples/qwen3_cached.pup");
+    let context = Checkpoint::metadata_context(&f.dir, 1).unwrap();
+    let budget = llm_capacity::request_plan(text, &context, 10, 7, Some(2), true)
+        .unwrap()
+        .total_bytes();
+    let larger = llm_capacity::request_plan(text, &context, 32, 7, Some(2), true)
+        .unwrap()
+        .total_bytes();
+    assert!(larger > budget && budget < 1024 * 1024);
+    let config = serde_json::to_vec(&serde_json::json!({
+        "source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),
+        "model_dir":f.dir, "device":"cuda:0",
+        "context_reserve_mib":0, "max_memory":budget,
+        "context_request":{"capacity":32,"prompt_tokens":7,"minimum_capacity":10}
+    }))
+    .unwrap();
+    let mut model = unsafe { Model::from_api(puppygrad::models::pup_llm::API, &config) }.unwrap();
+    assert_eq!(model.info.context_length, 10);
+    let prompt = [0, 1, 2, 3, 4, 5, 0];
+    let mut history = prompt.iter().map(|&t| t as usize).collect::<Vec<_>>();
+    let mut expected = vec![];
+    for _ in 0..4 {
+        let logits = f.reference(&history);
+        let token = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32;
+        expected.push(token);
+        history.push(token as usize);
+        if token == model.info.eos_token {
+            break;
+        }
+    }
+    for _ in 0..2 {
+        let output = model
+            .infer(
+                &prompt,
+                Generation {
+                    max_new_tokens: 4,
+                    temperature: 0.,
+                    seed: 42,
+                    reserved: 0,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.tokens, expected);
+    }
 }
 #[test]
 #[ignore = "requires NVIDIA GPU and NVRTC"]
 fn cached_qwen3_ffi_automatically_limits_context_and_chunks_prefill() {
-    cached_provider(Some(gpu::Backend::Cuda));
+    cached_provider(Some(gpu::Backend::Cuda), false);
 }
 
 #[test]
@@ -477,7 +599,31 @@ fn cached_qwen3_hip_matches_full_prefix_with_chunks_and_reset() {
 #[test]
 #[ignore = "requires AMD GPU and HIPRTC"]
 fn cached_qwen3_hip_ffi_limits_context_chunks_prefill_and_resets() {
-    cached_provider(Some(gpu::Backend::Hip));
+    cached_provider(Some(gpu::Backend::Hip), false);
+}
+
+#[test]
+fn checkpoint_loader_rejects_truncated_payload_and_invalid_offsets() {
+    let f = Fixture::new();
+    let path = f.dir.join("model.safetensors");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+    assert!(Checkpoint::load(&f.dir)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("payload size"));
+    assert!(Checkpoint::metadata_context(&f.dir, 1).is_err());
+    let header_size = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let mut header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + header_size]).unwrap();
+    header["model.norm.weight"]["data_offsets"] = serde_json::json!([0, 1]);
+    let new_header = serde_json::to_vec(&header).unwrap();
+    let mut bad = (new_header.len() as u64).to_le_bytes().to_vec();
+    bad.extend(new_header);
+    bad.extend(&bytes[8 + header_size..]);
+    std::fs::write(&path, bad).unwrap();
+    assert!(Checkpoint::load(&f.dir).is_err());
+    assert!(Checkpoint::metadata_context(&f.dir, 1).is_err());
 }
 #[test]
 #[ignore = "requires HIPRTC, but no GPU"]
@@ -499,4 +645,249 @@ fn hiprtc_compiles_qwen3_full_cached_prefill_and_decode() {
             }
         }
     }
+}
+
+fn growing_cached_provider(backend: Option<gpu::Backend>, stop_for_memory: bool) {
+    use puppygrad::runtime::llm_ffi::{Generation, Model, DONE_CONTEXT, DONE_LIMIT, DONE_MEMORY};
+    let f = Fixture::new();
+    // Disable EOS to exercise multiple capacity boundaries with deterministic sampling.
+    let path = f.dir.join("config.json");
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    checkpoint.as_object_mut().unwrap().remove("eos_token_id");
+    std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup");
+    let mut config = serde_json::json!({"source":source,"model_dir":f.dir,"device":backend.map_or("cpu",gpu::Backend::tag),"threads":1,"prefill_chunk":1,"context_reserve_mib":0,"grow_context":true,"context_request":{"capacity":4,"prompt_tokens":1,"minimum_capacity":1},"cache_dir":f.dir.join("compiled")});
+    if let Some(backend) = backend {
+        let context = Checkpoint::metadata_context(&f.dir, 1).unwrap();
+        let initial = puppygrad::runtime::llm_capacity::request_plan_for_backend(
+            backend,
+            include_str!("../examples/qwen3_cached.pup"),
+            &context,
+            4,
+            1,
+            Some(1),
+            true,
+        )
+        .unwrap();
+        let limit = if stop_for_memory {
+            initial.total_bytes()
+        } else {
+            1024 * 1024
+        };
+        assert!(limit <= 1024 * 1024);
+        config["max_memory"] = serde_json::json!(limit);
+    }
+    let mut model = unsafe {
+        Model::from_api(
+            puppygrad::models::pup_llm::API,
+            &serde_json::to_vec(&config).unwrap(),
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        model.info.context_length, 32,
+        "logical context must not be limited to the initial bucket"
+    );
+    let settings = Generation {
+        max_new_tokens: 12,
+        temperature: 0.,
+        reserved: 0,
+        seed: 42,
+    };
+    let mut expected = vec![];
+    let mut history = vec![1];
+    for _ in 0..12 {
+        let row = f.reference(&history);
+        let next = row
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        history.push(next);
+        expected.push(next as u32);
+    }
+    let output = model.infer(&[1], settings, None).unwrap();
+    if stop_for_memory {
+        assert_eq!(output.reason, DONE_MEMORY);
+        assert_eq!(output.tokens, expected[..4]);
+        return;
+    }
+    assert_eq!(output.reason, DONE_LIMIT);
+    assert_eq!(
+        output.tokens, expected,
+        "KV data must survive capacity growth"
+    );
+    let again = model.infer(&[1], settings, None).unwrap();
+    assert_eq!(
+        again.tokens, expected,
+        "later requests reset state without losing the grown capacity"
+    );
+    // Host callback failures must stop the provider itself, rather than merely hiding output.
+    let mut count = 0;
+    let mut cancel = |ids: &[u32]| {
+        count += ids.len();
+        if count == 3 {
+            Err("stop now".into())
+        } else {
+            Ok(())
+        }
+    };
+    assert_eq!(
+        model.infer(&[1], settings, Some(&mut cancel)).unwrap_err(),
+        "stop now"
+    );
+    assert_eq!(count, 3);
+    let full = model
+        .infer(
+            &[1],
+            Generation {
+                max_new_tokens: 32,
+                ..settings
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(full.tokens.len(), 32);
+    assert_eq!(full.reason, DONE_CONTEXT);
+}
+
+#[test]
+fn cached_qwen3_cpu_grows_context_preserves_kv_and_stops_on_callback_failure() {
+    growing_cached_provider(None, false);
+}
+#[test]
+#[ignore = "requires CUDA; synthetic model buffers capped at 1 MiB"]
+fn cached_qwen3_cuda_grows_context_preserves_kv_and_stops_on_callback_failure() {
+    growing_cached_provider(Some(gpu::Backend::Cuda), false);
+}
+#[test]
+#[ignore = "requires CUDA; synthetic model buffers capped below 1 MiB"]
+fn cached_qwen3_cuda_returns_partial_output_when_context_cannot_grow() {
+    growing_cached_provider(Some(gpu::Backend::Cuda), true);
+}
+
+fn reusable_prefill_provider(backend: Option<gpu::Backend>, tight_memory: bool) {
+    use puppygrad::runtime::llm_ffi::{Generation, Model};
+    let f = Fixture::new();
+    let path = f.dir.join("config.json");
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    checkpoint.as_object_mut().unwrap().remove("eos_token_id");
+    std::fs::write(&path, serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    let mut config = serde_json::json!({"source":PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/qwen3_cached.pup"),"model_dir":f.dir,"device":backend.map_or("cpu",gpu::Backend::tag),"threads":1,"context_reserve_mib":0,"grow_context":true,"context_request":{"capacity":32,"prompt_tokens":1,"minimum_capacity":1},"cache_dir":f.dir.join("compiled")});
+    if backend.is_some() {
+        let limit = if tight_memory {
+            let context = Checkpoint::metadata_context(&f.dir, 1).unwrap();
+            puppygrad::runtime::llm_capacity::request_plan_for_backend(
+                backend.unwrap(),
+                include_str!("../examples/qwen3_cached.pup"),
+                &context,
+                32,
+                1,
+                Some(1),
+                true,
+            )
+            .unwrap()
+            .total_bytes()
+        } else {
+            1024 * 1024
+        };
+        assert!(limit <= 1024 * 1024);
+        config["max_memory"] = serde_json::json!(limit);
+    }
+    let settings = Generation {
+        max_new_tokens: 3,
+        temperature: 0.,
+        reserved: 0,
+        seed: 42,
+    };
+    let mut exact_elapsed = None;
+    if backend.is_some() && !tight_memory {
+        let mut exact = config.clone();
+        exact["grow_context"] = serde_json::json!(false);
+        let mut baseline = unsafe {
+            Model::from_api(
+                puppygrad::models::pup_llm::API,
+                &serde_json::to_vec(&exact).unwrap(),
+            )
+        }
+        .unwrap();
+        for length in [1, 8] {
+            baseline.infer(&vec![1; length], settings, None).unwrap();
+        }
+        let prompt = (0..17)
+            .map(|i| ((i * 3 + 1) % VOCAB) as u32)
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        baseline.infer(&prompt, settings, None).unwrap();
+        exact_elapsed = Some(started.elapsed());
+        drop(baseline);
+    }
+    let mut model = unsafe {
+        Model::from_api(
+            puppygrad::models::pup_llm::API,
+            &serde_json::to_vec(&config).unwrap(),
+        )
+    }
+    .unwrap();
+    for length in [1, 8, 13, 16, 17, 21] {
+        let prompt = (0..length).map(|i| (i * 3 + 1) % VOCAB).collect::<Vec<_>>();
+        let mut history = prompt.clone();
+        let mut expected = vec![];
+        for _ in 0..3 {
+            let row = f.reference(&history);
+            let next = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
+            history.push(next);
+            expected.push(next as u32);
+        }
+        let input = prompt.iter().map(|&id| id as u32).collect::<Vec<_>>();
+        let mut streamed = vec![];
+        let mut callback = |ids: &[u32]| {
+            streamed.extend_from_slice(ids);
+            Ok(())
+        };
+        let started = std::time::Instant::now();
+        let output = model
+            .infer(
+                &input,
+                Generation {
+                    max_new_tokens: 3,
+                    temperature: 0.,
+                    reserved: 0,
+                    seed: 42,
+                },
+                Some(&mut callback),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        if length == 17 {
+            if let Some(exact) = exact_elapsed {
+                eprintln!("synthetic 17-token prompt after warmup: exact-shape {:.3} ms, reusable-shapes {:.3} ms", exact.as_secs_f64()*1000., elapsed.as_secs_f64()*1000.);
+            }
+        }
+        assert_eq!(output.tokens, expected, "prompt length {length}");
+        assert_eq!(streamed, expected);
+    }
+}
+#[test]
+fn cached_qwen3_cpu_reusable_prefill_preserves_positions_logits_and_streaming() {
+    reusable_prefill_provider(None, false);
+}
+#[test]
+#[ignore = "requires CUDA; synthetic model buffers capped at 1 MiB"]
+fn cached_qwen3_cuda_reusable_prefill_preserves_positions_logits_and_streaming() {
+    reusable_prefill_provider(Some(gpu::Backend::Cuda), false);
+}
+
+#[test]
+#[ignore = "requires CUDA; synthetic model buffers capped below 1 MiB"]
+fn cached_qwen3_cuda_reusable_prefill_falls_back_to_decode_under_memory_pressure() {
+    reusable_prefill_provider(Some(gpu::Backend::Cuda), true);
 }

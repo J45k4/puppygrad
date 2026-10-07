@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use puppygrad::audio::{
     inspect_wav, list_input_devices, record_input_device, resample_linear,
     start_input_device_stream, write_wav_pcm16, AudioDropPolicy as RuntimeAudioDropPolicy,
@@ -60,8 +60,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Parser, Debug)]
 #[command(name = "puppygrad")]
 struct Cli {
+    /// GPU model-buffer budget; bare numbers are GiB (also accepts 512MiB, 2GB).
+    #[arg(long, global = true)]
+    max_memory: Option<puppygrad::runtime::memory_limit::MemoryLimit>,
     #[command(subcommand)]
-    cmd: Command,
+    cmd: Option<Command>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -95,7 +98,7 @@ struct LlmRunArgs {
     verify_reference: bool,
 }
 impl LlmRunArgs {
-    fn run(self) -> Result<()> {
+    fn run(self, max_memory: Option<puppygrad::runtime::memory_limit::MemoryLimit>) -> Result<()> {
         puppygrad::runtime::llm::run(puppygrad::runtime::llm::Options {
             program: self
                 .source
@@ -110,6 +113,7 @@ impl LlmRunArgs {
             temperature: self.temperature,
             seed: self.seed,
             verify_reference: self.verify_reference,
+            max_memory,
         })
     }
 }
@@ -126,6 +130,8 @@ enum LlmCommand {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Open the interactive model browser and prompt interface.
+    Tui(puppygrad::runtime::tui::Options),
     /// Generate an image through a .pup program or image FFI provider.
     Image(puppygrad::runtime::image::Options),
     /// Train a .pup buffer program over named tensor files.
@@ -1291,15 +1297,49 @@ fn format_emitted_c(source: &str) -> Result<String> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.cmd {
+    let Some(command) = cli.cmd else {
+        use std::io::IsTerminal;
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            return puppygrad::runtime::tui::run(puppygrad::runtime::tui::Options {
+                max_memory: cli.max_memory,
+                ..Default::default()
+            });
+        }
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    if cli.max_memory.is_some()
+        && !matches!(
+            &command,
+            Command::Tui(_)
+                | Command::Run(_)
+                | Command::Llm {
+                    command: None | Some(LlmCommand::Run(_) | LlmCommand::Capacity(_)),
+                    ..
+                }
+        )
+    {
+        return Err(
+            "--max-memory currently applies to the TUI, LLM run and LLM capacity commands".into(),
+        );
+    }
+    match command {
+        Command::Tui(mut options) => {
+            options.max_memory = cli.max_memory;
+            puppygrad::runtime::tui::run(options)
+        }
         Command::Image(options) => puppygrad::runtime::image::run(options),
         Command::Train(options) => puppygrad::runtime::train::run(options),
-        Command::Run(args) => args.run(),
+        Command::Run(args) => args.run(cli.max_memory),
         Command::Llm { command, run } => match command {
-            Some(LlmCommand::Run(args)) => args.run(),
+            Some(LlmCommand::Run(args)) => args.run(cli.max_memory),
             Some(LlmCommand::Benchmark(args)) => puppygrad::runtime::llm_benchmark::run(args),
-            Some(LlmCommand::Capacity(args)) => puppygrad::runtime::llm_capacity::run(args),
-            None => run.run(),
+            Some(LlmCommand::Capacity(mut args)) => {
+                args.max_memory = cli.max_memory;
+                puppygrad::runtime::llm_capacity::run(args)
+            }
+            None => run.run(cli.max_memory),
         },
         Command::Emit {
             source,

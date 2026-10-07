@@ -564,3 +564,29 @@ fn chat_runtime_hides_template_and_streaming_matches_buffered_output() {
         assert_eq!(String::from_utf8(output.stdout).unwrap(), "hello world\n");
     }
 }
+
+#[test]
+fn native_provider_memory_stop_retains_partial_output_and_context_stop_is_validated() {
+    use puppygrad::runtime::llm_ffi::{DONE_CONTEXT, DONE_MEMORY};
+    let f = Fixture::new(&[]);
+    let mut model = f.model(r#"{"case":"memory_stop"}"#);
+    let mut seen = vec![];
+    let mut callback = |tokens: &[u32]| {
+        seen.extend_from_slice(tokens);
+        Ok(())
+    };
+    let output = model
+        .infer(&[0], generation(), Some(&mut callback))
+        .unwrap();
+    assert_eq!(output.reason, DONE_MEMORY);
+    assert_eq!(output.tokens, [1, 2]);
+    assert_eq!(seen, output.tokens);
+    let mut model = f.model(r#"{"case":"context_stop"}"#);
+    assert!(model
+        .infer(&[0], generation(), None)
+        .unwrap_err()
+        .contains("before the context limit"));
+    let output = model.infer(&[0; 30], generation(), None).unwrap();
+    assert_eq!(output.reason, DONE_CONTEXT);
+    assert_eq!(output.tokens.len(), 3);
+}

@@ -5,6 +5,8 @@ pub const NO_EOS: u32 = u32::MAX;
 pub const DONE_LIMIT: u32 = 0;
 pub const DONE_EOS: u32 = 1;
 pub const DONE_ERROR: u32 = 2;
+pub const DONE_CONTEXT: u32 = 3;
+pub const DONE_MEMORY: u32 = 4;
 pub type Result<T> = std::result::Result<T, String>;
 #[repr(C)]
 pub struct ErrorBuffer {
@@ -170,12 +172,29 @@ unsafe extern "C" fn tokens_callback(user: *mut c_void, tokens: *const u32, coun
         Err(_) => state.error = Some("token callback panicked".into()),
     }
 }
+/// Built-in synchronous providers can stop after a failed host callback without
+/// changing the native ABI. Only our own callback table may be inspected here.
+/// # Safety
+/// The callback table must be valid for the current synchronous inference call.
+pub(crate) unsafe fn callback_error(callbacks: &Callbacks) -> Option<String> {
+    if callbacks.on_done.is_some_and(|f| {
+        std::ptr::fn_addr_eq(f, done_callback as unsafe extern "C" fn(*mut c_void, u32))
+    }) && !callbacks.user.is_null()
+    {
+        (&*callbacks.user.cast::<CallbackState<'_>>()).error.clone()
+    } else {
+        None
+    }
+}
 unsafe extern "C" fn done_callback(user: *mut c_void, reason: u32) {
     let state = &mut *user.cast::<CallbackState<'_>>();
     if state.done.replace(reason).is_some() {
         state.error = Some("LLM completed more than once".into());
     }
-    if !matches!(reason, DONE_LIMIT | DONE_EOS | DONE_ERROR) {
+    if !matches!(
+        reason,
+        DONE_LIMIT | DONE_EOS | DONE_ERROR | DONE_CONTEXT | DONE_MEMORY
+    ) {
         state.error = Some("LLM returned an unknown completion reason".into());
     }
 }
@@ -354,11 +373,101 @@ impl Model {
         if reason == DONE_LIMIT && count != generation.max_new_tokens as usize {
             return Err("LLM completed before the requested token limit without EOS".into());
         }
+        if reason == DONE_CONTEXT
+            && count as u64 != self.info.context_length - input.len() as u64 + 1
+        {
+            return Err("LLM reported context exhaustion before the context limit".into());
+        }
         Ok(Output { tokens, reason })
     }
 }
 impl Drop for Model {
     fn drop(&mut self) {
         unsafe { self.api.free_model.unwrap()(self.state.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn builtin_provider_stops_execution_after_host_callback_error() {
+        let dir = std::env::temp_dir().join(format!("pup-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("cancel.pup");
+        std::fs::write(&source, "output weight(\"scores\")\n").unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"vocab_size":2,"n_positions":32}"#,
+        )
+        .unwrap();
+        let bytes = [0f32, 1.]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2], &bytes).unwrap();
+        std::fs::write(
+            dir.join("model.safetensors"),
+            safetensors::tensor::serialize([("scores", view)], None).unwrap(),
+        )
+        .unwrap();
+        let config = serde_json::to_vec(&serde_json::json!({"source":source,"model_dir":dir,"device":"cpu","threads":1,"cache_dir":dir.join("compiled")})).unwrap();
+        let mut model = unsafe { Model::from_api(crate::models::pup_llm::API, &config) }.unwrap();
+        let mut seen = 0;
+        let mut callback = |ids: &[u32]| {
+            seen += ids.len();
+            if seen == 3 {
+                Err("cancelled".into())
+            } else {
+                Ok(())
+            }
+        };
+        let generation = Generation {
+            max_new_tokens: 32,
+            temperature: 0.,
+            reserved: 0,
+            seed: 1,
+        };
+        assert_eq!(
+            model
+                .infer(&[0], generation, Some(&mut callback))
+                .unwrap_err(),
+            "cancelled"
+        );
+        // Inspect provider output directly: suppressing later host callbacks alone
+        // would leave all 32 generated tokens here.
+        let mut count = 0;
+        let mut storage = ErrorStorage::new();
+        let mut error = storage.buffer();
+        assert_eq!(
+            unsafe {
+                model.api.read_output.unwrap()(
+                    model.state.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    &mut count,
+                    &mut error,
+                )
+            },
+            0
+        );
+        assert_eq!(count, 3);
+        assert_eq!(
+            model
+                .infer(
+                    &[0],
+                    Generation {
+                        max_new_tokens: 1,
+                        ..generation
+                    },
+                    None
+                )
+                .unwrap()
+                .tokens,
+            [1]
+        );
+        drop(model);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

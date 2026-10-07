@@ -10,6 +10,8 @@ extern "C" {
 #define PUP_LLM_DONE_LIMIT 0u
 #define PUP_LLM_DONE_EOS 1u
 #define PUP_LLM_DONE_ERROR 2u
+#define PUP_LLM_DONE_CONTEXT 3u
+#define PUP_LLM_DONE_MEMORY 4u
 /* All functions and callbacks are synchronous, on the calling thread in v1.
  * State is exclusively borrowed during calls; free_model releases it exactly once.
  * See docs/llm-runtime.md for ownership, callback ordering and error rules. */

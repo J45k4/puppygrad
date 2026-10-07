@@ -14,6 +14,7 @@ pub mod pop;
 pub mod rewrite;
 pub mod source;
 pub mod spec;
+mod state_resize;
 pub mod tensor;
 
 #[cfg(test)]

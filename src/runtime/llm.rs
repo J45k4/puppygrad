@@ -19,6 +19,7 @@ pub struct Options {
     pub seed: u64,
     pub stream: bool,
     pub verify_reference: bool,
+    pub max_memory: Option<super::memory_limit::MemoryLimit>,
 }
 pub fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let generation = Generation {
@@ -28,13 +29,17 @@ pub fn run(options: Options) -> std::result::Result<(), Box<dyn std::error::Erro
         seed: options.seed,
     };
     generation.validate()?;
-    let mut model = load_model(
+    let mut model = load_model_with_policy(
         &options.program,
         &options.model_dir,
         &options.device,
         options.threads,
         options.verify_reference,
         options.cpu_target,
+        LoadPolicy {
+            max_memory: options.max_memory.map(|m| m.0),
+            ..Default::default()
+        },
     )?;
     let (tokenizer, input) = encode_prompt(&model, &options.model_dir, &options.prompt)?;
     let started = Instant::now();
@@ -76,7 +81,7 @@ pub fn generate(
 ) -> Result<Vec<u32>> {
     generate_displayed(model, tokenizer, input, generation, stream, true, writer)
 }
-fn generate_displayed(
+pub(super) fn generate_displayed(
     model: &mut Model,
     tokenizer: &tokenizers::Tokenizer,
     input: &[u32],
@@ -85,6 +90,26 @@ fn generate_displayed(
     echo_prompt: bool,
     writer: &mut dyn Write,
 ) -> Result<Vec<u32>> {
+    Ok(generate_output_displayed(
+        model,
+        tokenizer,
+        input,
+        generation,
+        stream,
+        echo_prompt,
+        writer,
+    )?
+    .tokens)
+}
+pub(super) fn generate_output_displayed(
+    model: &mut Model,
+    tokenizer: &tokenizers::Tokenizer,
+    input: &[u32],
+    generation: Generation,
+    stream: bool,
+    echo_prompt: bool,
+    writer: &mut dyn Write,
+) -> Result<super::llm_ffi::Output> {
     let mut decoded = String::new();
     let mut decoder = tokenizer.decode_stream(true);
     if stream && echo_prompt {
@@ -135,7 +160,7 @@ fn generate_displayed(
         .write_all(tail.as_bytes())
         .map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
-    Ok(output.tokens)
+    Ok(output)
 }
 
 /// Open either a compiled provider or the built-in .pup adapter.
@@ -147,12 +172,52 @@ pub(super) fn load_model(
     verify_reference: bool,
     cpu_target: crate::compiler::cpu::CpuTarget,
 ) -> std::result::Result<Model, Box<dyn std::error::Error>> {
+    load_model_with_policy(
+        program,
+        model_dir,
+        device,
+        threads,
+        verify_reference,
+        cpu_target,
+        LoadPolicy::default(),
+    )
+}
+
+#[derive(Default)]
+pub(super) struct LoadPolicy<'a> {
+    pub grow_context: bool,
+    pub cache_dir: Option<&'a Path>,
+    pub context_request: Option<super::llm_capacity::ContextRequest>,
+    pub max_memory: Option<usize>,
+}
+
+pub(super) fn load_model_with_policy(
+    program: &Path,
+    model_dir: &Path,
+    device: &str,
+    threads: Option<usize>,
+    verify_reference: bool,
+    cpu_target: crate::compiler::cpu::CpuTarget,
+    policy: LoadPolicy<'_>,
+) -> std::result::Result<Model, Box<dyn std::error::Error>> {
     if threads == Some(0) {
         return Err("threads must be greater than zero".into());
     }
-    let config = serde_json::to_vec(
-        &serde_json::json!({"source":program,"model_dir":model_dir,"device":device,"verify_reference":verify_reference,"threads":threads,"cpu_target":cpu_target}),
-    )?;
+    let mut config = serde_json::json!({"source":program,"model_dir":model_dir,"device":device,"verify_reference":verify_reference,"threads":threads,"cpu_target":cpu_target});
+    if policy.max_memory.is_some() && !program.extension().is_some_and(|e| e == "pup") {
+        return Err("--max-memory currently requires a GPU .pup provider".into());
+    }
+    config["grow_context"] = serde_json::json!(policy.grow_context);
+    if let Some(limit) = policy.max_memory {
+        config["max_memory"] = serde_json::to_value(limit)?;
+    }
+    if let Some(cache) = policy.cache_dir {
+        config["cache_dir"] = serde_json::to_value(cache)?;
+    }
+    if let Some(request) = policy.context_request {
+        config["context_request"] = serde_json::to_value(request)?;
+    }
+    let config = serde_json::to_vec(&config)?;
     let model = if program.extension().is_some_and(|e| e == "pup") {
         unsafe { Model::from_api(crate::models::pup_llm::API, &config) }?
     } else {
@@ -178,14 +243,39 @@ pub(super) fn encode_prompt(
     model_dir: &Path,
     prompt: &str,
 ) -> std::result::Result<(tokenizers::Tokenizer, Vec<u32>), Box<dyn std::error::Error>> {
+    let (tokenizer, input) = tokenize_prompt(model_dir, prompt)?;
+    validate_tokenizer(model, &tokenizer)?;
+    Ok((tokenizer, input))
+}
+
+pub(super) fn tokenize_prompt(
+    model_dir: &Path,
+    prompt: &str,
+) -> std::result::Result<(tokenizers::Tokenizer, Vec<u32>), Box<dyn std::error::Error>> {
     let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| e.to_string())?;
+    let input = tokenize_with(&tokenizer, model_dir, prompt)?;
+    Ok((tokenizer, input))
+}
+
+pub(super) fn tokenize_with(
+    tokenizer: &tokenizers::Tokenizer,
+    model_dir: &Path,
+    prompt: &str,
+) -> std::result::Result<Vec<u32>, Box<dyn std::error::Error>> {
     let formatted = format_prompt(model_dir, prompt)?;
     let input = tokenizer
         .encode(formatted, true)
         .map_err(|e| e.to_string())?
         .get_ids()
         .to_vec();
+    Ok(input)
+}
+
+pub(super) fn validate_tokenizer(
+    model: &Model,
+    tokenizer: &tokenizers::Tokenizer,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     if tokenizer
         .get_vocab(true)
         .values()
@@ -193,7 +283,7 @@ pub(super) fn encode_prompt(
     {
         return Err("tokenizer contains IDs outside the model vocabulary".into());
     }
-    Ok((tokenizer, input))
+    Ok(())
 }
 
 /// The CLI currently accepts one user message. Qwen3 uses its documented

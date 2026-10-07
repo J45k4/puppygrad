@@ -1,0 +1,11 @@
+{
+  "id": "gpt2",
+  "name": "GPT-2 small",
+  "description": "124M parameter text completion model",
+  "program": "llm.pup",
+  "checkpoint": {
+    "repo": "openai-community/gpt2",
+    "revision": "607a30d783dfa663caf39e06633721c8d4cfcd7e",
+    "files": ["config.json", "tokenizer.json", "model.safetensors"]
+  }
+}

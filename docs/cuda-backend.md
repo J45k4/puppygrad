@@ -33,7 +33,9 @@ the CUDA toolkit. No `nvcc` command or toolkit headers are required. The runtime
 queries the GPU's compute capability and asks NVRTC to compile for it. NVRTC
 must support that architecture; unsupported devices/compiler versions fail explicitly.
 
-Standard NVRTC library locations are searched. For a custom installation:
+Standard NVRTC library locations are searched first, followed by the local
+`.cache/cuda-toolchain/nvidia/cuda_nvrtc/lib/` directory relative to the current
+working directory. `PUPPYGRAD_NVRTC` overrides discovery. For a custom installation:
 
 ```sh
 export PUPPYGRAD_NVRTC=/absolute/path/to/libnvrtc.so.12
@@ -41,10 +43,11 @@ export PUPPYGRAD_NVRTC=/absolute/path/to/libnvrtc.so.12
 
 Keep NVIDIA's matching `libnvrtc-builtins` beside it. This workstation's test
 installation was downloaded as NVIDIA's `nvidia-cuda-nvrtc-cu12==12.6.85` wheel
-and extracted into the ignored `.cache/cuda-toolchain/` directory. To use it here:
+and extracted into the ignored `.cache/cuda-toolchain/` directory. Running from
+the checkout root detects it automatically. From another directory, use:
 
 ```sh
-export PUPPYGRAD_NVRTC="$PWD/.cache/cuda-toolchain/nvidia/cuda_nvrtc/lib/libnvrtc.so.12"
+export PUPPYGRAD_NVRTC=/path/to/puppygrad/.cache/cuda-toolchain/nvidia/cuda_nvrtc/lib/libnvrtc.so.12
 ```
 
 ## Lowering and ownership

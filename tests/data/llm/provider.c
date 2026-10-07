@@ -31,6 +31,8 @@ static void *build_model(const uint8_t *config,size_t len,PupLlmInfo *info,PupLl
     if(strstr(json,"eos")) s->mode=5;
     if(strstr(json,"wrong_output")) s->mode=6;
     if(strstr(json,"unicode")) s->mode=7;
+    if(strstr(json,"memory_stop")) s->mode=8;
+    if(strstr(json,"context_stop")) s->mode=9;
     *info=(PupLlmInfo){6,5,32};live_count++;return s;
 }
 static int32_t infer(void *state,const uint32_t *input,size_t count,const PupLlmGeneration *generation,const PupLlmCallbacks *callbacks,PupLlmError *error) {
@@ -40,10 +42,11 @@ static int32_t infer(void *state,const uint32_t *input,size_t count,const PupLlm
     if(s->mode==4) {error_message(error,"deliberate infer failure");if(callbacks->on_done)callbacks->on_done(callbacks->user,PUP_LLM_DONE_ERROR);return 1;}
     size_t total=generation->max_new_tokens;
     if(s->mode==5 && total>0)total=1;
+    if(s->mode==8 && total>2)total=2;
     for(size_t i=0;i<total;i++)s->tokens[s->count++]=s->mode==5?5:s->mode==7?1+(i%3):(generation->temperature>0?3+(generation->seed%2):1+(i%2));
     if(s->mode==3 && callbacks->on_done)callbacks->on_done(callbacks->user,PUP_LLM_DONE_LIMIT);
     if(callbacks->on_tokens && s->count) {callback_count++;callbacks->on_tokens(callbacks->user,s->tokens,s->count);}
-    if(s->mode!=2 && s->mode!=3 && callbacks->on_done)callbacks->on_done(callbacks->user,s->mode==5&&total>0?PUP_LLM_DONE_EOS:PUP_LLM_DONE_LIMIT);
+    if(s->mode!=2 && s->mode!=3 && callbacks->on_done)callbacks->on_done(callbacks->user,s->mode==8?PUP_LLM_DONE_MEMORY:s->mode==9?PUP_LLM_DONE_CONTEXT:s->mode==5&&total>0?PUP_LLM_DONE_EOS:PUP_LLM_DONE_LIMIT);
     if(s->mode==1 && callbacks->on_done)callbacks->on_done(callbacks->user,PUP_LLM_DONE_LIMIT);
     if(s->mode==6 && s->count)s->tokens[0]=4;
     return 0;
