@@ -98,6 +98,34 @@ impl Fixture {
     fn w(&self, name: &str) -> &[f32] {
         &self.weights[name].1
     }
+    fn shard(&self) -> serde_json::Value {
+        let path = self.dir.join("model.safetensors");
+        let bytes = std::fs::read(&path).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut weights = BTreeMap::new();
+        for shard in 0..2 {
+            let name = format!("model-{:05}-of-00002.safetensors", shard + 1);
+            let views = self
+                .weights
+                .keys()
+                .enumerate()
+                .filter(|(i, _)| i % 2 == shard)
+                .map(|(_, key)| {
+                    weights.insert(key.clone(), name.clone());
+                    (key.as_str(), tensors.tensor(key).unwrap())
+                })
+                .collect::<Vec<_>>();
+            std::fs::write(self.dir.join(name), serialize(views, None).unwrap()).unwrap();
+        }
+        let index = serde_json::json!({"weight_map":weights});
+        std::fs::write(
+            self.dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        index
+    }
     fn reference(&self, tokens: &[usize]) -> Vec<f32> {
         let mut x = tokens
             .iter()
@@ -600,6 +628,136 @@ fn cached_qwen3_hip_matches_full_prefix_with_chunks_and_reset() {
 #[ignore = "requires AMD GPU and HIPRTC"]
 fn cached_qwen3_hip_ffi_limits_context_chunks_prefill_and_resets() {
     cached_provider(Some(gpu::Backend::Hip), false);
+}
+
+#[test]
+fn sharded_checkpoints_preserve_bindings_metadata_and_reference_logits() {
+    for tied in [true, false] {
+        let f = Fixture::new();
+        let path = f.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["tie_word_embeddings"] = tied.into();
+        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut single = Checkpoint::load(&f.dir).unwrap();
+        single.bind_tokens(&[1, 3, 2]).unwrap();
+        f.shard();
+        let mut sharded = Checkpoint::load(&f.dir).unwrap();
+        sharded.bind_tokens(&[1, 3, 2]).unwrap();
+        assert_eq!(single.context.constants, sharded.context.constants);
+        assert_eq!(single.inputs.len(), sharded.inputs.len());
+        let metadata = Checkpoint::metadata_context(&f.dir, 3).unwrap();
+        assert_eq!(metadata.tensors.len(), single.context.tensors.len());
+        for (name, spec) in &single.context.tensors {
+            let loaded = &sharded.context.tensors[name];
+            let planned = &metadata.tensors[name];
+            assert_eq!(
+                (spec.slot, &spec.shape, spec.dtype),
+                (loaded.slot, &loaded.shape, loaded.dtype)
+            );
+            assert_eq!(
+                (spec.slot, &spec.shape, spec.dtype),
+                (planned.slot, &planned.shape, planned.dtype)
+            );
+        }
+        for slot in 1..single.inputs.len() {
+            assert_eq!(
+                single.inputs[slot].f32().unwrap(),
+                sharded.inputs[slot].f32().unwrap()
+            );
+        }
+        let p = source::parse_with_context(include_str!("../examples/qwen3.pup"), &sharded.context)
+            .unwrap();
+        let executable = cpu::compile(&p.graph, p.root, &f.dir.join("cpu")).unwrap();
+        assert_logits(
+            executable.run(&sharded.inputs).unwrap()[0].f32().unwrap(),
+            &f.reference(&[1, 3, 2]),
+        );
+    }
+}
+
+#[test]
+fn sharded_checkpoints_reject_missing_files_and_inconsistent_indexes() {
+    for case in [
+        "missing_file",
+        "wrong_shard",
+        "missing_weight",
+        "unindexed_weight",
+        "empty_index",
+        "truncated_shard",
+    ] {
+        let f = Fixture::new();
+        let mut index = f.shard();
+        let first = index["weight_map"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        match case {
+            "missing_file" => {
+                std::fs::remove_file(f.dir.join("model-00002-of-00002.safetensors")).unwrap();
+            }
+            "wrong_shard" => {
+                index["weight_map"][&first] = "model-00002-of-00002.safetensors".into();
+            }
+            "missing_weight" => {
+                index["weight_map"]["absent.weight"] = "model-00001-of-00002.safetensors".into();
+            }
+            "unindexed_weight" => {
+                index["weight_map"].as_object_mut().unwrap().remove(&first);
+            }
+            "empty_index" => {
+                index["weight_map"] = serde_json::json!({});
+            }
+            "truncated_shard" => {
+                let path = f.dir.join("model-00002-of-00002.safetensors");
+                let bytes = std::fs::read(&path).unwrap();
+                std::fs::write(path, &bytes[..bytes.len() - 1]).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(
+            f.dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        assert!(Checkpoint::load(&f.dir).is_err(), "{case}");
+        assert!(Checkpoint::metadata_context(&f.dir, 1).is_err(), "{case}");
+    }
+}
+
+#[test]
+fn sharded_checkpoints_reject_paths_outside_the_model_directory() {
+    for path in [
+        "../other.safetensors",
+        "/tmp/other.safetensors",
+        "nested/../other.safetensors",
+        "model.bin",
+    ] {
+        let f = Fixture::new();
+        let mut index = f.shard();
+        let first = index["weight_map"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        index["weight_map"][&first] = path.into();
+        std::fs::write(
+            f.dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let error = Checkpoint::load(&f.dir).err().unwrap().to_string();
+        assert!(
+            error.contains("invalid checkpoint shard path"),
+            "{path}: {error}"
+        );
+        assert!(Checkpoint::metadata_context(&f.dir, 1).is_err());
+    }
 }
 
 #[test]

@@ -16,11 +16,50 @@ Running `puppygrad` with no arguments in a terminal opens the interactive UI
 `--device`, `--cache-dir`, `--catalog`, and `--db`. Without a terminal, the no-argument
 command prints help; existing command-line operations remain available for scripts.
 
-Type `/model` to browse GPT-2 small and Qwen3-0.6B. The list distinguishes downloaded,
-partial, and missing checkpoints. Use arrow keys to choose an entry; Enter downloads
+Typing `/` opens suggestions for every slash command, including aliases. Keep
+typing to filter the list (for example `/resu` suggests `/resume`). Up/Down selects
+a suggestion; Tab or Enter completes it in the composer. Press Enter again to
+run the command, or add its arguments. Esc closes suggestions without stopping
+background work. Completion applies to command names, not their arguments.
+
+Type `/models` (or `/model`) to preview GPT-2 small, Qwen3-0.6B and Qwen3-1.7B
+as you type, including during background warmup. The list shows missing, partial,
+downloading, downloaded but not loaded, loading, preparing kernels, and ready states.
+Ready includes the device and means warmup or inference succeeded in this process;
+new prompt shapes can still need kernel compilation. Press Enter to focus the list,
+or use arrow keys directly. Enter downloads
 missing files or selects a downloaded model. `d` downloads the highlighted model.
 Downloads run in the background with file/byte progress, and completed files are
 published atomically. `/download [id]` also downloads assets directly.
+Esc closes the list or preview without interrupting warmup; another Esc stops it.
+
+The last selected model is saved in the active SQLite database and restored before
+startup warmup, including when you select a model without sending a message.
+Startup still opens a fresh chat. `--resume` or `/resume` uses the saved chat's
+model and remembers that choice. On first upgrade, the most recent saved chat's
+model supplies the default; a model missing from the current catalog falls back
+to Qwen3-0.6B (or the first entry in a custom catalog). Each database keeps its
+own choice, so `PUPPYGRAD_DB` and `--db` also control this preference.
+
+Each saved user/assistant turn also stores `turns.created_at`, the UTC Unix time
+in milliseconds when the pair was saved. Existing turns and imported records
+without a recorded time keep `NULL`; known times survive import, resume, and
+older-message retrieval. These timestamps are metadata and are not added to
+the model prompt.
+
+Wide terminals also show an Activity panel on the right. It keeps a timestamped
+log of checkpoint loading, context planning, kernel preparation, CPU/CUDA/HIP
+compilation and cache hits, warmup, and generation completion. It follows the
+latest events and keeps up to 200 entries; repeated download progress updates
+share one entry per file. `/logs` toggles the panel, which hides automatically in
+terminals narrower than 110 columns. Detailed build events do not enter chat history.
+
+Checkpoint loading includes both disk reads and conversion to the runtime's F32
+weights. The Activity panel reports these times separately. The loader reuses a
+read buffer of at most 4 MiB and converts directly into the final shared weight
+allocation, avoiding an intermediate F32 vector and its full copy. F32, F16 and
+BF16 checkpoints, shard validation, deterministic bindings and tied weights use
+the same path; conversion preserves the previous values, including NaN handling.
 
 Enter a prompt to stream its response. The selected model stays loaded between
 requests, and recent user/assistant turns are included in each prompt. Changing
@@ -49,8 +88,12 @@ New databases have mode 0600 on Unix. SQLite uses WAL, foreign keys and atomic
 transactions. Multiple TUIs may use separate sessions; stale writes to a session
 changed by another TUI are rejected with a request to resume it again.
 
-`/sessions` and `/resume` open a keyboard picker showing each chat's first-message
-title, ID, last update, model and turn count. Use Up/Down and Enter to resume;
+Typing `/sessions` or `/resume` previews saved chats before Enter, showing each
+chat's first-message title, ID, last update, model and turn count. The cached list
+is available during warmup and refreshes in the background. Press Enter to focus
+the picker, or use arrow keys directly; Enter on a selected chat resumes it.
+Browsing keeps any current operation running; switching chats requires it to
+finish or be stopped. Use Up/Down and Enter to resume;
 Esc closes the picker. `/resume ID` accepts a full ID or an unambiguous prefix,
 and `/resume latest` opens the most recently updated chat. `puppygrad tui --resume`
 resumes the latest chat at startup; `--resume ID` selects one. Resuming restores

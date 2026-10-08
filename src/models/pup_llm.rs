@@ -107,7 +107,11 @@ fn boundary<T>(f: impl FnOnce() -> ffi::Result<T>) -> ffi::Result<T> {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(".pup LLM provider panicked".into()))
 }
 fn profile_startup(stage: &str, started: Instant) {
-    if std::env::var_os("PUPPYGRAD_STARTUP_PROFILE").is_some() {
+    let message = format!(
+        "{stage} completed in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    if !crate::progress::emit(&message) && std::env::var_os("PUPPYGRAD_STARTUP_PROFILE").is_some() {
         eprintln!("startup {stage}: {:.3}s", started.elapsed().as_secs_f64());
     }
 }
@@ -160,6 +164,7 @@ unsafe extern "C" fn build_model(
         config.cpu_target.validate().map_err(|e| e.to_string())?;
         let source = std::fs::read_to_string(&config.source).map_err(|e| e.to_string())?;
         let started = Instant::now();
+        crate::progress::emit("Loading checkpoint weights (read + conversion)…");
         let mut checkpoint = Checkpoint::load(&config.model_dir).map_err(|e| e.to_string())?;
         profile_startup("checkpoint", started);
         let integer = |key: &str| match checkpoint.context.constants.get(key) {
@@ -218,6 +223,9 @@ unsafe extern "C" fn build_model(
         let mut prepared_shapes = HashMap::new();
         let mut shape_plans = HashMap::new();
         let started = Instant::now();
+        crate::progress::emit(format!(
+            "Planning context and buffers for {context_capacity} tokens…"
+        ));
         if auto_context || prefill_chunk.is_some() {
             checkpoint.bind_tokens(&[0]).map_err(|e| e.to_string())?;
             let has_state =
@@ -388,6 +396,10 @@ impl State {
         let key = (chunk.len(), capacity);
         if !self.executables.contains_key(&key) {
             let started = Instant::now();
+            crate::progress::emit(format!(
+                "Preparing {}-token shape (context {capacity})…",
+                chunk.len()
+            ));
             let lowered = self.prepared_shapes.remove(&key);
             let program = if lowered.is_some() {
                 None
@@ -772,11 +784,11 @@ impl State {
                         self.prepared_shapes.insert(shape_key, lowered);
                     }
                 }
-                eprintln!(
+                crate::progress::warning(format!(
                     "memory pressure: context {capacity}, prefill {}",
                     prefill_chunk
                         .map_or_else(|| "whole prompt".into(), |n| format!("{n}-token chunks"))
-                );
+                ));
             }
         }
         self.context_capacity = capacity;

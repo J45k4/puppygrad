@@ -1,0 +1,11 @@
+{
+  "id": "qwen3-1.7b",
+  "name": "Qwen3-1.7B",
+  "description": "1.7B parameter conversational model with cached decoding",
+  "program": "qwen3_cached.pup",
+  "checkpoint": {
+    "repo": "Qwen/Qwen3-1.7B",
+    "revision": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+    "files": ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "model.safetensors.index.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "LICENSE"]
+  }
+}

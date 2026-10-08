@@ -724,7 +724,9 @@ pub(crate) fn compile_lowered_with_runtime(
     let index = match super::kernel_cache::Index::open(cache) {
         Ok(index) => Some(index),
         Err(error) => {
-            eprintln!("Kernel cache index unavailable: {error}; using file cache");
+            crate::progress::warning(format!(
+                "Kernel cache index unavailable: {error}; using file cache"
+            ));
             None
         }
     };
@@ -743,12 +745,25 @@ pub(crate) fn compile_lowered_with_runtime(
             match index.allows(&identity, &artifacts) {
                 Ok(allowed) => allowed,
                 Err(error) => {
-                    eprintln!("Kernel cache metadata lookup failed: {error}; recompiling module");
+                    crate::progress::warning(format!(
+                        "Kernel cache metadata lookup failed: {error}; recompiling module"
+                    ));
                     false
                 }
             }
         });
     let cache_hit = cached.is_some();
+    let started = std::time::Instant::now();
+    crate::progress::emit(format!(
+        "{} {} module {stem} · {} kernels · {architecture}",
+        if cache_hit {
+            "Loading cached"
+        } else {
+            "Compiling"
+        },
+        backend.label(),
+        lowered.kernels.len()
+    ));
     let ptx = if let Some(ptx) = cached {
         ptx
     } else {
@@ -798,11 +813,21 @@ pub(crate) fn compile_lowered_with_runtime(
             lowered.gemm_count,
             cache_hit,
         ) {
-            eprintln!("Kernel cache metadata update failed: {error}");
+            crate::progress::warning(format!("Kernel cache metadata update failed: {error}"));
         }
     }
     std::mem::forget(module);
     drop(current);
+    crate::progress::emit(format!(
+        "{} module ready · {:.3}s{}",
+        backend.label(),
+        started.elapsed().as_secs_f64(),
+        if cache_hit {
+            " · cache hit"
+        } else {
+            " · compiled"
+        }
+    ));
     let gemm_count = lowered.gemm_count;
     Ok(Executable {
         runtime: runtime.clone(),

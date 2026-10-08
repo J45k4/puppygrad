@@ -74,13 +74,13 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
     let mut db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
     let version: i32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 2 {
+    if version > 4 {
         return Err(
             format!("Database version {version} is newer than this application supports").into(),
         );
     }
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-    if version < 2 {
+    if version < 4 {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old_kernel_table =
             has_table(&tx, "kernel_modules")? && !has_column(&tx, "kernel_modules", "cache_dir")?;
@@ -88,6 +88,9 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
             tx.execute_batch("ALTER TABLE kernel_modules RENAME TO old_kernel_modules;")?;
         }
         tx.execute_batch(SCHEMA)?;
+        if !has_column(&tx, "turns", "created_at")? {
+            tx.execute_batch("ALTER TABLE turns ADD COLUMN created_at INTEGER;")?;
+        }
         if old_kernel_table {
             // Explicitly reopening an old kernel DB upgrades it in place.
             let directory = path
@@ -98,7 +101,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
             tx.execute(&format!("INSERT INTO kernel_modules(cache_dir,{KERNEL_COLUMNS}) SELECT ?1,{KERNEL_COLUMNS} FROM old_kernel_modules"),[root])?;
             tx.execute_batch("DROP TABLE old_kernel_modules; CREATE INDEX IF NOT EXISTS kernel_modules_last_used ON kernel_modules(last_used_at);")?;
         }
-        tx.execute_batch("PRAGMA user_version=2;")?;
+        tx.execute_batch("PRAGMA user_version=4;")?;
         tx.commit()?;
     }
     Ok(db)
@@ -150,13 +153,18 @@ pub(crate) fn import(db: &mut Connection, source: &Path, destination: &Path) -> 
     let snapshot = legacy.transaction()?;
     for (table, columns) in [
         ("sessions", "id,title,model,created_at,updated_at"),
-        ("turns", "session_id,ordinal,user,assistant"),
+        ("turns", "session_id,ordinal,user,assistant,created_at"),
         ("legacy_imports", "path"),
     ] {
         if !has_table(&snapshot, table)? {
             continue;
         }
-        let mut select = snapshot.prepare(&format!("SELECT {columns} FROM {table}"))?;
+        let select_columns = if table == "turns" && !has_column(&snapshot, "turns", "created_at")? {
+            "session_id,ordinal,user,assistant,NULL AS created_at"
+        } else {
+            columns
+        };
+        let mut select = snapshot.prepare(&format!("SELECT {select_columns} FROM {table}"))?;
         let count = select.column_count();
         let placeholders = vec!["?"; count].join(",");
         let mut insert = tx.prepare(&format!(
@@ -171,7 +179,7 @@ pub(crate) fn import(db: &mut Connection, source: &Path, destination: &Path) -> 
             if table == "turns" && added == 0 {
                 let same: bool = tx.query_row(
                     "SELECT user=?3 AND assistant=?4 FROM turns WHERE session_id=?1 AND ordinal=?2",
-                    params_from_iter(&values),
+                    params_from_iter(values.iter().take(4)),
                     |r| r.get(0),
                 )?;
                 if !same {
@@ -179,6 +187,8 @@ pub(crate) fn import(db: &mut Connection, source: &Path, destination: &Path) -> 
                         "Conflicting session IDs in legacy database; import rolled back".into(),
                     );
                 }
+                tx.execute("UPDATE turns SET created_at=?3 WHERE session_id=?1 AND ordinal=?2 AND created_at IS NULL",
+                    rusqlite::params![values[0], values[1], values[4]])?;
             }
         }
     }
@@ -211,13 +221,16 @@ pub(crate) fn import(db: &mut Connection, source: &Path, destination: &Path) -> 
     Ok(())
 }
 
-const SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS sessions (
+const SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY, title TEXT NOT NULL, model TEXT,
             created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS turns (
             session_id TEXT NOT NULL REFERENCES sessions(id), ordinal INTEGER NOT NULL,
-            user TEXT NOT NULL, assistant TEXT NOT NULL,
+            user TEXT NOT NULL, assistant TEXT NOT NULL, created_at INTEGER,
             PRIMARY KEY(session_id, ordinal)
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_at DESC);
@@ -264,7 +277,7 @@ mod tests {
         CREATE TABLE turns(session_id TEXT NOT NULL REFERENCES sessions(id),ordinal INTEGER NOT NULL,user TEXT NOT NULL,assistant TEXT NOT NULL,PRIMARY KEY(session_id,ordinal)) WITHOUT ROWID;
         CREATE TABLE legacy_imports(path TEXT PRIMARY KEY); PRAGMA user_version=1;
         INSERT INTO sessions VALUES('saved','Earlier chat','qwen3',10,20);
-        INSERT INTO turns VALUES('saved',0,'Remember puppy','OK puppy');
+        INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('saved',0,'Remember puppy','OK puppy');
         INSERT INTO legacy_imports VALUES('/old/chat.jsonl');";
 
     fn old_kernels(path: &Path) -> Connection {
@@ -342,12 +355,12 @@ mod tests {
             "OK puppy"
         );
         assert!(db
-            .execute("INSERT INTO turns VALUES('absent',0,'user','answer')", [])
+            .execute("INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('absent',0,'user','answer')", [])
             .is_err());
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            2
+            4
         );
         #[cfg(unix)]
         {
@@ -359,6 +372,109 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn version_two_upgrade_adds_settings_without_changing_saved_chats() {
+        let f = Fixture::new();
+        let path = f.0.join("puppygrad.db");
+        let db = open(&path).unwrap();
+        db.execute_batch(
+            "DROP TABLE app_settings; ALTER TABLE turns DROP COLUMN created_at; PRAGMA user_version=2;
+            INSERT INTO sessions VALUES('chat','Saved chat','qwen3-1.7b',1,2);
+            INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('chat',0,'hello','hi');",
+        )
+        .unwrap();
+        drop(db);
+        let db = open(&path).unwrap();
+        assert!(has_table(&db, "app_settings").unwrap());
+        assert!(has_table(&db, "kernel_modules").unwrap());
+        assert_eq!(db.query_row("SELECT model,user,assistant FROM sessions JOIN turns ON sessions.id=turns.session_id", [], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?))).unwrap(),
+            ("qwen3-1.7b".into(), "hello".into(), "hi".into()));
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn version_three_upgrade_keeps_old_turn_times_unknown_and_preserves_preferences() {
+        let f = Fixture::new();
+        let path = f.0.join("puppygrad.db");
+        let db = open(&path).unwrap();
+        db.execute_batch(
+            "ALTER TABLE turns DROP COLUMN created_at; PRAGMA user_version=3;
+            INSERT INTO sessions VALUES('chat','Saved chat','qwen3-1.7b',1,2);
+            INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('chat',0,'hello','hi');
+            INSERT INTO app_settings VALUES('last_model','qwen3-1.7b');",
+        )
+        .unwrap();
+        drop(db);
+        let db = open(&path).unwrap();
+        assert!(has_column(&db, "turns", "created_at").unwrap());
+        assert_eq!(
+            db.query_row("SELECT user,assistant,created_at FROM turns", [], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?
+            )))
+            .unwrap(),
+            ("hello".into(), "hi".into(), None)
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT value FROM app_settings WHERE key='last_model'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "qwen3-1.7b"
+        );
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn database_import_preserves_known_timestamps_and_fills_unknown_duplicate_times() {
+        let f = Fixture::new();
+        let target = f.0.join("puppygrad.db");
+        let archive = f.0.join("archive.db");
+        let original = open(&archive).unwrap();
+        original.execute_batch("INSERT INTO sessions VALUES('chat','Chat',NULL,123,123);
+            INSERT INTO turns(session_id,ordinal,user,assistant,created_at) VALUES('chat',0,'hello','hi',123);
+            INSERT INTO turns(session_id,ordinal,user,assistant,created_at) VALUES('chat',1,'second','reply',456);").unwrap();
+        let mut db = open(&target).unwrap();
+        db.execute_batch(
+            "INSERT INTO sessions VALUES('chat','Chat',NULL,123,123);
+            INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('chat',0,'hello','hi');",
+        )
+        .unwrap();
+        import(&mut db, &archive, &target).unwrap();
+        let timestamps = db
+            .prepare("SELECT created_at FROM turns ORDER BY ordinal")
+            .unwrap()
+            .query_map([], |r| r.get::<_, Option<i64>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(timestamps, [Some(123), Some(456)]);
+        assert_eq!(
+            original
+                .query_row("SELECT created_at FROM turns WHERE ordinal=0", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            123
+        );
+        import(&mut db, &archive, &target).unwrap();
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -457,9 +573,9 @@ mod tests {
         let archive = f.0.join("old.sqlite3");
         let source = Connection::open(&archive).unwrap();
         source.execute_batch(OLD_SESSIONS).unwrap();
-        source.execute_batch("INSERT INTO sessions VALUES('another','Another chat',NULL,1,2); INSERT INTO turns VALUES('another',0,'question','answer');").unwrap();
+        source.execute_batch("INSERT INTO sessions VALUES('another','Another chat',NULL,1,2); INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('another',0,'question','answer');").unwrap();
         let mut db = open(&target).unwrap();
-        db.execute_batch("INSERT INTO sessions VALUES('saved','Current chat',NULL,1,2); INSERT INTO turns VALUES('saved',0,'Different question','Different answer');").unwrap();
+        db.execute_batch("INSERT INTO sessions VALUES('saved','Current chat',NULL,1,2); INSERT INTO turns(session_id,ordinal,user,assistant) VALUES('saved',0,'Different question','Different answer');").unwrap();
         assert!(import(&mut db, &archive, &target).is_err());
         assert_eq!(
             db.query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))

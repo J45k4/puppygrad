@@ -304,9 +304,9 @@ fn format_chat_prompt(
     let system = (older_messages > 0 || feedback.is_some()).then(|| format!(
         "You are a helpful assistant. The app saves the conversation to a file. Earlier messages outside your context: {older_messages}.\n\nTo read earlier messages, your ENTIRE response must be FETCH_OLDER N, with no explanation, quotes or other text. N is a positive integer from 1 to 1024. Example response: FETCH_OLDER 2\n\nWhen asked about an earlier detail that is absent from the visible conversation, fetch earlier messages before answering. Never pretend that you fetched them, and never invent a missing detail. The app will insert the retrieved user/assistant turns before the recent messages and ask the same question again. If a fetch is refused, request fewer messages or explain that the detail is unavailable. If no earlier messages remain, answer from the visible conversation."
     ));
-    // Put the result beside the pending question so the model sees that the
-    // previous control request has already been handled, rather than repeating it.
-    let continued_prompt = feedback.map(|feedback| format!("{prompt}\n\n[Application FETCH_OLDER result: {feedback} Earlier messages still outside context: {older_messages}. Continue answering the question above using the visible conversation. Do not repeat a successful fetch. Request additional messages only if the required detail is still absent.]"));
+    // Keep the question before the fetch result and repeat it afterward. Both
+    // Qwen sizes then stay focused on the question as the fetch completes.
+    let continued_prompt = feedback.map(|feedback| format!("{prompt}\n\n[Application FETCH_OLDER result: {feedback} Earlier messages still outside context: {older_messages}. Answer the user question below using the visible conversation. Do not repeat a successful fetch. Request additional messages only if the required detail is still absent.]\n\n{prompt}"));
     format_conversation(
         qwen3,
         turns,
@@ -394,6 +394,7 @@ mod prompt_tests {
         let turns = [super::super::conversation::Turn {
             user: "My name is puppy".into(),
             assistant: "Hello puppy".into(),
+            created_at: None,
         }];
         let ordinary = format_chat_prompt(true, &turns, "What is my name", 0, None);
         assert_eq!(
@@ -414,6 +415,14 @@ mod prompt_tests {
         );
         assert!(fetched.starts_with("<|im_start|>system\n"));
         assert!(fetched.contains("[Application FETCH_OLDER result: Added 2 older messages."));
+        assert!(
+            fetched.find("What is my name").unwrap()
+                < fetched.find("[Application FETCH_OLDER result:").unwrap()
+        );
+        assert!(
+            fetched.rfind("What is my name").unwrap()
+                > fetched.find("[Application FETCH_OLDER result:").unwrap()
+        );
     }
 
     #[test]
@@ -421,6 +430,7 @@ mod prompt_tests {
         let turns = [super::super::conversation::Turn {
             user: "My name is Teppo".into(),
             assistant: "Hello Teppo".into(),
+            created_at: Some(1_700_000_000_000),
         }];
         let formatted = format_conversation(
             true,

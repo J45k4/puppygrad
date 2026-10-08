@@ -358,12 +358,12 @@ fn hip_kernel_index_adopts_files_and_rebuilds_changed_or_missing_binaries() {
     assert_eq!((source_hash.len(), binary_hash.len()), (64, 64));
     assert_eq!(cache.join(source_path), first.source_path);
     // Unsupported bookkeeping must leave the valid file cache usable.
-    db.execute_batch("PRAGMA user_version=3").unwrap();
+    db.execute_batch("PRAGMA user_version=5").unwrap();
     assert!(load().cache_hit);
     assert_eq!(
         db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
             .unwrap(),
-        3
+        5
     );
     drop(db);
     drop(first);

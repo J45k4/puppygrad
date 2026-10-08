@@ -4,6 +4,7 @@ pub mod database;
 pub mod engine;
 pub mod gpu;
 pub mod models;
+mod progress;
 pub mod runtime;
 pub mod video;
 pub mod vision;

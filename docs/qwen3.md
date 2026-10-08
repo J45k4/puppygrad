@@ -1,7 +1,8 @@
-# Qwen3-0.6B in Puppygrad
+# Qwen3 in Puppygrad
 
 [examples/qwen3_cached.pup](../examples/qwen3_cached.pup) implements the dense Qwen3 decoder
-using ordinary source functions and primitive tensor Pops. It runs through the
+using ordinary source functions and primitive tensor Pops. The same source supports
+Qwen3-0.6B and Qwen3-1.7B, using dimensions from the checkpoint config. It runs through the
 existing `llm` application and LLM buffer/FFI contract, on generated C CPU kernels
 or generated CUDA/HIP kernels. There is no Qwen model computation in Rust or Python.
 
@@ -15,11 +16,31 @@ state does **not** imply a 64-wide attention head.
 
 ## Assets and execution
 
-The tested checkpoint is the official
-[Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), at revision
-`c1899de289a04d12100db370d81485cdf75e47ca`. Its Apache-2.0 license is retained
-alongside the downloaded model. Assets, generated code, PTX and benchmark logs
+The catalog includes these official Apache-2.0 checkpoints:
+
+| Model | Pinned revision | Approximate F32 weights |
+|---|---|---:|
+| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | `c1899de289a04d12100db370d81485cdf75e47ca` | 2.22 GiB |
+| [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | 6.41 GiB |
+
+Their licenses are retained alongside downloaded models. Assets, generated code, PTX and benchmark logs
 remain under ignored `models/` and `.cache/` directories.
+
+The checkpoint loader converts BF16 weights directly into their final shared F32
+buffers with a reusable 4 MiB read buffer. A local Qwen3-1.7B checkpoint-only
+measurement on 2026-10-08 (same files, before and after the loader change) showed:
+
+| Build | Before | After |
+|---|---:|---:|
+| Development (`cargo run`) | 39.34 s | 6.49 s |
+| Release | 8.86 s | 4.88 s |
+
+These are individual runs without clearing the OS file cache; disk-cache state
+and memory pressure affect timings. They exclude tokenization, GPU upload,
+context planning and kernel preparation. The original development profile spent
+34.25 s converting BF16 values; its disk reads took 1.42 s. The Activity panel now
+reports reads and conversion separately. This changes startup work; the final
+weight format and inference precision remain F32.
 
 ```bash
 mkdir -p models/qwen3-0.6b
@@ -51,17 +72,50 @@ target/release/puppygrad emit examples/qwen3_cached.pup \
   --model-dir models/qwen3-0.6b --sequence-length 24 --backend cuda -o qwen3.cu
 ```
 
-The runtime recognizes `model_type: qwen3` and formats its single user prompt
+In the TUI, use `/model qwen3-1.7b` to select the larger model or `/download qwen3-1.7b`
+to download its assets. It uses `qwen3_cached.pup` on CPU, CUDA and HIP just like 0.6B.
+The official 1.7B checkpoint uses two Safetensors shards and an index; all three
+are included in the model manifest. An equivalent command-line run is:
+
+```bash
+target/release/puppygrad llm examples/qwen3_cached.pup \
+  --model-dir models/qwen3-1.7b --device hip:0 \
+  --prompt "Explain what a compiler does." --max-new-tokens 64 --stream
+```
+
+The runtime recognizes `model_type: qwen3` and formats its command-line user prompt
 using the official tokenizer's non-thinking generation prefix. It displays the
 assistant's generated text in both streaming and buffered modes. This is a
-single-turn text interface; the FFI still accepts ordinary token ID buffers.
+single-turn command-line interface; the TUI supports saved multi-turn sessions.
+The FFI still accepts ordinary token ID buffers.
 
 The checkpoint loader expands BF16 values to F32 for the current backends. When
 `tie_word_embeddings` is true, `lm_head.weight` binds to the embedding's existing
 input slot, even if both tensors are serialized. Qwen3's
 `max_position_embeddings` supplies the provider's context limit. The loader and
-metadata-only emitter produce identical bindings. Sharded safetensors and RoPE
-scaling variants are not implemented by this example.
+metadata-only emitter produce identical bindings for single-file and sharded
+checkpoints. With an index, all listed shards are validated before tensor values
+are loaded; weights bind in globally sorted name order. Missing files/weights,
+incorrect shard assignments, unsafe relative paths and invalid payloads are rejected.
+RoPE scaling variants are not implemented by this example.
+
+### Qwen3-1.7B HIP validation
+
+On an RX 9070 XT, with F32 weights and KV storage, 512 KV slots, a 33-token
+prompt and 64 output tokens, three release runs after one warmup measured:
+
+| Metric | Median |
+|---|---:|
+| First token | 188.0 ms |
+| Decode throughput | 59.5 tokens/s |
+| Whole request | 1.247 s |
+
+These warm timings exclude checkpoint loading and initial compilation. They
+do not predict speed at larger context capacities. Real HIP checks cover
+multi-turn name recall and `FETCH_OLDER` retrieval on both Qwen sizes. Retrieval
+feedback keeps the pending question before and after the result so both models
+continue answering it after older turns are inserted. Qwen3-1.7B still has small-model
+quality limitations; for example, it interpreted the name "Puppy" as an animal persona.
 
 The official [model card](https://huggingface.co/Qwen/Qwen3-0.6B#model-overview)
 advertises a **32,768-token context window**, shared by prompt and generated

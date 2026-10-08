@@ -268,7 +268,7 @@ mod tests {
     fn future_schema_versions_are_not_rewritten() {
         let f = Fixture::new();
         let db = f.index();
-        db.0.execute_batch("PRAGMA user_version=3").unwrap();
+        db.0.execute_batch("PRAGMA user_version=5").unwrap();
         drop(db);
         let _scope = crate::database::use_path(&f.0.join("puppygrad.db")).unwrap();
         assert!(Index::open(&f.0).is_err());
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            3
+            5
         );
     }
 }

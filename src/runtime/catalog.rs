@@ -101,10 +101,28 @@ impl Manifest {
                 "checkpoint files must be nonempty relative paths without parent traversal".into(),
             );
         }
-        for required in ["config.json", "tokenizer.json", "model.safetensors"] {
+        for required in ["config.json", "tokenizer.json"] {
             if !value.checkpoint.files.iter().any(|s| s == required) {
                 return Err(format!("LLM manifest must include {required}").into());
             }
+        }
+        if !value
+            .checkpoint
+            .files
+            .iter()
+            .any(|s| s == "model.safetensors")
+            && (!value
+                .checkpoint
+                .files
+                .iter()
+                .any(|s| s == "model.safetensors.index.json")
+                || !value
+                    .checkpoint
+                    .files
+                    .iter()
+                    .any(|s| s.ends_with(".safetensors")))
+        {
+            return Err("LLM manifest must include model.safetensors or a shard index and its .safetensors files".into());
         }
         Ok(value)
     }
@@ -213,6 +231,10 @@ pub fn load(directory: Option<&Path>) -> Result<Vec<Entry>> {
                 include_str!("../../examples/qwen3-0.6b.model.json"),
                 include_str!("../../examples/qwen3_cached.pup"),
             ),
+            (
+                include_str!("../../examples/qwen3-1.7b.model.json"),
+                include_str!("../../examples/qwen3_cached.pup"),
+            ),
         ]
         .into_iter()
         .map(|(text, program)| {
@@ -262,6 +284,28 @@ mod tests {
             assert_eq!(entry.status_in(&dir), Status::Downloaded);
         }
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn sharded_manifest_requires_the_index_and_weight_files() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../examples/qwen3-1.7b.model.json")).unwrap();
+        assert!(Manifest::parse(&manifest.to_string()).is_ok());
+        manifest["checkpoint"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|file| !file.as_str().unwrap().ends_with(".safetensors"));
+        assert!(Manifest::parse(&manifest.to_string()).is_err());
+        manifest["checkpoint"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .push("model-00001-of-00002.safetensors".into());
+        assert!(Manifest::parse(&manifest.to_string()).is_ok());
+        manifest["checkpoint"]["files"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|file| file.as_str().unwrap() != "model.safetensors.index.json");
+        assert!(Manifest::parse(&manifest.to_string()).is_err());
     }
 
     #[test]

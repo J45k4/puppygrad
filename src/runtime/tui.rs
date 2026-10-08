@@ -6,7 +6,7 @@ use super::{
     llm_ffi::{Generation, Model},
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
 };
 use ratatui::{
@@ -17,6 +17,7 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use std::{
+    collections::VecDeque,
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -58,6 +59,7 @@ pub struct Options {
 }
 
 enum Request {
+    SelectModel(usize),
     NewConversation,
     ListSessions,
     Resume(String),
@@ -81,6 +83,7 @@ enum Update {
         path: PathBuf,
         turns: Vec<Turn>,
         session: Session,
+        saved_sessions: Vec<Session>,
     },
     NewConversation(Session),
     Sessions(Vec<Session>),
@@ -90,6 +93,8 @@ enum Update {
     },
     ContextTrimmed(usize),
     Status(String),
+    Activity(String),
+    ModelState(Option<ModelState>),
     Warmed {
         error: Option<String>,
         elapsed: Duration,
@@ -111,17 +116,66 @@ enum Update {
     Error(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Preparation {
+    Loading,
+    Unprepared,
+    Preparing,
+    Ready,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelState {
+    index: usize,
+    device: String,
+    preparation: Preparation,
+}
+
+struct ActivityLine {
+    elapsed: Duration,
+    text: String,
+    download: bool,
+}
+
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/models", "Browse models and their readiness"),
+    ("/model", "Browse models or select by ID"),
+    ("/resume", "Browse saved chats or resume ID/latest"),
+    ("/sessions", "Browse saved chats"),
+    ("/new", "Start a fresh chat"),
+    ("/download", "Download model assets [id]"),
+    ("/device", "Choose cpu, cuda:0 or hip:0"),
+    ("/temperature", "Set sampling temperature N"),
+    ("/tokens", "Set output length auto or N"),
+    ("/history", "Show the session database path"),
+    ("/logs", "Show or hide the activity panel"),
+    ("/clear", "Clear the display, keep conversation"),
+    ("/help", "Show commands and keyboard shortcuts"),
+    ("/quit", "Stop and exit"),
+    ("/exit", "Stop and exit (alias of /quit)"),
+];
+
 struct App {
     entries: Vec<Entry>,
     cache: PathBuf,
     selected: usize,
+    selection_changed: bool,
     cursor: ListState,
     browser: bool,
+    model_state: Option<ModelState>,
+    downloading: Option<usize>,
+    activity: VecDeque<ActivityLine>,
+    show_activity: bool,
+    response_started: bool,
     input: Composer,
+    completion_prefix: String,
+    completion_cursor: ListState,
     transcript: String,
     history_file: Option<PathBuf>,
     session: Option<Session>,
     sessions: Option<Vec<Session>>,
+    session_browser: bool,
+    session_preview_requested: bool,
     session_cursor: ListState,
     status: String,
     device: String,
@@ -152,16 +206,191 @@ impl App {
         let mut cursor = ListState::default();
         cursor.select(Some(selected));
         Self {
-            entries, cache, selected, cursor,
+            entries, cache, selected, cursor, selection_changed: false,
             browser: false,
+            model_state: None, downloading: None,
+            activity: VecDeque::new(), show_activity: true, response_started: false,
             input: Composer::default(),
-            transcript: "Welcome to Puppygrad. Type /model to choose or download a model.\n\nChats are saved automatically. /sessions or /resume opens saved chats. /new starts a fresh chat. Type /help for commands.\n".into(),
+            completion_prefix: String::new(),
+            completion_cursor: ListState::default(),
+            transcript: "Welcome to Puppygrad. Type /models to choose or download a model.\n\nChats are saved automatically. /sessions or /resume opens saved chats. /new starts a fresh chat. Type /help for commands.\n".into(),
             history_file: None,
-            session: None, sessions: None, session_cursor: ListState::default(),
+            session: None, sessions: None, session_browser: false, session_preview_requested: false, session_cursor: ListState::default(),
             status: "Ready".into(), device,
             temperature: 0.7, limit: None,
             busy: false, warming: false, auto_warmup: true, quitting: false, scroll: 0,
             clock: Instant::now(), requests, cancel,
+        }
+    }
+
+    fn model_preview(&self) -> bool {
+        matches!(self.input.text.trim(), "/model" | "/models")
+    }
+
+    fn session_preview(&self) -> bool {
+        matches!(self.input.text.trim(), "/resume" | "/sessions")
+    }
+
+    fn command_suggestions(&self) -> Vec<(&'static str, &'static str)> {
+        let prefix = self.input.text.trim_start();
+        if self.browser
+            || self.session_browser
+            || self.input.cursor != self.input.text.len()
+            || self.input.selection().is_some()
+            || !prefix.starts_with('/')
+            || prefix.chars().any(char::is_whitespace)
+            || SLASH_COMMANDS.iter().any(|(command, _)| *command == prefix)
+        {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|(command, _)| command.starts_with(prefix))
+            .collect()
+    }
+
+    fn refresh_command_suggestions(&mut self) -> Vec<(&'static str, &'static str)> {
+        let suggestions = self.command_suggestions();
+        if self.completion_prefix != self.input.text {
+            self.completion_prefix.clone_from(&self.input.text);
+            self.completion_cursor = ListState::default();
+        }
+        if suggestions.is_empty() {
+            self.completion_cursor.select(None);
+        } else if self
+            .completion_cursor
+            .selected()
+            .is_none_or(|index| index >= suggestions.len())
+        {
+            self.completion_cursor.select(Some(0));
+        }
+        suggestions
+    }
+
+    fn complete_command_key(&mut self, key: KeyEvent) -> bool {
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        let suggestions = self.refresh_command_suggestions();
+        if suggestions.is_empty() {
+            return false;
+        }
+        let index = self.completion_cursor.selected().unwrap_or(0);
+        match key.code {
+            KeyCode::Up => self
+                .completion_cursor
+                .select(Some((index + suggestions.len() - 1) % suggestions.len())),
+            KeyCode::Down => self
+                .completion_cursor
+                .select(Some((index + 1) % suggestions.len())),
+            KeyCode::Tab | KeyCode::Enter => {
+                // Completion only edits the composer. A second Enter runs the command.
+                self.input.clear();
+                self.input.insert(suggestions[index].0);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn refresh_session_preview(&mut self) {
+        let preview = !self.browser && !self.session_browser && self.session_preview();
+        if preview && !self.session_preview_requested {
+            self.session_preview_requested = true;
+            if self.requests.send(Request::ListSessions).is_err() {
+                self.status = "Session worker unavailable; restart to browse saved chats.".into();
+            }
+        } else if !preview {
+            self.session_preview_requested = false;
+        }
+    }
+
+    fn open_session_picker(&mut self) {
+        self.browser = false;
+        self.session_browser = true;
+        self.input.clear();
+        if !self.session_preview_requested {
+            let _ = self.requests.send(Request::ListSessions);
+        }
+        if !self.busy {
+            self.status = "Saved chats · Enter resumes · Esc closes".into();
+        }
+    }
+
+    fn select_model(&mut self, index: usize) {
+        self.selected = index;
+        self.selection_changed = true;
+        self.cursor.select(Some(index));
+        if self.requests.send(Request::SelectModel(index)).is_err() {
+            self.status = "Model worker unavailable; selection could not be saved.".into();
+            return;
+        }
+        self.status = format!("Selected {}", self.entries[index].manifest.name);
+        self.warmup();
+    }
+
+    fn log_activity(&mut self, text: impl Into<String>, download: bool) {
+        let text = text.into();
+        if self.activity.back().is_some_and(|last| last.text == text) {
+            return;
+        }
+        // Keep current download progress without filling the log with byte updates.
+        if download
+            && self.activity.back().is_some_and(|last| {
+                last.download
+                    && last.text.split_once(": ").map(|(file, _)| file)
+                        == text.split_once(": ").map(|(file, _)| file)
+            })
+        {
+            self.activity.pop_back();
+        }
+        self.activity.push_back(ActivityLine {
+            elapsed: self.clock.elapsed(),
+            text,
+            download,
+        });
+        if self.activity.len() > 200 {
+            self.activity.pop_front();
+        }
+    }
+
+    fn model_status(&self, index: usize) -> String {
+        if self.downloading == Some(index) {
+            return "downloading…".into();
+        }
+        if let Some(state) = self.model_state.as_ref().filter(|s| s.index == index) {
+            let phase = match state.preparation {
+                Preparation::Loading => "loading",
+                Preparation::Unprepared => "loaded · not prepared",
+                Preparation::Preparing => "preparing kernels",
+                Preparation::Ready => "ready",
+            };
+            return format!("{phase} on {}", state.device);
+        }
+        match self.entries[index].status(&self.cache) {
+            Status::Downloaded => "downloaded · not loaded".into(),
+            status => status.to_string(),
+        }
+    }
+
+    fn close_picker_or_stop(&mut self) {
+        if self.session_browser {
+            self.session_browser = false;
+        } else if self.browser {
+            self.browser = false;
+        } else if self.model_preview()
+            || self.session_preview()
+            || !self.command_suggestions().is_empty()
+        {
+            self.input.clear();
+        } else if self.busy {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.status = "Stopping after the current step…".into();
+        } else if self.input.selection().is_some() {
+            self.input.selection_anchor = None;
+        } else {
+            self.input.clear();
         }
     }
 
@@ -188,6 +417,7 @@ impl App {
                 "Warming {} on {}… You can type a prompt.",
                 self.entries[self.selected].manifest.name, self.device
             );
+            self.log_activity(self.status.clone(), false);
         }
     }
 
@@ -202,8 +432,10 @@ impl App {
         }
         self.cancel.store(false, Ordering::Relaxed);
         if self.requests.send(Request::Download(index)).is_ok() {
+            self.downloading = Some(index);
             self.busy = true;
             self.status = format!("Downloading {}…", self.entries[index].manifest.name);
+            self.log_activity(self.status.clone(), false);
         }
     }
 
@@ -229,6 +461,7 @@ impl App {
             return;
         }
         self.input.clear();
+        self.response_started = false;
         self.transcript.push_str(&format!(
             "\nYou: {text}\n\n{}:\n",
             self.entries[self.selected].manifest.name
@@ -258,19 +491,17 @@ impl App {
             "Preparing model…"
         }
         .into();
+        self.log_activity(self.status.clone(), false);
     }
 
     fn command(&mut self, text: &str) {
         let mut parts = text.split_whitespace();
         match parts.next().unwrap_or("") {
-            "/model" => {
+            "/model" | "/models" => {
                 if let Some(id) = parts.next() {
                     if self.busy { self.status = "Stop the current operation before switching models.".into(); return; }
                     if let Some(index) = self.entries.iter().position(|e| e.manifest.id == id) {
-                        self.selected = index;
-                        self.cursor.select(Some(index));
-                        self.status = format!("Selected {}", self.entries[index].manifest.name);
-                        self.warmup();
+                        self.select_model(index);
                     } else { self.status = format!("Unknown model {id}; use /model to browse."); }
                 } else { self.cursor.select(Some(self.selected)); self.browser = true; }
             }
@@ -311,6 +542,10 @@ impl App {
                 }
             }
             "/clear" => self.transcript.clear(),
+            "/logs" => {
+                self.show_activity = !self.show_activity;
+                self.status = if self.show_activity { "Activity log shown on wide terminals" } else { "Activity log hidden" }.into();
+            }
             "/new" => {
                 if self.busy { self.status = "Stop the current operation before starting a new conversation.".into(); return; }
                 self.cancel.store(false, Ordering::Relaxed);
@@ -318,16 +553,15 @@ impl App {
                 self.status = "Starting a new conversation…".into();
             }
             "/sessions" | "/resume" => {
-                if self.busy { self.status = "Stop the current operation before switching sessions.".into(); return; }
-                let request = if text.starts_with("/resume") {
-                    parts.next().map(|id| Request::Resume(id.into())).unwrap_or(Request::ListSessions)
-                } else { Request::ListSessions };
-                self.busy = self.requests.send(request).is_ok();
-                self.status = "Loading saved chats…".into();
+                if let Some(id) = parts.next().filter(|_| text.starts_with("/resume")) {
+                    if self.busy { self.status = "Stop the current operation before switching sessions.".into(); return; }
+                    self.busy = self.requests.send(Request::Resume(id.into())).is_ok();
+                    self.status = "Resuming chat…".into();
+                } else { self.open_session_picker(); }
             }
             "/history" => self.status = self.history_file.as_ref().map_or_else(|| "Session database is opening…".into(), |path| format!("Session database: {}", path.display())),
             "/quit" | "/exit" => self.quit(),
-            "/help" => self.transcript.push_str("\n/model [id] — browse or select models\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nPageUp/PageDown scroll. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
+            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nPageUp/PageDown scroll. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
             _ => self.status = "Unknown command. Type /help.".into(),
         }
     }
@@ -377,8 +611,14 @@ impl App {
                 path,
                 turns,
                 session,
+                saved_sessions,
             } => {
-                self.restore_model(&session);
+                self.session_cursor
+                    .select((!saved_sessions.is_empty()).then_some(0));
+                self.sessions = Some(saved_sessions);
+                if !self.selection_changed && !self.busy {
+                    self.restore_model(&session);
+                }
                 self.session = Some(session);
                 self.history_file = Some(path);
                 let mut restored = String::new();
@@ -395,26 +635,32 @@ impl App {
                     .find("\nYou:")
                     .unwrap_or(self.transcript.len());
                 self.transcript.insert_str(position, &restored);
+                self.warmup();
             }
             Update::NewConversation(session) => {
                 self.session = Some(session);
-                self.sessions = None;
+                self.session_browser = false;
                 self.busy = false;
                 self.transcript.clear();
                 self.scroll = 0;
                 self.status = "New chat · previous chats are available in /sessions".into();
             }
             Update::Sessions(sessions) => {
-                self.busy = false;
-                self.browser = false;
-                self.session_cursor
-                    .select((!sessions.is_empty()).then_some(0));
+                let selected = self
+                    .sessions
+                    .as_ref()
+                    .and_then(|old| self.session_cursor.selected().and_then(|i| old.get(i)))
+                    .map(|session| &session.id);
+                self.session_cursor.select(
+                    selected
+                        .and_then(|id| sessions.iter().position(|session| session.id == *id))
+                        .or_else(|| (!sessions.is_empty()).then_some(0)),
+                );
                 self.sessions = Some(sessions);
-                self.status = "Saved chats · Enter resumes · Esc closes".into();
             }
             Update::Resumed { session, turns } => {
                 self.busy = false;
-                self.sessions = None;
+                self.session_browser = false;
                 self.browser = false;
                 self.restore_model(&session);
                 self.transcript = format!("Resumed: {}\n", session.title);
@@ -434,18 +680,31 @@ impl App {
                 self.session = Some(session);
             }
             Update::ContextTrimmed(turns) => {
+                self.log_activity(
+                    format!(
+                        "Removed {turns} older turns from active context; history stays saved."
+                    ),
+                    false,
+                );
                 self.transcript.push_str(&format!("[Removed {turns} older turns from active context; saved messages remain available.]\n\n"));
             }
-            Update::Status(status) => self.status = status,
+            Update::Status(status) => {
+                self.log_activity(status.clone(), false);
+                self.status = status;
+            }
+            Update::Activity(message) => self.log_activity(message, false),
+            Update::ModelState(state) => self.model_state = state,
             Update::Warmed { error, elapsed } => {
+                let message = error.map_or_else(
+                    || format!("Ready · warmed in {:.2}s", elapsed.as_secs_f64()),
+                    |error| format!("Warmup: {error}"),
+                );
+                self.log_activity(message.clone(), false);
                 // A submitted prompt already queued behind warmup owns busy now.
                 if self.warming {
                     self.warming = false;
                     self.busy = false;
-                    self.status = error.map_or_else(
-                        || format!("Ready · warmed in {:.2}s", elapsed.as_secs_f64()),
-                        |error| format!("Warmup: {error}"),
-                    );
+                    self.status = message;
                 }
             }
             Update::Progress { file, bytes, total } => {
@@ -457,9 +716,15 @@ impl App {
                         bytes as f64 * 100. / total.max(1) as f64
                     ),
                     None => format!("Downloading {file}: {:.1} MiB", bytes as f64 / 1048576.),
-                }
+                };
+                self.log_activity(self.status.clone(), true);
             }
             Update::Chunk(text) => {
+                if !self.response_started {
+                    self.response_started = true;
+                    self.status = "Generating response…".into();
+                    self.log_activity(self.status.clone(), false);
+                }
                 self.transcript.push_str(&text);
                 self.scroll = 0;
             }
@@ -485,15 +750,20 @@ impl App {
                     tokens as f64 / elapsed.as_secs_f64().max(0.000001),
                     first_token.map_or_else(|| "—".into(), |d| format!("{:.2}s", d.as_secs_f64()))
                 );
+                self.log_activity(self.status.clone(), false);
             }
             Update::Downloaded => {
+                self.downloading = None;
                 self.busy = false;
                 self.status = "Download complete. Press Enter to select the model.".into();
+                self.log_activity(self.status.clone(), false);
                 self.warmup();
             }
             Update::Error(error) => {
+                self.downloading = None;
                 self.busy = false;
                 self.status = error.clone();
+                self.log_activity(format!("Error: {error}"), false);
                 self.transcript.push_str(&format!("\n{error}\n"));
             }
         }
@@ -511,6 +781,10 @@ impl App {
     }
 
     fn resume_selected(&mut self) {
+        if self.busy {
+            self.status = "Stop the current operation before switching chats; Esc closes the list, then Esc stops the operation.".into();
+            return;
+        }
         let session = self
             .sessions
             .as_ref()
@@ -525,6 +799,7 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        let suggestions = self.refresh_command_suggestions();
         let layout = self
             .input
             .layout(frame.area().width.saturating_sub(1).max(1) as usize);
@@ -555,15 +830,104 @@ impl App {
             Paragraph::new(title).block(Block::new().borders(Borders::BOTTOM)),
             header,
         );
-        if let Some(sessions) = &self.sessions {
-            if sessions.is_empty() {
+        let body = if self.show_activity && body.width >= 110 && body.height >= 6 {
+            let [main, activity] = Layout::horizontal([
+                Constraint::Min(60),
+                Constraint::Length((body.width / 3).clamp(32, 60)),
+            ])
+            .areas(body);
+            let block = Block::new()
+                .borders(Borders::LEFT)
+                .padding(Padding::horizontal(1))
+                .title(" Activity · /logs ");
+            let inner = block.inner(activity);
+            let lines = if self.activity.is_empty() {
+                vec![Line::from(
+                    "Model loading, compilation and generation events will appear here.",
+                )]
+            } else {
+                self.activity
+                    .iter()
+                    .flat_map(|event| {
+                        let seconds = event.elapsed.as_secs();
+                        event.text.lines().enumerate().map(move |(i, line)| {
+                            Line::from(vec![
+                                Span::styled(
+                                    if i == 0 {
+                                        format!("{:02}:{:02} ", seconds / 60, seconds % 60)
+                                    } else {
+                                        "      ".into()
+                                    },
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::raw(line),
+                            ])
+                        })
+                    })
+                    .collect()
+            };
+            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+            let scroll = paragraph
+                .line_count(inner.width.max(1))
+                .saturating_sub(inner.height as usize)
+                .min(u16::MAX as usize) as u16;
+            frame.render_widget(paragraph.block(block).scroll((scroll, 0)), activity);
+            main
+        } else {
+            body
+        };
+        let body = if !suggestions.is_empty() {
+            let [main, completions] = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(
+                    (suggestions.len().min(5) as u16 + 1).min(body.height.saturating_sub(1)),
+                ),
+            ])
+            .areas(body);
+            let items: Vec<_> = suggestions
+                .iter()
+                .map(|(command, description)| {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(*command, Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("  {description}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                })
+                .collect();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::new().title(" Commands · ↑↓ choose · Tab/Enter complete "))
+                    .highlight_style(Style::default().bg(Color::DarkGray))
+                    .highlight_symbol("› "),
+                completions,
+                &mut self.completion_cursor,
+            );
+            main
+        } else {
+            body
+        };
+        if self.session_browser || (!self.browser && self.session_preview()) {
+            if self
+                .sessions
+                .as_ref()
+                .is_none_or(|sessions| sessions.is_empty())
+            {
                 frame.render_widget(
-                    Paragraph::new("No saved chats yet. Send a message to save your first chat.")
-                        .block(Block::new().title(" Sessions ")),
+                    Paragraph::new(if self.sessions.is_none() {
+                        "Loading saved chats…"
+                    } else {
+                        "No saved chats yet. Send a message to save your first chat."
+                    })
+                    .block(Block::new().title(" Sessions ")),
                     body,
                 );
             } else {
-                let items = sessions
+                let items = self
+                    .sessions
+                    .as_ref()
+                    .unwrap()
                     .iter()
                     .map(|session| {
                         let active = self.session.as_ref().is_some_and(|s| s.id == session.id);
@@ -592,7 +956,7 @@ impl App {
                     &mut self.session_cursor,
                 );
             }
-        } else if self.browser {
+        } else if self.browser || self.model_preview() {
             let items: Vec<_> = self
                 .entries
                 .iter()
@@ -603,13 +967,24 @@ impl App {
                     } else {
                         ""
                     };
+                    let color = if self.downloading == Some(i) {
+                        Color::Yellow
+                    } else if let Some(state) = self.model_state.as_ref().filter(|s| s.index == i) {
+                        if state.preparation == Preparation::Ready {
+                            Color::Green
+                        } else {
+                            Color::Yellow
+                        }
+                    } else if entry.status(&self.cache) == Status::Downloaded {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    };
                     ListItem::new(vec![
-                        Line::from(format!(
-                            "{}{} — {}",
-                            entry.manifest.name,
-                            selected,
-                            entry.status(&self.cache)
-                        )),
+                        Line::from(vec![
+                            Span::raw(format!("{}{} — ", entry.manifest.name, selected)),
+                            Span::styled(self.model_status(i), Style::default().fg(color)),
+                        ]),
                         Line::from(format!(
                             "  {} · {}",
                             entry.manifest.id, entry.manifest.description
@@ -646,12 +1021,16 @@ impl App {
         } else {
             self.status.clone()
         };
-        let hints = if self.sessions.is_some() {
+        let hints = if self.session_browser {
             " · ↑↓ browse · Enter resume · Esc close"
         } else if self.browser {
             " · ↑↓ browse · Enter select/download · d download · Esc close"
+        } else if self.model_preview() || self.session_preview() {
+            " · ↑↓ browse · Enter open · Esc close"
+        } else if !suggestions.is_empty() {
+            " · ↑↓ choose · Tab/Enter complete · Esc close"
         } else {
-            " · Enter send · Shift+Enter newline · /model · /help · Ctrl-C quit"
+            " · Enter send · Shift+Enter newline · /models · /help · Ctrl-C quit"
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -667,7 +1046,7 @@ impl App {
             ])),
             status,
         );
-        let title = if self.sessions.is_some() {
+        let title = if self.session_browser {
             " Close sessions to enter a prompt "
         } else if self.browser {
             " Close model browser to enter a prompt "
@@ -716,7 +1095,7 @@ impl App {
                 .collect::<Vec<_>>(),
         );
         frame.render_widget(Paragraph::new(visible).block(block), input);
-        if !self.browser && self.sessions.is_none() && content.height > 0 && content.width > 0 {
+        if !self.browser && !self.session_browser && content.height > 0 && content.width > 0 {
             frame.set_cursor_position((
                 content.x + (layout.cursor_column as u16).min(content.width - 1),
                 content.y + (layout.cursor_row - first) as u16,
@@ -742,6 +1121,7 @@ impl App {
             if self.quitting && !self.busy {
                 break;
             }
+            self.refresh_session_preview();
             terminal.draw(|frame| self.render(frame))?;
             if !event::poll(Duration::from_millis(50))? {
                 continue;
@@ -749,7 +1129,7 @@ impl App {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if !self.browser
-                        && self.sessions.is_none()
+                        && !self.session_browser
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         match key.code {
@@ -775,24 +1155,31 @@ impl App {
                         continue;
                     }
                     if key.code == KeyCode::Esc {
-                        if self.busy {
-                            self.cancel.store(true, Ordering::Relaxed);
-                            self.status = "Stopping after the current step…".into();
-                        } else if self.sessions.is_some() {
-                            self.sessions = None;
-                        } else if self.browser {
-                            self.browser = false;
-                        } else if self.input.selection().is_some() {
-                            self.input.selection_anchor = None;
-                        } else {
-                            self.input.clear();
-                        }
+                        self.close_picker_or_stop();
                         continue;
                     }
-                    if self.sessions.is_some() {
-                        let count = self.sessions.as_ref().unwrap().len();
+                    if self.complete_command_key(key) {
+                        continue;
+                    }
+                    if !self.session_browser
+                        && !self.browser
+                        && self.model_preview()
+                        && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab)
+                    {
+                        self.browser = true;
+                        self.input.clear();
+                    }
+                    if !self.browser
+                        && !self.session_browser
+                        && self.session_preview()
+                        && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab)
+                    {
+                        self.open_session_picker();
+                    }
+                    if self.session_browser {
+                        let count = self.sessions.as_ref().map_or(0, Vec::len);
                         let index = self.session_cursor.selected().unwrap_or(0);
-                        if !self.busy && count > 0 {
+                        if count > 0 {
                             match key.code {
                                 KeyCode::Up => self
                                     .session_cursor
@@ -815,14 +1202,14 @@ impl App {
                             }
                             KeyCode::Enter if !self.busy => {
                                 if self.entries[index].status(&self.cache) == Status::Downloaded {
-                                    self.selected = index;
                                     self.browser = false;
-                                    self.status =
-                                        format!("Selected {}", self.entries[index].manifest.name);
-                                    self.warmup();
+                                    self.select_model(index);
                                 } else {
                                     self.download(index);
                                 }
+                            }
+                            KeyCode::Enter => {
+                                self.status = "Stop the current operation before switching models; Esc closes this list, then Esc stops the operation.".into();
                             }
                             KeyCode::Char('d') => self.download(index),
                             _ => {}
@@ -878,7 +1265,7 @@ impl App {
                         }
                     }
                 }
-                Event::Paste(text) if !self.browser => self
+                Event::Paste(text) if !self.browser && !self.session_browser => self
                     .input
                     .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
                 Event::Resize(_, _) => self.input.reset_column(),
@@ -1228,6 +1615,10 @@ fn worker(
     resume: Option<String>,
 ) {
     // ABI handles are deliberately created and freed on this one owner thread.
+    let activity = updates.clone();
+    let _progress_scope = crate::progress::listen(move |message| {
+        let _ = activity.send(Update::Activity(message.into()));
+    });
     let mut loaded: Option<(usize, String, Model)> = None;
     let mut tokenizer: Option<(usize, tokenizers::Tokenizer)> = None;
     let mut conversation = match Conversation::open(&history_file) {
@@ -1259,32 +1650,80 @@ fn worker(
         let _ = updates.send(Update::Error(format!("History migration: {error}")));
         return;
     }
+    match conversation.last_model() {
+        Ok(Some(id)) if entries.iter().any(|entry| entry.manifest.id == id) => {
+            conversation.model = Some(id);
+        }
+        Ok(Some(id)) => {
+            let _ = updates.send(Update::Activity(format!(
+                "Saved model {id} is not in this catalog; using the default."
+            )));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = updates.send(Update::Activity(format!(
+                "Could not read last model: {error}"
+            )));
+        }
+    }
     if let Some(id) = resume {
         if let Err(error) = conversation.resume(&id) {
             let _ = updates.send(Update::Error(format!("Resume: {error}")));
+        } else if let Some(id) = conversation
+            .model
+            .as_deref()
+            .filter(|id| entries.iter().any(|entry| entry.manifest.id == *id))
+        {
+            save_model_preference(&conversation, id, &updates);
         }
     }
     let _ = updates.send(Update::HistoryLoaded {
         path: conversation.path.clone(),
         turns: conversation.turns.clone(),
         session: conversation.current(),
+        saved_sessions: conversation.sessions().unwrap_or_else(|error| {
+            let _ = updates.send(Update::Activity(format!(
+                "Could not load saved chats: {error}"
+            )));
+            Vec::new()
+        }),
     });
     for request in requests {
         let shutdown = matches!(&request, Request::Shutdown);
         let warming = matches!(&request, Request::Warmup { .. });
+        let inference = matches!(&request, Request::Warmup { .. } | Request::Generate { .. });
         let warmup_started = Instant::now();
         let result: Result<()> = (|| {
             match request {
                 Request::Shutdown => return Ok(()),
+                Request::SelectModel(index) => {
+                    let id = &entries[index].manifest.id;
+                    save_model_preference(&conversation, id, &updates);
+                    conversation.model = Some(id.clone());
+                }
                 Request::NewConversation => {
                     conversation.reset()?;
                     let _ = updates.send(Update::NewConversation(conversation.current()));
                 }
-                Request::ListSessions => {
-                    let _ = updates.send(Update::Sessions(conversation.sessions()?));
-                }
+                Request::ListSessions => match conversation.sessions() {
+                    Ok(sessions) => {
+                        let _ = updates.send(Update::Sessions(sessions));
+                    }
+                    Err(error) => {
+                        let _ = updates.send(Update::Activity(format!(
+                            "Could not load saved chats: {error}"
+                        )));
+                    }
+                },
                 Request::Resume(id) => {
                     let session = conversation.resume(&id)?;
+                    if let Some(id) = session
+                        .model
+                        .as_deref()
+                        .filter(|id| entries.iter().any(|entry| entry.manifest.id == *id))
+                    {
+                        save_model_preference(&conversation, id, &updates);
+                    }
                     let _ = updates.send(Update::Resumed {
                         session,
                         turns: conversation.turns.clone(),
@@ -1329,6 +1768,9 @@ fn worker(
                     }
                     let started = Instant::now();
                     let entry = &entries[index];
+                    if !warming {
+                        save_model_preference(&conversation, &entry.manifest.id, &updates);
+                    }
                     let dir = entry.model_dir(&cache);
                     if tokenizer
                         .as_ref()
@@ -1364,6 +1806,11 @@ fn worker(
                     {
                         // Release the old weights before loading the next model.
                         loaded = None;
+                        let _ = updates.send(Update::ModelState(Some(ModelState {
+                            index,
+                            device: device.clone(),
+                            preparation: Preparation::Loading,
+                        })));
                         let _ = updates.send(Update::Status(format!(
                             "Loading {} and planning context on {device}…",
                             entry.manifest.name
@@ -1389,6 +1836,11 @@ fn worker(
                         )?;
                         llm::validate_tokenizer(&model, tokenizer)?;
                         loaded = Some((index, device.clone(), model));
+                        let _ = updates.send(Update::ModelState(Some(ModelState {
+                            index,
+                            device: device.clone(),
+                            preparation: Preparation::Preparing,
+                        })));
                     }
                     if cancel.load(Ordering::Relaxed) {
                         return Err("Generation stopped".into());
@@ -1427,12 +1879,19 @@ fn worker(
                                 if cancel.load(Ordering::Relaxed) {
                                     return Err("Warmup stopped".into());
                                 }
-                                eprintln!("optional prefill warmup skipped: {error}");
+                                let _ = updates.send(Update::Activity(format!(
+                                    "Optional prefill warmup skipped: {error}"
+                                )));
                             }
                         }
                         if cancel.load(Ordering::Relaxed) {
                             return Err("Warmup stopped".into());
                         }
+                        let _ = updates.send(Update::ModelState(Some(ModelState {
+                            index,
+                            device: device.clone(),
+                            preparation: Preparation::Ready,
+                        })));
                         let _ = updates.send(Update::Warmed {
                             error: None,
                             elapsed: warmup_started.elapsed(),
@@ -1454,6 +1913,11 @@ fn worker(
                         &cancel,
                         started,
                     )?;
+                    let _ = updates.send(Update::ModelState(Some(ModelState {
+                        index,
+                        device,
+                        preparation: Preparation::Ready,
+                    })));
                 }
             }
             Ok(())
@@ -1461,6 +1925,16 @@ fn worker(
         if let Err(error) = result {
             if warming {
                 loaded = None;
+            }
+            if inference {
+                let state = loaded.as_ref().map(|(index, device, _)| ModelState {
+                    index: *index,
+                    device: device.clone(),
+                    preparation: Preparation::Unprepared,
+                });
+                let _ = updates.send(Update::ModelState(state));
+            }
+            if warming {
                 let _ = updates.send(Update::Warmed {
                     error: Some(error.to_string()),
                     elapsed: warmup_started.elapsed(),
@@ -1472,6 +1946,14 @@ fn worker(
         if shutdown {
             break;
         }
+    }
+}
+
+fn save_model_preference(conversation: &Conversation, id: &str, updates: &Sender<Update>) {
+    if let Err(error) = conversation.remember_model(id) {
+        let _ = updates.send(Update::Activity(format!(
+            "Could not save last model: {error}"
+        )));
     }
 }
 
@@ -1698,7 +2180,6 @@ pub fn run(options: Options) -> Result<()> {
             )
         )?;
         enhanced_keyboard = true;
-        app.warmup();
         app.events(&updates, &mut terminal)
     })();
     if enhanced_keyboard {
@@ -1731,6 +2212,186 @@ mod tests {
 
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn slash_completion_covers_all_commands_without_executing_them() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let expected = [
+            "/models",
+            "/model",
+            "/resume",
+            "/sessions",
+            "/new",
+            "/download",
+            "/device",
+            "/temperature",
+            "/tokens",
+            "/history",
+            "/logs",
+            "/clear",
+            "/help",
+            "/quit",
+            "/exit",
+        ];
+        let transcript = app.transcript.clone();
+        app.busy = true;
+        app.warming = true;
+        for (index, command) in expected.iter().enumerate() {
+            app.input.clear();
+            app.input.insert("/");
+            assert_eq!(
+                app.command_suggestions()
+                    .iter()
+                    .map(|s| s.0)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for _ in 0..index {
+                assert!(app.complete_command_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+            }
+            assert!(app.complete_command_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert_eq!(app.input.text, *command);
+            // Completed commands go through normal submission, including existing pickers.
+            assert!(!app.complete_command_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(app.busy && app.warming && !app.quitting);
+            assert!(!app.browser && !app.session_browser && app.show_activity);
+            assert!(!app.cancel.load(Ordering::Relaxed));
+            assert_eq!(app.transcript, transcript);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn slash_completion_filters_resets_navigation_and_respects_text_editing() {
+        let f = WarmupFixture::new();
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.input.insert("/");
+        assert!(app.complete_command_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(
+            app.completion_cursor.selected(),
+            Some(SLASH_COMMANDS.len() - 1)
+        );
+        app.input.insert("mod");
+        assert_eq!(
+            app.refresh_command_suggestions()
+                .iter()
+                .map(|s| s.0)
+                .collect::<Vec<_>>(),
+            ["/models", "/model"]
+        );
+        assert_eq!(app.completion_cursor.selected(), Some(0));
+        assert!(app.complete_command_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(app.complete_command_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.input.text, "/model");
+        assert!(app.model_preview());
+        for text in [
+            "hello /resu",
+            "/resume latest",
+            "/resu\n",
+            "/unknown",
+            "/résu",
+        ] {
+            app.input.clear();
+            app.input.insert(text);
+            assert!(app.command_suggestions().is_empty(), "{text}");
+        }
+        app.input.clear();
+        app.input.insert("/resu");
+        assert_eq!(
+            app.command_suggestions(),
+            [("/resume", SLASH_COMMANDS[2].1)]
+        );
+        assert!(!app.complete_command_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+        app.input.horizontal(false, false, false);
+        assert!(app.command_suggestions().is_empty());
+        app.input.horizontal(true, false, false);
+        app.input.select_all();
+        assert!(app.command_suggestions().is_empty());
+        app.input.selection_anchor = None;
+        app.browser = true;
+        assert!(app.command_suggestions().is_empty());
+        app.browser = false;
+        app.session_browser = true;
+        assert!(app.command_suggestions().is_empty());
+    }
+
+    #[test]
+    fn slash_completion_renders_beside_activity_and_opens_resume_preview_during_warmup() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.busy = true;
+        app.warming = true;
+        app.sessions = Some(vec![session()]);
+        app.input.insert("/resu");
+        app.log_activity("Loading model checkpoint", false);
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for text in [
+            "Welcome to Puppygrad",
+            "Commands",
+            "/resume",
+            "Tab/Enter complete",
+            "Loading model checkpoint",
+        ] {
+            assert!(screen.contains(text), "{text}: {screen}");
+        }
+        app.close_picker_or_stop();
+        assert!(app.input.text.is_empty() && app.busy && app.warming);
+        assert!(!app.cancel.load(Ordering::Relaxed));
+        app.input.insert("/resu");
+        assert!(app.complete_command_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        app.refresh_session_preview();
+        assert!(matches!(rx.try_recv().unwrap(), Request::ListSessions));
+        assert!(app.session_preview() && !app.session_browser && app.busy);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Test chat") && !screen.contains("Commands"));
+        app.submit();
+        assert!(app.session_browser && app.busy && app.warming);
+        assert!(rx.try_recv().is_err());
+        for (width, height) in [(20, 12), (1, 1)] {
+            app.session_browser = false;
+            app.input.clear();
+            app.input.insert("/");
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+        }
+    }
 
     #[test]
     fn possible_fetch_commands_are_hidden_and_ordinary_prefixes_stream() {
@@ -1778,10 +2439,12 @@ mod tests {
         ));
         app.update(Update::HistoryLoaded {
             session: session(),
+            saved_sessions: vec![],
             path: f.root.join("conversation.jsonl"),
             turns: vec![Turn {
                 user: "old question".into(),
                 assistant: "old answer".into(),
+                created_at: None,
             }],
         });
         assert!(
@@ -1845,13 +2508,253 @@ mod tests {
             turns: vec![Turn {
                 user: "saved question".into(),
                 assistant: "saved answer".into(),
+                created_at: None,
             }],
         });
-        assert!(app.sessions.is_none());
+        assert!(!app.session_browser);
         assert!(!app.busy);
         assert!(app.transcript.contains("saved answer"));
         app.command("/resume latest");
         assert!(matches!(rx.try_recv().unwrap(), Request::Resume(id) if id == "latest"));
+    }
+
+    #[test]
+    fn resume_previews_cached_chats_while_typing_and_keeps_busy_operations_owned() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.auto_warmup = false;
+        let mut saved = session();
+        saved.title = "A previous conversation".into();
+        saved.updated = "2026-10-08 12:34".into();
+        saved.model = Some("qwen3-1.7b".into());
+        saved.turns = 4;
+        app.update(Update::HistoryLoaded {
+            path: f.root.join("puppygrad.db"),
+            session: session(),
+            turns: vec![],
+            saved_sessions: vec![saved.clone()],
+        });
+        app.input.insert("/resum");
+        app.refresh_session_preview();
+        assert!(rx.try_recv().is_err());
+        app.input.insert("e");
+        app.refresh_session_preview();
+        app.refresh_session_preview();
+        assert!(matches!(rx.try_recv().unwrap(), Request::ListSessions));
+        assert!(rx.try_recv().is_err());
+        assert!(!app.session_browser && app.input.text == "/resume");
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("A previous conversation"));
+        assert!(screen.contains("2026-10-08 12:34"));
+        assert!(screen.contains("4 turns"));
+        assert!(screen.contains("qwen3-1.7b"));
+        app.busy = true;
+        app.warming = true;
+        let mut newer = saved.clone();
+        newer.id = "ffffffffffffffffffffffffffffffff".into();
+        newer.title = "Another conversation".into();
+        app.update(Update::Sessions(vec![newer.clone(), saved.clone()]));
+        assert!(app.busy && app.warming);
+        assert_eq!(app.session_cursor.selected(), Some(1)); // Keep the highlighted chat after refresh.
+        app.close_picker_or_stop();
+        app.refresh_session_preview();
+        assert!(!app.cancel.load(Ordering::Relaxed));
+        app.update(Update::Sessions(vec![newer, saved.clone()])); // A late reply only refreshes the cache.
+        assert!(!app.session_browser && !app.session_preview() && app.busy);
+        app.input.insert("/resume");
+        app.refresh_session_preview();
+        assert!(matches!(rx.try_recv().unwrap(), Request::ListSessions));
+        app.open_session_picker();
+        app.resume_selected();
+        assert!(rx.try_recv().is_err()); // Browsing is allowed; switching during warmup is blocked.
+        app.busy = false;
+        app.warming = false;
+        app.resume_selected();
+        assert!(matches!(rx.try_recv().unwrap(), Request::Resume(id) if id == saved.id));
+    }
+
+    #[test]
+    fn sessions_preview_distinguishes_loading_from_empty_and_leaves_commands_editable() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.input.insert("/sessions");
+        app.refresh_session_preview();
+        assert!(matches!(rx.try_recv().unwrap(), Request::ListSessions));
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Loading saved chats"));
+        app.update(Update::Sessions(vec![]));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("No saved chats yet"));
+        assert!(!app.session_browser && !app.busy);
+        app.input.clear();
+        app.input.insert("/resume latest");
+        assert!(!app.session_preview());
+        app.submit();
+        assert!(matches!(rx.try_recv().unwrap(), Request::Resume(id) if id == "latest"));
+    }
+
+    #[test]
+    fn last_selected_model_survives_restart_without_messages_and_resume_overrides_it() {
+        let mut f = WarmupFixture::new();
+        let mut other = f.entries[0].clone();
+        other.manifest.id.push_str("-other");
+        f.entries.push(other);
+        let path = f.root.join("puppygrad.db");
+        let run = |requests: Vec<Request>, resume: Option<String>| {
+            let (tx, rx) = mpsc::channel();
+            let (updates, received) = mpsc::channel();
+            for request in requests {
+                tx.send(request).unwrap();
+            }
+            tx.send(Request::Shutdown).unwrap();
+            worker(
+                f.entries.clone(),
+                f.cache.clone(),
+                rx,
+                updates,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                path.clone(),
+                resume,
+            );
+            received
+                .try_iter()
+                .find_map(|update| match update {
+                    Update::HistoryLoaded { session, turns, .. } => Some((session, turns)),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        run(vec![Request::SelectModel(1)], None);
+        let (fresh, turns) = run(vec![], None);
+        assert_eq!(
+            fresh.model.as_deref(),
+            Some(f.entries[1].manifest.id.as_str())
+        );
+        assert!(turns.is_empty());
+        let mut chat = Conversation::open(&path).unwrap();
+        assert!(chat.sessions().unwrap().is_empty()); // Selection creates no chat or turn.
+        chat.model = Some(f.entries[0].manifest.id.clone());
+        chat.append("old question".into(), "old answer".into())
+            .unwrap();
+        let saved_id = chat.session_id.clone();
+        assert_eq!(
+            run(vec![], None).0.model.as_deref(),
+            Some(f.entries[1].manifest.id.as_str())
+        );
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute("DELETE FROM app_settings", []).unwrap();
+        assert_eq!(
+            run(vec![], None).0.model.as_deref(),
+            Some(f.entries[0].manifest.id.as_str())
+        );
+        chat.remember_model(&f.entries[1].manifest.id).unwrap();
+        let (resumed, turns) = run(vec![], Some(saved_id.clone()));
+        assert_eq!(resumed.id, saved_id);
+        assert_eq!(
+            resumed.model.as_deref(),
+            Some(f.entries[0].manifest.id.as_str())
+        );
+        assert_eq!(turns[0].assistant, "old answer");
+        assert_eq!(
+            chat.last_model().unwrap().as_deref(),
+            Some(f.entries[0].manifest.id.as_str())
+        );
+        chat.remember_model("removed-model").unwrap();
+        assert!(run(vec![], None).0.model.is_none()); // Catalog changes use the ordinary default.
+        let other_path = f.root.join("other.db");
+        assert!(Conversation::open(&other_path)
+            .unwrap()
+            .last_model()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn startup_warms_restored_model_and_does_not_replace_an_explicit_selection() {
+        let mut f = WarmupFixture::new();
+        let mut other = f.entries[0].clone();
+        other.manifest.id.push_str("-other");
+        let dir = other.model_dir(&f.cache);
+        fs::create_dir_all(&dir).unwrap();
+        for name in &other.manifest.checkpoint.files {
+            fs::copy(f.entries[0].model_dir(&f.cache).join(name), dir.join(name)).unwrap();
+        }
+        f.entries.push(other);
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut saved = session();
+        saved.model = Some(f.entries[1].manifest.id.clone());
+        app.update(Update::HistoryLoaded {
+            path: f.root.join("puppygrad.db"),
+            session: saved.clone(),
+            turns: vec![],
+            saved_sessions: vec![],
+        });
+        assert_eq!(app.selected, 1);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Request::Warmup { index: 1, .. }
+        ));
+        app.update(Update::Warmed {
+            error: None,
+            elapsed: Duration::ZERO,
+        });
+        app.auto_warmup = false;
+        let id = app.entries[0].manifest.id.clone();
+        app.command(&format!("/model {id}"));
+        assert!(matches!(rx.try_recv().unwrap(), Request::SelectModel(0)));
+        app.update(Update::HistoryLoaded {
+            path: f.root.join("puppygrad.db"),
+            session: saved,
+            turns: vec![],
+            saved_sessions: vec![],
+        });
+        assert_eq!(app.selected, 0);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -1951,11 +2854,22 @@ mod tests {
     #[test]
     #[ignore = "requires the full Qwen3-0.6B checkpoint and an AMD GPU"]
     fn qwen_chat_remembers_a_name_across_normal_turns() {
-        let dir = PathBuf::from("models/qwen3-0.6b");
+        qwen_name_chat("qwen3-0.6b");
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-1.7B checkpoint and an AMD GPU"]
+    fn qwen17_chat_remembers_a_name_across_normal_turns() {
+        qwen_name_chat("qwen3-1.7b");
+    }
+
+    fn qwen_name_chat(id: &str) {
+        let dir = PathBuf::from("models").join(id);
         let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
         let cache = PathBuf::from(".cache/pup/conversation-validation");
         let mut chat =
-            Conversation::open(&cache.join(format!("name-{}.jsonl", std::process::id()))).unwrap();
+            Conversation::open(&cache.join(format!("name-{id}-{}.db", std::process::id())))
+                .unwrap();
         chat.reset().unwrap();
         let _database_scope = crate::database::use_path(&chat.path).unwrap();
         let mut model = llm::load_model_with_policy(
@@ -1985,7 +2899,7 @@ mod tests {
         };
         model.infer(&[0], warm, None).unwrap();
         model.infer(&[0; 8], warm, None).unwrap();
-        for prompt in ["hello", "My name is puppy", "What is my name"] {
+        for prompt in ["hello", "my name is puppy", "What is my name?"] {
             let (tx, rx) = mpsc::channel();
             generate_conversation(
                 &mut model,
@@ -2011,7 +2925,7 @@ mod tests {
                 })
                 .collect::<String>();
             println!("{prompt}: {text}");
-            if prompt == "What is my name" {
+            if prompt == "What is my name?" {
                 assert!(text.to_lowercase().contains("puppy"), "{text}");
             }
         }
@@ -2020,10 +2934,20 @@ mod tests {
     #[test]
     #[ignore = "requires the full Qwen3-0.6B checkpoint and an AMD GPU"]
     fn qwen_chat_remembers_and_fetches_archived_messages() {
-        let dir = PathBuf::from("models/qwen3-0.6b");
+        qwen_archive_chat("qwen3-0.6b");
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-1.7B checkpoint and an AMD GPU"]
+    fn qwen17_chat_fetches_archived_messages() {
+        qwen_archive_chat("qwen3-1.7b");
+    }
+
+    fn qwen_archive_chat(id: &str) {
+        let dir = PathBuf::from("models").join(id);
         let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
         let cache = PathBuf::from(".cache/pup/conversation-validation");
-        let path = cache.join(format!("chat-{}.jsonl", std::process::id()));
+        let path = cache.join(format!("chat-{id}-{}.db", std::process::id()));
         let mut chat = Conversation::open(&path).unwrap();
         chat.reset().unwrap();
         chat.append(
@@ -2340,6 +3264,9 @@ mod tests {
         assert!(
             matches!(received.try_recv().unwrap(), Update::HistoryLoaded { turns, .. } if turns.is_empty())
         );
+        let state = received.try_recv().unwrap();
+        assert!(matches!(state, Update::ModelState(None)));
+        app.update(state);
         let update = received.try_recv().unwrap();
         assert!(matches!(&update, Update::Warmed { error: Some(_), .. }));
         app.update(update);
@@ -2380,9 +3307,17 @@ mod tests {
                 limit: None,
             })
             .unwrap();
+        let mut preparation = Vec::new();
+        let mut activity = Vec::new();
         loop {
             match received.recv_timeout(Duration::from_secs(15)).unwrap() {
                 Update::Status(_) | Update::HistoryLoaded { .. } => {}
+                Update::Activity(message) => activity.push(message),
+                Update::ModelState(Some(state)) => {
+                    assert_eq!(state.index, 0);
+                    assert_eq!(state.device, "cpu");
+                    preparation.push(state.preparation);
+                }
                 Update::Warmed { error, .. } => {
                     assert!(error.is_none(), "{error:?}");
                     break;
@@ -2390,6 +3325,19 @@ mod tests {
                 _ => panic!("warmup emitted conversation output"),
             }
         }
+        assert_eq!(
+            preparation,
+            [
+                Preparation::Loading,
+                Preparation::Preparing,
+                Preparation::Ready
+            ]
+        );
+        assert!(activity.iter().any(|s| s == "Loading checkpoint weights (read + conversion)…"));
+        assert!(activity
+            .iter()
+            .any(|s| s.starts_with("Compiling CPU module")));
+        assert!(activity.iter().any(|s| s.starts_with("CPU module ready")));
         assert!(fs::read_dir(f.cache.join("compiled/cpu"))
             .unwrap()
             .any(|p| p.unwrap().path().extension().is_some_and(|e| e == "so")));
@@ -2669,8 +3617,11 @@ mod tests {
             tx,
             Arc::new(AtomicBool::new(false)),
         );
-        app.command("/model");
-        assert!(app.browser);
+        // Preview is rendered before Enter, without taking focus from typing.
+        app.input.insert("/model");
+        assert!(app.model_preview() && !app.browser);
+        app.input.insert("s");
+        assert!(app.model_preview() && !app.browser);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let screen: String = terminal
@@ -2682,12 +3633,213 @@ mod tests {
             .collect();
         assert!(screen.contains("GPT-2 small"));
         assert!(screen.contains("Qwen3-0.6B"));
+        assert!(screen.contains("Qwen3-1.7B"));
         assert!(screen.contains("downloaded"));
         assert!(screen.contains("not downloaded"));
+        app.input.backspace();
+        assert!(app.model_preview());
+        app.input.backspace();
+        assert!(!app.model_preview());
+        app.input.clear();
+        app.input.insert("/models");
+        app.submit();
+        assert!(app.browser);
+        assert!(app.input.text.is_empty());
+        assert!(rx.try_recv().is_err()); // Opening the list never starts a download.
         app.download(1);
         assert!(matches!(rx.try_recv().unwrap(), Request::Download(1)));
         assert!(app.busy);
+        assert_eq!(app.model_status(1), "downloading…");
+        app.update(Update::Error("Download stopped".into()));
+        assert_eq!(app.model_status(1), "not downloaded");
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn model_readiness_tracks_worker_device_and_browsing_does_not_cancel_warmup() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(app.model_status(0), "downloaded · not loaded");
+        app.warmup();
+        assert!(matches!(rx.try_recv().unwrap(), Request::Warmup { .. }));
+        for (preparation, label) in [
+            (Preparation::Loading, "loading on cpu"),
+            (Preparation::Preparing, "preparing kernels on cpu"),
+            (Preparation::Ready, "ready on cpu"),
+        ] {
+            app.update(Update::ModelState(Some(ModelState {
+                index: 0,
+                device: "cpu".into(),
+                preparation,
+            })));
+            assert_eq!(app.model_status(0), label);
+        }
+        app.input.insert("/models");
+        app.close_picker_or_stop();
+        assert!(!app.model_preview() && app.busy);
+        assert!(!app.cancel.load(Ordering::Relaxed));
+        app.command("/models");
+        app.close_picker_or_stop();
+        assert!(!app.browser && app.busy);
+        assert!(!app.cancel.load(Ordering::Relaxed));
+        app.close_picker_or_stop();
+        assert!(app.cancel.load(Ordering::Relaxed));
+        app.update(Update::ModelState(None));
+        app.update(Update::Warmed {
+            error: Some("Stopped".into()),
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(app.model_status(0), "downloaded · not loaded");
+        assert!(!app.busy);
+        app.device = "hip:0".into();
+        app.update(Update::ModelState(Some(ModelState {
+            index: 0,
+            device: "cpu".into(),
+            preparation: Preparation::Ready,
+        })));
+        assert_eq!(app.model_status(0), "ready on cpu"); // Device label belongs to the worker.
+        app.update(Update::ModelState(Some(ModelState {
+            index: 0,
+            device: "hip:0".into(),
+            preparation: Preparation::Loading,
+        })));
+        assert_eq!(app.model_status(0), "loading on hip:0");
+        app.auto_warmup = false;
+        let id = app.entries[0].manifest.id.clone();
+        app.command(&format!("/models {id}"));
+        assert_eq!(app.selected, 0);
+        assert!(matches!(rx.try_recv().unwrap(), Request::SelectModel(0)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn activity_panel_keeps_build_events_separate_from_chat_and_adapts_to_width() {
+        let f = WarmupFixture::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.transcript = "A message in the chat.".into();
+        app.update(Update::Status("Loading tokenizer…".into()));
+        app.update(Update::Activity("Compiling CPU module test…".into()));
+        // Detailed build events leave the current phase and chat untouched.
+        assert_eq!(app.status, "Loading tokenizer…");
+        assert_eq!(app.transcript, "A message in the chat.");
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(160)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let chat = rows
+            .iter()
+            .map(|row| row.chars().take(107).collect::<String>())
+            .collect::<String>();
+        let panel = rows
+            .iter()
+            .skip(2)
+            .take(13)
+            .map(|row| row.chars().skip(107).collect::<String>())
+            .collect::<String>();
+        assert!(chat.contains("A message in the chat."));
+        assert!(!chat.contains("Compiling CPU"));
+        assert!(panel.contains("Activity · /logs"));
+        assert!(panel.contains("Loading tokenizer"));
+        assert!(panel.contains("Compiling CPU module"));
+        assert!(panel.contains("00:00"));
+        let mut narrow = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        narrow.draw(|frame| app.render(frame)).unwrap();
+        let screen = narrow
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("A message in the chat."));
+        assert!(!screen.contains("Activity · /logs"));
+        app.command("/logs");
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!screen.contains("Activity · /logs"));
+        app.command("/logs");
+        assert!(app.show_activity);
+    }
+
+    #[test]
+    fn activity_log_is_bounded_coalesces_downloads_and_scrolls_to_recent_events() {
+        let f = WarmupFixture::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        for bytes in 1..100 {
+            app.update(Update::Progress {
+                file: "weights.bin".into(),
+                bytes,
+                total: Some(100),
+            });
+        }
+        assert_eq!(app.activity.len(), 1);
+        app.update(Update::Progress {
+            file: "config.json".into(),
+            bytes: 5,
+            total: Some(10),
+        });
+        assert_eq!(app.activity.len(), 2);
+        for n in 0..210 {
+            app.update(Update::Activity(format!("event {n}")));
+        }
+        assert_eq!(app.activity.len(), 200);
+        app.update(Update::Activity(format!(
+            "{}\nLatest build finished",
+            "long wrapped event ".repeat(30)
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Latest build finished"));
+        assert!(!screen.contains("event 10 "));
+        app.update(Update::Chunk("hello".into()));
+        app.update(Update::Chunk(" world".into()));
+        assert_eq!(
+            app.activity
+                .iter()
+                .filter(|line| line.text == "Generating response…")
+                .count(),
+            1
+        );
+        assert!(app.transcript.ends_with("hello world"));
     }
 
     #[test]

@@ -1650,6 +1650,11 @@ fn compile_source(
             .and_then(|b| serde_json::from_slice::<BuildInfo>(&b).ok())
             .as_ref()
             == Some(&build_info);
+    let started = std::time::Instant::now();
+    crate::progress::emit(format!(
+        "{} CPU module {key}…",
+        if valid { "Loading cached" } else { "Compiling" }
+    ));
     if !valid {
         // Each compiler invocation gets private temporary files, then atomic publication.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1688,6 +1693,15 @@ fn compile_source(
     let library =
         unsafe { libloading::Library::new(&library_path) }.map_err(|e| Error(e.to_string()))?;
     let run = *unsafe { library.get::<Run>(b"pup_run\0") }.map_err(|e| Error(e.to_string()))?;
+    crate::progress::emit(format!(
+        "CPU module ready · {:.3}s{}",
+        started.elapsed().as_secs_f64(),
+        if valid {
+            " · cache hit"
+        } else {
+            " · compiled"
+        }
+    ));
     let (profile_run, profile_metadata) = if profile {
         let run = *unsafe { library.get::<ProfileRun>(b"pup_run_profiled\0") }
             .map_err(|e| Error(e.to_string()))?;

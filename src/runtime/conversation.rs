@@ -14,6 +14,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub(super) struct Turn {
     pub user: String,
     pub assistant: String,
+    /// UTC Unix milliseconds when the turn was saved; old records are unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +94,33 @@ impl Conversation {
         crate::database::import(&mut self.db, path, &self.path)
     }
 
+    pub fn last_model(&self) -> Result<Option<String>> {
+        let saved = self
+            .db
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='last_model'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if saved.is_some() {
+            return Ok(saved);
+        }
+        // Existing databases already know the model of their most recent chat.
+        Ok(self.db.query_row(
+            "SELECT model FROM sessions WHERE model IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+            [], |r| r.get(0)
+        ).optional()?)
+    }
+
+    pub fn remember_model(&self, id: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO app_settings(key,value) VALUES('last_model',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [id],
+        )?;
+        Ok(())
+    }
+
     /// Atomic, one-time import; every reset starts another resumable session.
     pub fn import_legacy(&mut self, path: &Path) -> Result<()> {
         let source = path.canonicalize()?.to_string_lossy().into_owned();
@@ -141,8 +171,8 @@ impl Conversation {
                         tx.execute("INSERT INTO sessions(id,title,created_at,updated_at) VALUES(?1,?2,?3,?3)", params![session, title(&turn.user), timestamp])?;
                     }
                     tx.execute(
-                        "INSERT INTO turns VALUES(?1,?2,?3,?4)",
-                        params![session, ordinal, turn.user, turn.assistant],
+                        "INSERT INTO turns(session_id,ordinal,user,assistant,created_at) VALUES(?1,?2,?3,?4,?5)",
+                        params![session, ordinal, turn.user, turn.assistant, turn.created_at],
                     )?;
                     ordinal += 1;
                 }
@@ -211,12 +241,13 @@ impl Conversation {
     }
 
     fn read_session(db: &Connection, session: &str, start: usize, end: usize) -> Result<Vec<Turn>> {
-        let mut query = db.prepare("SELECT user,assistant FROM turns WHERE session_id=?1 AND ordinal>=?2 AND ordinal<?3 ORDER BY ordinal")?;
+        let mut query = db.prepare("SELECT user,assistant,created_at FROM turns WHERE session_id=?1 AND ordinal>=?2 AND ordinal<?3 ORDER BY ordinal")?;
         let turns = query
             .query_map(params![session, start, end], |r| {
                 Ok(Turn {
                     user: r.get(0)?,
                     assistant: r.get(1)?,
+                    created_at: r.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -253,13 +284,17 @@ impl Conversation {
             params![self.session_id, first_title, self.model, timestamp],
         )?;
         tx.execute(
-            "INSERT INTO turns VALUES(?1,?2,?3,?4)",
-            params![self.session_id, self.count, user, assistant],
+            "INSERT INTO turns(session_id,ordinal,user,assistant,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![self.session_id, self.count, user, assistant, timestamp],
         )?;
         tx.commit()?;
         self.title = first_title;
         self.count += 1;
-        self.turns.push(Turn { user, assistant });
+        self.turns.push(Turn {
+            user,
+            assistant,
+            created_at: Some(timestamp),
+        });
         Ok(())
     }
 
@@ -471,6 +506,56 @@ mod tests {
         assert_eq!(chat.turns.len(), 5);
     }
     #[test]
+    fn turn_timestamps_are_saved_in_utc_milliseconds_and_survive_resume_and_fetch() {
+        let f = Fixture::new();
+        let mut chat = f.chat();
+        let session = chat.session_id.clone();
+        let before = now();
+        for n in 0..10 {
+            chat.append(format!("user {n}"), format!("reply {n}"))
+                .unwrap();
+        }
+        let after = now();
+        let timestamps = chat
+            .turns
+            .iter()
+            .map(|turn| turn.created_at.unwrap())
+            .collect::<Vec<_>>();
+        assert!(timestamps
+            .iter()
+            .all(|timestamp| *timestamp >= before && *timestamp <= after));
+        let saved: i64 = chat
+            .db
+            .query_row(
+                "SELECT created_at FROM turns WHERE session_id=?1 AND ordinal=0",
+                [&session],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, timestamps[0]);
+        drop(chat);
+        let mut resumed = f.chat();
+        resumed.resume(&session).unwrap();
+        assert_eq!(
+            resumed
+                .turns
+                .iter()
+                .map(|turn| turn.created_at.unwrap())
+                .collect::<Vec<_>>(),
+            timestamps[2..]
+        );
+        resumed.fetch(4, 4096, encode_fetch).unwrap();
+        assert_eq!(
+            resumed
+                .turns
+                .iter()
+                .map(|turn| turn.created_at.unwrap())
+                .collect::<Vec<_>>(),
+            timestamps
+        );
+    }
+
+    #[test]
     fn legacy_import_is_atomic_idempotent_and_preserves_reset_separated_chats() {
         let f = Fixture::new();
         let source = f.path().with_extension("jsonl");
@@ -487,6 +572,7 @@ mod tests {
         assert!(chat.turns.is_empty());
         chat.resume("latest").unwrap();
         assert_eq!(chat.turns[0].user, "second");
+        assert!(chat.turns[0].created_at.is_none());
         drop(chat);
         assert_eq!(f.chat().sessions().unwrap().len(), 2);
         assert_eq!(fs::read_to_string(&source).unwrap(), data);
