@@ -6,11 +6,11 @@ use super::{
     llm_ffi::{Generation, Model},
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
     execute,
 };
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
@@ -186,6 +186,8 @@ struct App {
     auto_warmup: bool,
     quitting: bool,
     scroll: u16,
+    chat_area: Rect,
+    chat_max_scroll: u16,
     clock: Instant,
     requests: Sender<Request>,
     cancel: Arc<AtomicBool>,
@@ -219,6 +221,7 @@ impl App {
             status: "Ready".into(), device,
             temperature: 0.7, limit: None,
             busy: false, warming: false, auto_warmup: true, quitting: false, scroll: 0,
+            chat_area: Rect::default(), chat_max_scroll: 0,
             clock: Instant::now(), requests, cancel,
         }
     }
@@ -561,7 +564,7 @@ impl App {
             }
             "/history" => self.status = self.history_file.as_ref().map_or_else(|| "Session database is opening…".into(), |path| format!("Session database: {}", path.display())),
             "/quit" | "/exit" => self.quit(),
-            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nPageUp/PageDown scroll. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
+            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nMouse wheel over the chat or PageUp/PageDown scrolls. Scroll to the bottom to follow new replies. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
             _ => self.status = "Unknown command. Type /help.".into(),
         }
     }
@@ -726,7 +729,6 @@ impl App {
                     self.log_activity(self.status.clone(), false);
                 }
                 self.transcript.push_str(&text);
-                self.scroll = 0;
             }
             Update::Done {
                 session,
@@ -799,6 +801,7 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
+        self.chat_area = Rect::default();
         let suggestions = self.refresh_command_suggestions();
         let layout = self
             .input
@@ -1006,6 +1009,14 @@ impl App {
                 .line_count(body.width.max(1))
                 .saturating_sub(body.height as usize)
                 .min(u16::MAX as usize) as u16;
+            // Keep the visible rows fixed while streaming if the user has
+            // scrolled up. At the bottom, new text continues to follow normally.
+            if self.scroll > 0 {
+                let top = self.chat_max_scroll.saturating_sub(self.scroll);
+                self.scroll = height.saturating_sub(top);
+            }
+            self.chat_area = body;
+            self.chat_max_scroll = height;
             frame.render_widget(
                 paragraph.scroll((height.saturating_sub(self.scroll), 0)),
                 body,
@@ -1100,6 +1111,24 @@ impl App {
                 content.x + (layout.cursor_column as u16).min(content.width - 1),
                 content.y + (layout.cursor_row - first) as u16,
             ));
+        }
+    }
+
+    fn scroll_chat(&mut self, up: bool, lines: u16) {
+        self.scroll = if up {
+            self.scroll.saturating_add(lines).min(self.chat_max_scroll)
+        } else {
+            self.scroll.saturating_sub(lines)
+        };
+    }
+
+    fn mouse(&mut self, mouse: MouseEvent) {
+        if self.chat_area.contains((mouse.column, mouse.row).into()) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_chat(true, 3),
+                MouseEventKind::ScrollDown => self.scroll_chat(false, 3),
+                _ => {}
+            }
         }
     }
 
@@ -1259,8 +1288,8 @@ impl App {
                             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 self.input.insert(&c.to_string())
                             }
-                            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(10),
-                            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(10),
+                            KeyCode::PageUp => self.scroll_chat(true, 10),
+                            KeyCode::PageDown => self.scroll_chat(false, 10),
                             _ => {}
                         }
                     }
@@ -1269,6 +1298,7 @@ impl App {
                     .input
                     .insert(&text.replace("\r\n", "\n").replace('\r', "\n")),
                 Event::Resize(_, _) => self.input.reset_column(),
+                Event::Mouse(mouse) => self.mouse(mouse),
                 _ => {}
             }
         }
@@ -2172,7 +2202,11 @@ pub fn run(options: Options) -> Result<()> {
     let mut enhanced_keyboard = false;
     let outcome = (|| {
         let mut terminal = ratatui::try_init()?;
-        execute!(io::stdout(), event::EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            event::EnableBracketedPaste,
+            event::EnableMouseCapture
+        )?;
         execute!(
             io::stdout(),
             event::PushKeyboardEnhancementFlags(
@@ -2185,7 +2219,11 @@ pub fn run(options: Options) -> Result<()> {
     if enhanced_keyboard {
         let _ = execute!(io::stdout(), event::PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(io::stdout(), event::DisableBracketedPaste);
+    let _ = execute!(
+        io::stdout(),
+        event::DisableMouseCapture,
+        event::DisableBracketedPaste
+    );
     ratatui::restore();
     cancel.store(true, Ordering::Relaxed);
     let _ = requests.send(Request::Shutdown);
@@ -2212,6 +2250,96 @@ mod tests {
 
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn mouse_scroll_stays_in_chat_and_holds_position_while_streaming() {
+        let f = WarmupFixture::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.transcript = (0..40).map(|n| format!("line {n:02}\n")).collect();
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let area = app.chat_area;
+        let wheel = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let top_line = |terminal: &Terminal<TestBackend>| {
+            (0..7)
+                .map(|x| terminal.backend().buffer()[(area.x + x, area.y)].symbol())
+                .collect::<String>()
+        };
+        let up = wheel(MouseEventKind::ScrollUp, area.x, area.y);
+        let down = wheel(MouseEventKind::ScrollDown, area.x, area.y);
+        let bottom = top_line(&terminal);
+        app.mouse(up);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.scroll, 3);
+        let reading = top_line(&terminal);
+        assert_ne!(reading, bottom);
+
+        // Activity pane, header, composer and clicks must not move the chat.
+        for event in [
+            wheel(MouseEventKind::ScrollUp, area.right(), area.y),
+            wheel(MouseEventKind::ScrollUp, area.x, 0),
+            wheel(MouseEventKind::ScrollUp, area.x, area.bottom() + 1),
+            wheel(
+                MouseEventKind::Down(event::MouseButton::Left),
+                area.x,
+                area.y,
+            ),
+        ] {
+            app.mouse(event);
+            assert_eq!(app.scroll, 3);
+        }
+
+        app.update(Update::Chunk("stream A\nstream B\n".into()));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(top_line(&terminal), reading);
+        assert_eq!(app.scroll, 5);
+        for _ in 0..100 {
+            app.mouse(up);
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.scroll, app.chat_max_scroll);
+        assert_eq!(top_line(&terminal), "line 00");
+        app.mouse(down);
+        assert_eq!(app.scroll, app.chat_max_scroll - 3);
+        for _ in 0..100 {
+            app.mouse(down);
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.scroll, 0);
+        app.update(Update::Chunk("latest line\n".into()));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        assert_eq!(app.scroll, 0);
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .contains("latest line"));
+
+        app.input.insert("/models");
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.mouse(up);
+        assert_eq!(app.scroll, 0);
+        app.input.clear();
+        app.transcript = "short chat".into();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        app.mouse(up);
+        assert_eq!(app.scroll, 0);
+    }
 
     #[test]
     fn slash_completion_covers_all_commands_without_executing_them() {

@@ -72,6 +72,7 @@ impl Runtime {
 #[derive(Clone, Debug)]
 pub enum Tensor {
     F32(Arc<[f32]>),
+    BF16(Arc<[u16]>),
     I32(Arc<[i32]>),
     U8(Arc<[u8]>),
     Bool(Arc<[u8]>),
@@ -80,6 +81,7 @@ impl Tensor {
     pub(crate) fn dtype(&self) -> DType {
         match self {
             Self::F32(_) => DType::F32,
+            Self::BF16(_) => DType::BF16,
             Self::I32(_) => DType::I32,
             Self::U8(_) => DType::U8,
             Self::Bool(_) => DType::Bool,
@@ -88,6 +90,7 @@ impl Tensor {
     pub fn len(&self) -> usize {
         match self {
             Self::F32(x) => x.len(),
+            Self::BF16(x) => x.len(),
             Self::I32(x) => x.len(),
             Self::Bool(x) | Self::U8(x) => x.len(),
         }
@@ -98,6 +101,7 @@ impl Tensor {
     pub(crate) fn ptr(&self) -> *const c_void {
         match self {
             Self::F32(x) => x.as_ptr().cast(),
+            Self::BF16(x) => x.as_ptr().cast(),
             Self::I32(x) => x.as_ptr().cast(),
             Self::Bool(x) | Self::U8(x) => x.as_ptr().cast(),
         }
@@ -106,6 +110,13 @@ impl Tensor {
         match self {
             Self::F32(x) => Ok(x),
             _ => Err(Error("expected f32 tensor".into())),
+        }
+    }
+    /// Raw BF16 bits, without widening or allocating another weight copy.
+    pub fn bf16(&self) -> Result<&[u16]> {
+        match self {
+            Self::BF16(x) => Ok(x),
+            _ => Err(Error("expected bf16 tensor".into())),
         }
     }
 }
@@ -212,6 +223,7 @@ impl Executable {
         // Own mutable buffers separately: no aliasing through Arc during execution.
         enum Buffer {
             F(Vec<f32>),
+            H(Vec<u16>),
             I(Vec<i32>),
             B(Vec<u8>),
             U(Vec<u8>),
@@ -221,6 +233,7 @@ impl Executable {
             let n = numel(shape)?;
             buffers.push(match dt {
                 DType::F32 => Buffer::F(vec![0.; n]),
+                DType::BF16 => Buffer::H(vec![0; n]),
                 DType::I32 => Buffer::I(vec![0; n]),
                 DType::Bool => Buffer::B(vec![0; n]),
                 DType::U8 => Buffer::U(vec![0; n]),
@@ -235,6 +248,7 @@ impl Executable {
             .iter_mut()
             .map(|x| match x {
                 Buffer::F(v) => v.as_mut_ptr().cast(),
+                Buffer::H(v) => v.as_mut_ptr().cast(),
                 Buffer::I(v) => v.as_mut_ptr().cast(),
                 Buffer::B(v) | Buffer::U(v) => v.as_mut_ptr().cast(),
             })
@@ -277,6 +291,7 @@ impl Executable {
             .into_iter()
             .map(|x| match x {
                 Buffer::F(v) => Tensor::F32(v.into()),
+                Buffer::H(v) => Tensor::BF16(v.into()),
                 Buffer::I(v) => Tensor::I32(v.into()),
                 Buffer::B(v) => Tensor::Bool(v.into()),
                 Buffer::U(v) => Tensor::U8(v.into()),
@@ -288,12 +303,26 @@ impl Executable {
 fn ctype(dt: DType) -> &'static str {
     match dt {
         DType::F32 => "float",
+        DType::BF16 => "unsigned short",
         DType::WeakFloat => "double",
         DType::I32 => "int32_t",
         DType::WeakInt => "int64_t",
         DType::Bool | DType::U8 => "uint8_t",
         DType::Void => "uint8_t",
     }
+}
+
+fn storage_value(dt: DType, value: &str) -> String {
+    if dt != DType::BF16 {
+        return value.into();
+    }
+    // Copying a BF16 view preserves raw bits, including signaling NaNs. A
+    // computed F32 value instead rounds to nearest, with ties to even.
+    value
+        .strip_prefix("pup_bf16_load(")
+        .and_then(|x| x.strip_suffix(')'))
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("pup_bf16_store({value})"))
 }
 fn coord(index: &str, shape: &[usize], axis: usize) -> String {
     if shape[axis] <= 1 {
@@ -377,6 +406,7 @@ impl Emitter<'_> {
         } else {
             "err=2;goto cleanup;"
         };
+        let value = storage_value(dest.dtype(), value);
         let body = format!(
             "int64_t ix={ix}; if(ix<0 || ix>={}) {{{error}}} {target}[ix*{row}+i%{}]={value};",
             shape[0],
@@ -411,6 +441,7 @@ impl Emitter<'_> {
             .checked_mul(match dt {
                 DType::WeakFloat | DType::WeakInt => 8,
                 DType::F32 | DType::I32 => 4,
+                DType::BF16 => 2,
                 _ => 1,
             })
             .ok_or_else(|| Error("CPU workspace overflow".into()))?;
@@ -594,7 +625,12 @@ impl Emitter<'_> {
             return Ok(expr.replace("$index", i));
         }
         if self.material.contains(&v) || node.op() == Op::Param {
-            return Ok(format!("{}[{i}]", self.names[&v]));
+            let value = format!("{}[{i}]", self.names[&v]);
+            return Ok(if node.dtype() == DType::BF16 {
+                format!("pup_bf16_load({value})")
+            } else {
+                value
+            });
         }
         match node.op() {
             Op::Const => {
@@ -843,9 +879,11 @@ impl Emitter<'_> {
             .zip(xs)
             .map(|(&s, x)| {
                 if self.g.node(s).unwrap().dtype().is_weak()
-                    && scalar_type.is_some_and(|d| matches!(d, DType::F32 | DType::I32 | DType::U8))
+                    && scalar_type.is_some_and(|d| {
+                        matches!(d, DType::F32 | DType::BF16 | DType::I32 | DType::U8)
+                    })
                 {
-                    format!("({})({x})", ctype(scalar_type.unwrap()))
+                    format!("({})({x})", ctype(scalar_type.unwrap().compute_dtype()))
                 } else {
                     x
                 }
@@ -872,6 +910,9 @@ impl Emitter<'_> {
         }
         let expr = match node.op() {
             Op::Cast if dt == DType::Bool => format!("({x})!=0"),
+            Op::Cast if dt == DType::BF16 => {
+                return Ok(format!("pup_bf16_load(pup_bf16_store((float)({x})))"))
+            }
             Op::Cast => format!("({})({x})", ctype(dt)),
             Op::Add => format!("({x})+({y})"),
             Op::Sub => format!("({x})-({y})"),
@@ -880,6 +921,13 @@ impl Emitter<'_> {
             Op::Max => format!("({x})>({y})?({x}):({y})"),
             Op::Cmplt => format!("({x})<({y})"),
             Op::Neg => format!("-({x})"),
+            Op::Where if dt == DType::BF16 => {
+                return Ok(format!(
+                    "pup_bf16_load(({x})?({}):({}))",
+                    storage_value(dt, y),
+                    storage_value(dt, &xs[2])
+                ))
+            }
             Op::Where => format!("({x})?({y}):({})", xs[2]),
             Op::Exp2 => format!("{}({x})", if dt == DType::F32 { "exp2f" } else { "exp2" }),
             Op::Log2 => format!("{}({x})", if dt == DType::F32 { "log2f" } else { "log2" }),
@@ -887,7 +935,7 @@ impl Emitter<'_> {
             Op::Sin => format!("{}({x})", if dt == DType::F32 { "sinf" } else { "sin" }),
             op => return Err(Error(format!("CPU lowering missing {op:?}"))),
         };
-        Ok(format!("({})({expr})", ctype(dt)))
+        Ok(format!("({})({expr})", ctype(dt.compute_dtype())))
     }
     fn dims(&self, v: Value) -> Result<Vec<usize>> {
         let n = self.g.node(v)?;
@@ -1074,7 +1122,9 @@ fn emit_impl(
         }
         let a = g.node(mn.src()[0])?;
         let b = g.node(mn.src()[1])?;
-        if a.dtype() != DType::F32 || b.dtype() != DType::F32 {
+        if !matches!(a.dtype(), DType::F32 | DType::BF16)
+            || !matches!(b.dtype(), DType::F32 | DType::BF16)
+        {
             continue;
         }
         let (ash, bsh) = (a.shape().unwrap(), b.shape().unwrap());
@@ -1247,12 +1297,16 @@ fn emit_impl(
             let n = numel(&e.shape(payload))?;
             let value = if e.store_snapshot_needed(payload) {
                 let snapshot = format!("state_snapshot{}", e.kernel_count);
-                let value = e.read(payload, "i")?;
+                let value = storage_value(g.node(payload)?.dtype(), &e.read(payload, "i")?);
                 e.alloc(&snapshot, g.node(payload)?.dtype(), n)?;
                 let begin = e.body.len();
                 e.body += &format!("for(size_t i=0;i<{n};i++) {snapshot}[i]={value};\n");
                 e.kernel(v, begin, 0, 0, "wall");
-                format!("{snapshot}[i]")
+                if g.node(payload)?.dtype() == DType::BF16 {
+                    format!("pup_bf16_load({snapshot}[i])")
+                } else {
+                    format!("{snapshot}[i]")
+                }
             } else {
                 e.read(payload, "i")?
             };
@@ -1384,7 +1438,7 @@ fn emit_impl(
                     .transpose()?
                     .unwrap_or(0);
                 for (j, &s) in src.iter().enumerate() {
-                    let x = e.read(s, "i")?;
+                    let x = storage_value(dt, &e.read(s, "i")?);
                     e.body +=
                         &format!("for(size_t i=0;i<{part};i++) {name}[{}+i]={x};\n", j * part);
                 }
@@ -1419,7 +1473,8 @@ fn emit_impl(
                 let base = e.shape(src[0]);
                 let row = numel(&base[1..])?;
                 let ix = e.read(src[1], &format!("i/{}", row.max(1)))?;
-                let val = e.read(src[0], &format!("ix*{row}+i%{}", row.max(1)))?;
+                let val =
+                    storage_value(dt, &e.read(src[0], &format!("ix*{row}+i%{}", row.max(1)))?);
                 e.body+=&format!("for(size_t i=0;i<{n};i++) {{ int64_t ix={ix};if(ix<0 || ix>={}) {{err=2;goto cleanup;}} {name}[i]={val};}}\n",base[0]);
             }
             Op::Pad => {
@@ -1441,14 +1496,17 @@ fn emit_impl(
                     .map(|(j, _)| format!("({}-{})*{}", coord("i", &shape, j), offsets[j], st[j]))
                     .collect::<Vec<_>>()
                     .join("+");
-                let x = e.read(src[0], &if idx.is_empty() { "0".into() } else { idx })?;
+                let x = storage_value(
+                    dt,
+                    &e.read(src[0], &if idx.is_empty() { "0".into() } else { idx })?,
+                );
                 e.body += &format!(
                     "for(size_t i=0;i<{n};i++) {name}[i]=({})?{x}:0;\n",
                     if check.is_empty() { "1" } else { &check }
                 );
             }
             _ => {
-                let expr = e.elementwise(v, "i")?;
+                let expr = storage_value(dt, &e.elementwise(v, "i")?);
                 e.body += &format!("for(size_t i=0;i<{n};i++) {name}[i]={expr};\n");
             }
         }
@@ -1463,7 +1521,7 @@ fn emit_impl(
         let node = g.node(v)?;
         if !matches!(
             node.dtype(),
-            DType::F32 | DType::I32 | DType::Bool | DType::U8
+            DType::F32 | DType::BF16 | DType::I32 | DType::Bool | DType::U8
         ) {
             return Err(Error(
                 "CPU outputs require concrete dtypes; add cast".into(),
@@ -1471,11 +1529,7 @@ fn emit_impl(
         }
         let n = numel(&e.shape(v))?;
         let bytes = n
-            .checked_mul(if matches!(node.dtype(), DType::Bool | DType::U8) {
-                1
-            } else {
-                4
-            })
+            .checked_mul(super::gpu::dtype_bytes(node.dtype()))
             .ok_or_else(|| Error("CPU output size overflow".into()))?;
         output_bytes = output_bytes
             .checked_add(bytes)
@@ -1488,7 +1542,7 @@ fn emit_impl(
         if e.direct_outputs.get(&e.names[&v]) == Some(&j) {
             continue;
         }
-        let x = e.read(v, "i")?;
+        let x = storage_value(node.dtype(), &e.read(v, "i")?);
         e.mark_reads(&x, e.kernel_count);
         e.body += &format!(
             "for(size_t i=0;i<{n};i++) (({}*)outputs[{j}])[i]={x};\n",
@@ -1577,7 +1631,7 @@ int pup_run(const void **inputs,void **outputs,size_t threads) {{
     return pup_run_profiled(inputs,outputs,threads,stats,{count});
 }}
 "#,
-            runtime = include_str!("cpu_runtime.c"),
+            runtime = concat!(include_str!("cpu_runtime.c"), include_str!("bf16.c")),
             kernels = e.kernels,
             decl = e.decl,
             workspace = e.peak_workspace.max(1),
@@ -1585,7 +1639,7 @@ int pup_run(const void **inputs,void **outputs,size_t threads) {{
         );
         return Ok((code, fused.len()));
     }
-    Ok((format!("// puppygrad C ABI 3: self-contained C, signed arithmetic wraps (-fwrapv)\n{}\n{}\nint pup_run(const void **inputs,void **outputs,size_t threads) {{\nif(!threads) return 3;\nint err=0;\n{}unsigned char *arena=malloc({}ULL); if(!arena) return 1;\npup_pool pool;\nif((err=pup_pool_init(&pool,threads<{max_tasks}ULL?threads:{max_tasks}ULL))) {{free(arena);return err;}}\n{}cleanup:\npup_pool_destroy(&pool);\nfree(arena);return err;\n}}\n",include_str!("cpu_runtime.c"),e.kernels,e.decl,e.peak_workspace.max(1),e.body),fused.len()))
+    Ok((format!("// puppygrad C ABI 3: self-contained C, signed arithmetic wraps (-fwrapv)\n{}\n{}\nint pup_run(const void **inputs,void **outputs,size_t threads) {{\nif(!threads) return 3;\nint err=0;\n{}unsigned char *arena=malloc({}ULL); if(!arena) return 1;\npup_pool pool;\nif((err=pup_pool_init(&pool,threads<{max_tasks}ULL?threads:{max_tasks}ULL))) {{free(arena);return err;}}\n{}cleanup:\npup_pool_destroy(&pool);\nfree(arena);return err;\n}}\n",concat!(include_str!("cpu_runtime.c"), include_str!("bf16.c")),e.kernels,e.decl,e.peak_workspace.max(1),e.body),fused.len()))
 }
 
 pub fn compile(g: &Graph, root: Value, cache: &Path) -> Result<Executable> {

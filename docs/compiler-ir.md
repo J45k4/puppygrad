@@ -149,7 +149,7 @@ Restricted f-strings interpolate integer binding names, for example
 | `param(slot, dtype, size)` | External flat tensor; use `scalar` instead of size for a scalar parameter. Slots are unique within a program. |
 | `const(value)` | Bool, signed i64 integer literal, or finite f64 float literal. Integers/floats have weak dtypes; use `cast` to state a concrete width. |
 | `stack(a, b, ...)` | Stack equal-shaped values; also builds shape tuples. `stack()` is the empty shape tuple. |
-| `cast(x, dtype)` | State a concrete `bool`, `i32`, or `f32` dtype. |
+| `cast(x, dtype)` | State a concrete `bool`, `u8`, `i32`, `bf16`, or `f32` dtype. |
 | `add`, `sub`, `fdiv`, `mul`, `max`, `cmplt` | Two sources with compatible dtypes; shapes broadcast from the right. `cmplt` produces bool. |
 | `neg`, `exp2`, `log2`, `sqrt`, `sin` | One source. The transcendental subset requires floating-point input. |
 | `where(condition, a, b)` | Bool condition, compatible branch types, broadcast shapes. |
@@ -167,6 +167,12 @@ Restricted f-strings interpolate integer binding names, for example
 | `flip(x, [flags...])` | One bool flag per axis. |
 | `reduce(x, op, count)` | Reduce `count` leading axes with `add`, `mul`, or `max`. Arbitrary-axis reduction is a permutation followed by this operation. |
 | `sink(a, b, ...)` | Collect graph roots; does not produce a tensor. |
+
+`bf16` is two-byte storage on CPU, CUDA and HIP. Arithmetic, unary functions,
+reductions and matrix multiplication widen the values they consume and produce
+F32 results; mixing BF16 and F32 inputs also produces F32. Views, gathers,
+BF16-only stacks and `where` branches preserve BF16 storage and its raw bits.
+An explicit `cast(x, bf16)` rounds to nearest with ties to even.
 
 Shape arguments to reshape/expand/pad/shrink can name graph values. A list such as
 `[2,3]` is shorthand for integer `CONST`s and a `STACK`. A single dimension uses
@@ -351,8 +357,9 @@ bindings, `--model-dir DIR` selects checkpoint metadata; otherwise emission uses
 the `model.safetensors` header, validating the declared payload size without
 reading weight values. No tokenizer or actual input token IDs are needed.
 Bindings use the same sorted slots and normalized names as the LLM provider.
-Weights remain caller-supplied F32 buffers, including when the checkpoint stores
-F16/BF16. Generated comments identify the used input slots, types, and lengths.
+Weights use caller-supplied BF16 buffers for BF16 checkpoints and F32 buffers for
+F32 checkpoints or widened F16 values. Generated comments identify the used
+input slots, types, and lengths.
 
 The backend currently specializes static shapes. `--sequence-length N` sets the
 `tokens` input shape to `[N]` (default 1); emit separately for each required length.

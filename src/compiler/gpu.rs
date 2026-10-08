@@ -147,6 +147,7 @@ pub(crate) fn dtype_bytes(dt: DType) -> usize {
     match dt {
         DType::WeakFloat | DType::WeakInt => 8,
         DType::F32 | DType::I32 => 4,
+        DType::BF16 => 2,
         _ => 1,
     }
 }
@@ -1082,6 +1083,7 @@ impl Executable {
             }
             outputs.push(match dt {
                 DType::F32 => download!(f32, F32),
+                DType::BF16 => download!(u16, BF16),
                 DType::I32 => download!(i32, I32),
                 DType::U8 => download!(u8, U8),
                 DType::Bool => download!(u8, Bool),

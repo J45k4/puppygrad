@@ -99,8 +99,10 @@ eight output accumulators per thread. Softmax rows above width 4096 stream their
 values instead of keeping large per-lane arrays or separate exponential tensors;
 row fusion supports widths through 65536. F32 reductions and small contractions
 operate in explicit 32-lane groups. HIP shuffle calls specify width 32, so adjacent groups
-stay independent on both wave32 and wave64 devices. F32, I32, U8 and Bool buffers
-are supported. Floating-point contraction and fast math are disabled; numerical
+stay independent on both wave32 and wave64 devices. BF16, F32, I32, U8 and Bool
+buffers are supported. BF16 weights remain two-byte buffers and widen inside
+their consuming kernels; matrix accumulators and arithmetic results remain F32.
+Floating-point contraction and fast math are disabled; numerical
 comparisons still use tolerances for GPU transcendental and reduction differences.
 
 HIP uses its own pointer, error-string and graph parameter ABIs. Primary contexts
@@ -179,7 +181,8 @@ cargo build --release
 python3 benchmarks/qwen3-hip/generation.py --output-dir .cache/hip-context
 ```
 
-This uses a fresh production LLM FFI worker for each size, F32 weights/KV,
+This uses a fresh production LLM FFI worker for each size, native checkpoint
+weights (BF16 for the pinned Qwen3 models), F32 KV,
 128-token prefill chunks and repeated chat token IDs. Each row leaves room for
 32 generated tokens. A separate config disables the EOS stop condition so every
 request generates the same number of tokens; original checkpoint files and
@@ -190,7 +193,7 @@ excludes the first token. JSON stores every token latency and checks determinist
 greedy output; CSV stores the table. Recorded VRAM usage includes the desktop and
 other processes. This measures execution at long contexts, not retrieval quality.
 
-On 2026-10-06, before the register-tile and wide-softmax optimizations,
+On 2026-10-06, with weights widened to F32 and before the register-tile and wide-softmax optimizations,
 Qwen3-0.6B passed the complete sweep on an RX 9070 XT with ROCm 7.2.4.
 All 36 requests completed and repeated requests produced identical
 greedy tokens. Context below is input plus 32 output tokens; first-token and

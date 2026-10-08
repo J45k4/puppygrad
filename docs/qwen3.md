@@ -18,17 +18,46 @@ state does **not** imply a 64-wide attention head.
 
 The catalog includes these official Apache-2.0 checkpoints:
 
-| Model | Pinned revision | Approximate F32 weights |
-|---|---|---:|
-| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | `c1899de289a04d12100db370d81485cdf75e47ca` | 2.22 GiB |
-| [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | 6.41 GiB |
+| Model | Pinned revision | Native BF16 weights | F32 comparison |
+|---|---|---:|---:|
+| [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | `c1899de289a04d12100db370d81485cdf75e47ca` | 1.11 GiB | 2.22 GiB |
+| [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | 3.20 GiB | 6.41 GiB |
 
 Their licenses are retained alongside downloaded models. Assets, generated code, PTX and benchmark logs
 remain under ignored `models/` and `.cache/` directories.
 
-The checkpoint loader converts BF16 weights directly into their final shared F32
-buffers with a reusable 4 MiB read buffer. A local Qwen3-1.7B checkpoint-only
-measurement on 2026-10-08 (same files, before and after the loader change) showed:
+The checkpoint loader keeps the original BF16 bits in its final shared buffers,
+and uploads those same two-byte values directly to CUDA/HIP. F32 activations and
+accumulators consume BF16 weights inside the kernels; this avoids a full widened
+copy while keeping the previous model arithmetic. This path uses the existing
+matrix schedules with F32 arithmetic, rather than hardware BF16 matrix instructions.
+
+On 2026-10-08, release measurements on this RX 9070 XT with 512 KV slots,
+a 33-token prompt and 64 output tokens gave these medians after one warmup and
+three measured requests:
+
+| Model / weight storage | Weight memory | First token | Decode tokens/s |
+|---|---:|---:|---:|
+| Qwen3-0.6B / previous F32 | 2.22 GiB | 72.7 ms | 125.0 |
+| Qwen3-0.6B / native BF16 | 1.11 GiB | 66.5 ms | 156.7 |
+| Qwen3-1.7B / native BF16 | 3.20 GiB | 143.3 ms | 88.1 |
+
+The 0.6B comparison produced identical greedy token IDs, with approximately 25%
+faster decode. Timings include production FFI reset, prefill, host sampling and
+callbacks, and exclude loading and compilation. Activations, accumulation and
+KV storage were F32 for every row. These short-context results do not predict
+throughput at longer contexts.
+
+Three alternating Qwen3-1.7B checkpoint-only loads measured a median of 2.074 s
+with the previous optimized F32 loader and 0.777 s with native BF16. Median peak
+process RSS fell from 6571.7 MiB to 3286.8 MiB. The OS file cache was not cleared;
+these are mostly warm-cache measurements and exclude GPU upload, tokenization,
+planning and compilation. Detailed samples and token IDs are recorded in
+`.cache/bf16-validation/results.json`.
+
+Before native BF16 storage was added, a local Qwen3-1.7B checkpoint-only
+measurement on 2026-10-08 (same files, before and after removing intermediate F32
+weight copies) showed:
 
 | Build | Before | After |
 |---|---:|---:|
@@ -40,7 +69,7 @@ and memory pressure affect timings. They exclude tokenization, GPU upload,
 context planning and kernel preparation. The original development profile spent
 34.25 s converting BF16 values; its disk reads took 1.42 s. The Activity panel now
 reports reads and conversion separately. This changes startup work; the final
-weight format and inference precision remain F32.
+weight format and inference precision remained F32 in those historical runs.
 
 ```bash
 mkdir -p models/qwen3-0.6b
@@ -89,7 +118,7 @@ assistant's generated text in both streaming and buffered modes. This is a
 single-turn command-line interface; the TUI supports saved multi-turn sessions.
 The FFI still accepts ordinary token ID buffers.
 
-The checkpoint loader expands BF16 values to F32 for the current backends. When
+The checkpoint loader retains BF16 values in BF16 storage on every backend. When
 `tie_word_embeddings` is true, `lm_head.weight` binds to the embedding's existing
 input slot, even if both tensors are serialized. Qwen3's
 `max_position_embeddings` supplies the provider's context limit. The loader and
@@ -101,7 +130,7 @@ RoPE scaling variants are not implemented by this example.
 
 ### Qwen3-1.7B HIP validation
 
-On an RX 9070 XT, with F32 weights and KV storage, 512 KV slots, a 33-token
+Before native BF16 support, on an RX 9070 XT with F32 weights and KV storage, 512 KV slots, a 33-token
 prompt and 64 output tokens, three release runs after one warmup measured:
 
 | Metric | Median |
@@ -128,7 +157,7 @@ to measure larger retained capacities and the workspace cost of prefill.
 
 For this architecture, F32 KV requires `2 * 28 * 8 * 128 * 4` bytes per slot:
 224 KiB per token, or 7 GiB at 32K capacity, in addition to approximately
-2.22 GiB of F32 weights. The production provider rounds required KV capacity up
+1.11 GiB of native BF16 weights. The production provider rounds required KV capacity up
 to a power of two, clipped to the effective FFI context limit (normally at least
 512 slots). Attention currently computes over the entire reserved capacity and
 masks unused rows. CUDA retained providers now prefill in 128-token chunks by
@@ -184,7 +213,7 @@ actual [Transformer implementation](https://github.com/tinygrad/tinygrad/blob/1a
 `python -m tinygrad.llm` and [lists `qwen3:0.6b`](https://github.com/tinygrad/tinygrad/blob/1a58c3ae9d5ff5605d81085cf1a364c113e95cf6/tinygrad/llm/cli.py); `examples/llm.py` no longer exists
 in that revision.
 
-Both implementations use identical BF16 checkpoint values expanded to F32, tied
+Those historical comparison runs used identical BF16 checkpoint values expanded to F32, tied
 embedding/output storage, and F32 attention. Tinygrad normally uses F16 KV storage;
 the harness explicitly selects F32 KV for matching arithmetic. This compares
 compiler/runtime execution, rather than Puppygrad F32 against the CLI's usual

@@ -252,6 +252,15 @@ fn qwen3_bf16_tied_bindings_and_cpu_match_independent_reference() {
         assert_eq!(spec.slot, loaded.slot);
         assert_eq!(spec.dtype, loaded.dtype);
         assert_eq!(spec.shape, loaded.shape);
+        if key != "tokens" {
+            assert_eq!(spec.dtype, puppygrad::compiler::pop::DType::BF16);
+            let expected: Vec<_> = f
+                .w(key)
+                .iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect();
+            assert_eq!(checkpoint.inputs[spec.slot].bf16().unwrap(), expected);
+        }
     }
     assert_eq!(
         metadata.tensors["lm_head.weight"].slot,
@@ -662,8 +671,8 @@ fn sharded_checkpoints_preserve_bindings_metadata_and_reference_logits() {
         }
         for slot in 1..single.inputs.len() {
             assert_eq!(
-                single.inputs[slot].f32().unwrap(),
-                sharded.inputs[slot].f32().unwrap()
+                single.inputs[slot].bf16().unwrap(),
+                sharded.inputs[slot].bf16().unwrap()
             );
         }
         let p = source::parse_with_context(include_str!("../examples/qwen3.pup"), &sharded.context)

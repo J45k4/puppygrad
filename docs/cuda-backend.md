@@ -105,7 +105,9 @@ normalization/softmax fusion. Set these before compilation.
 schedules; the latter counts standalone reductions, excluding fused kernels.
 Warp shuffle participation follows the [NVIDIA CUDA programming guide](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html).
 
-Supported output/input buffers are F32, I32, U8, and Bool. Weak scalars and
+Supported output/input buffers are BF16, F32, I32, U8, and Bool. BF16 weights
+remain two-byte buffers and widen inside their consuming kernels; matrix
+accumulators and arithmetic results remain F32. Weak scalars and
 compile-time shapes follow existing language semantics. Integer add/subtract,
 multiply, negation, and reductions explicitly wrap. FMA contraction and flush
 to zero are disabled, with precise division/sqrt requested. CPU and GPU

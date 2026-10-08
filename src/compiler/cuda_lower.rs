@@ -102,7 +102,9 @@ pub(crate) fn emit_backend(
         }
         let a = g.node(mn.src()[0])?;
         let b = g.node(mn.src()[1])?;
-        if a.dtype() != DType::F32 || b.dtype() != DType::F32 {
+        if !matches!(a.dtype(), DType::F32 | DType::BF16)
+            || !matches!(b.dtype(), DType::F32 | DType::BF16)
+        {
             continue;
         }
         let (ash, bsh) = (a.shape().unwrap(), b.shape().unwrap());
@@ -309,7 +311,7 @@ pub(crate) fn emit_backend(
         let node = g.node(v)?;
         if !matches!(
             node.dtype(),
-            DType::F32 | DType::I32 | DType::Bool | DType::U8
+            DType::F32 | DType::BF16 | DType::I32 | DType::Bool | DType::U8
         ) {
             return Err(Error(
                 "CUDA outputs require concrete dtypes; add cast".into(),
@@ -350,9 +352,13 @@ pub(crate) fn emit_backend(
             let value = if e.store_snapshot_needed(payload) {
                 let snapshot = format!("state_snapshot{}", kernels.len());
                 e.alloc(&snapshot, g.node(payload)?.dtype(), n)?;
-                let x = e.read(payload, "i")?;
+                let x = storage_value(g.node(payload)?.dtype(), &e.read(payload, "i")?);
                 add_kernel(&mut e, &mut kernels, n, format!("{snapshot}[i]={x};"));
-                format!("{snapshot}[i]")
+                if g.node(payload)?.dtype() == DType::BF16 {
+                    format!("pup_bf16_load({snapshot}[i])")
+                } else {
+                    format!("{snapshot}[i]")
+                }
             } else {
                 e.read(payload, "i")?
             };
@@ -524,7 +530,7 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
                         .unwrap_or(0);
                     let mut code = String::new();
                     for (j, &s) in src.iter().enumerate() {
-                        let x = e.read(s, &format!("i-{}", j * part))?;
+                        let x = storage_value(dt, &e.read(s, &format!("i-{}", j * part))?);
                         code += &format!(
                             "if(i>={} && i<{}) {name}[i]={x};\n",
                             j * part,
@@ -593,7 +599,8 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
                     let base = e.shape(src[0]);
                     let row = numel(&base[1..])?;
                     let ix = e.read(src[1], &format!("i/{}", row.max(1)))?;
-                    let x = e.read(src[0], &format!("ix*{row}+i%{}", row.max(1)))?;
+                    let x =
+                        storage_value(dt, &e.read(src[0], &format!("ix*{row}+i%{}", row.max(1)))?);
                     format!("int64_t ix={ix}; if(ix<0 || ix>={}) {{atomicExch(error,2);return;}} {name}[i]={x};",base[0])
                 }
                 Op::Pad => {
@@ -617,14 +624,17 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
                         })
                         .collect::<Vec<_>>()
                         .join("+");
-                    let x = e.read(src[0], if idx.is_empty() { "0" } else { &idx })?;
+                    let x = storage_value(
+                        dt,
+                        &e.read(src[0], if idx.is_empty() { "0" } else { &idx })?,
+                    );
                     format!(
                         "{name}[i]=({})?{x}:0;",
                         if check.is_empty() { "1" } else { &check }
                     )
                 }
                 _ => {
-                    let x = e.elementwise(v, "i")?;
+                    let x = storage_value(dt, &e.elementwise(v, "i")?);
                     format!("{name}[i]={x};")
                 }
             }
@@ -637,7 +647,7 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
             continue;
         }
         let n = numel(&e.shape(v))?;
-        let x = e.read(v, "i")?;
+        let x = storage_value(g.node(v)?.dtype(), &e.read(v, "i")?);
         let name = format!("out{slot}");
         e.types.insert(name.clone(), g.node(v)?.dtype());
         add_kernel(&mut e, &mut kernels, n, format!("{name}[i]={x};"));
@@ -667,6 +677,8 @@ if(out_row<{m} && out_col<{cols}) {name}[(batch*{m}+out_row)*{cols}+out_col]={ti
     if backend == crate::compiler::gpu::Backend::Hip {
         source += "template<typename T> __device__ __forceinline__ T pup_shfl_down(T x, unsigned int delta) { return __shfl_down(x, delta, 32); }\ntemplate<typename T> __device__ __forceinline__ T pup_shfl(T x, int lane) { return __shfl(x, lane, 32); }\n";
     }
+    source += "#define PUP_BF16_FN __device__ __forceinline__\n";
+    source += include_str!("bf16.c");
     for k in &mut kernels {
         if backend == crate::compiler::gpu::Backend::Hip {
             // Explicit width=32 isolates logical subwarps on wave64 as well

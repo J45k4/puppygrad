@@ -973,6 +973,7 @@ fn dtype(expr: &Expr) -> Result<DType> {
     match expr {
         Expr::Name(n) => match n.as_str() {
             "f32" => Ok(DType::F32),
+            "bf16" => Ok(DType::BF16),
             "i32" => Ok(DType::I32),
             "u8" => Ok(DType::U8),
             "bool" => Ok(DType::Bool),

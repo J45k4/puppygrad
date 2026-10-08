@@ -25,6 +25,11 @@ def main():
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     model = args.model_dir.resolve()
+    with (model / 'model.safetensors').open('rb') as checkpoint:
+        header_size = int.from_bytes(checkpoint.read(8), 'little')
+        header = json.loads(checkpoint.read(header_size))
+    weight_dtypes = sorted({'BF16' if tensor['dtype'] == 'BF16' else 'F32'
+                           for name, tensor in header.items() if name != '__metadata__'})
     fixture = out / 'fixed-length-checkpoint'
     fixture.mkdir(exist_ok=True)
     config = json.loads((model / 'config.json').read_text())
@@ -60,7 +65,7 @@ def main():
         return int((vram_device/'mem_info_vram_used').read_text()) if vram_device else None
     result = {'date':time.strftime('%Y-%m-%d'), 'backend':'HIP', 'source':str(args.source),
               'source_sha256':hashlib.sha256(args.source.read_bytes()).hexdigest(),
-              'model_dir':str(model), 'dtype':'F32', 'kv_dtype':'F32', 'build':'release',
+              'model_dir':str(model), 'dtype':'+'.join(weight_dtypes), 'kv_dtype':'F32', 'build':'release',
               'capacity_estimate':plan, 'generated_tokens':args.tokens, 'warmups':args.warmups,
               'repeats':args.repeats, 'prompt_lengths':lengths,
               'method':'Fresh production LLM FFI worker per row; synthetic repeated chat token IDs; greedy sampling; EOS stop disabled in a separate config; original tensors unchanged. Warm timers include reset, chunked prefill, host sampling, uploads, host logits and streaming callbacks. Model loading and compilation excluded. Decode throughput excludes first token.',

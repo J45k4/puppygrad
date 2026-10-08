@@ -38,24 +38,40 @@ impl Checkpoint {
             shard
                 .file
                 .seek(SeekFrom::Start(shard.payload_start + start as u64))?;
-            let values = read_weight(
-                name,
-                info.dtype,
-                end - start,
-                &mut shard.file,
-                &mut scratch,
-                &mut timing,
-            )?;
-            bind_weight(&mut context, key, inputs.len(), &info.shape)?;
-            inputs.push(Tensor::F32(values));
+            let dtype = weight_dtype(info.dtype);
+            let tensor = if dtype == DType::BF16 {
+                let started = Instant::now();
+                let values = read_bf16(name, end - start, &mut shard.file)?;
+                timing.read += started.elapsed();
+                Tensor::BF16(values)
+            } else {
+                Tensor::F32(read_weight(
+                    name,
+                    info.dtype,
+                    end - start,
+                    &mut shard.file,
+                    &mut scratch,
+                    &mut timing,
+                )?)
+            };
+            bind_weight(&mut context, key, inputs.len(), dtype, &info.shape)?;
+            inputs.push(tensor);
         }
         bind_tied_head(&mut context)?;
-        let values: usize = inputs.iter().skip(1).map(Tensor::len).sum();
+        let bytes: usize = inputs
+            .iter()
+            .skip(1)
+            .map(|t| t.len() * crate::compiler::gpu::dtype_bytes(t.dtype()))
+            .sum();
+        let bf16 = inputs
+            .iter()
+            .filter(|t| matches!(t, Tensor::BF16(_)))
+            .count();
         crate::progress::emit(format!(
-            "Checkpoint weights: read {:.3}s · convert {:.3}s · {:.2} GiB F32",
+            "Checkpoint weights: read {:.3}s · convert {:.3}s · {:.2} GiB ({bf16} BF16 tensors)",
             timing.read.as_secs_f64(),
             timing.convert.as_secs_f64(),
-            values as f64 * 4. / 1_073_741_824.,
+            bytes as f64 / 1_073_741_824.,
         ));
         Ok(Self {
             context,
@@ -89,7 +105,13 @@ impl Checkpoint {
                 )
                 .into());
             }
-            bind_weight(&mut context, key, slot, &tensor.shape)?;
+            bind_weight(
+                &mut context,
+                key,
+                slot,
+                weight_dtype(tensor.dtype),
+                &tensor.shape,
+            )?;
             slot += 1;
         }
         bind_tied_head(&mut context)?;
@@ -122,6 +144,33 @@ impl Checkpoint {
         );
         Ok(())
     }
+}
+
+fn weight_dtype(dtype: safetensors::Dtype) -> DType {
+    if dtype == safetensors::Dtype::BF16 {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
+fn read_bf16(name: &str, byte_len: usize, reader: &mut impl Read) -> Result<Arc<[u16]>> {
+    if !byte_len.is_multiple_of(2) {
+        return Err(format!("invalid checkpoint weight byte length for {name}: {byte_len}").into());
+    }
+    // SAFETY: all-zero bytes are a valid u16 value. Initialization also makes
+    // it safe to expose the storage as &mut [u8] to the Read implementation.
+    let mut values = unsafe { Arc::<[u16]>::new_zeroed_slice(byte_len / 2).assume_init() };
+    let output = Arc::get_mut(&mut values).unwrap();
+    // SAFETY: u16 is plain storage; the byte view covers exactly this unique
+    // allocation, stays within bounds and expires before output is read again.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), byte_len) };
+    reader.read_exact(bytes)?;
+    for value in output {
+        *value = u16::from_le(*value);
+    }
+    Ok(values)
 }
 
 // Read bounded chunks directly into the final shared allocation. Converting to
@@ -370,7 +419,13 @@ fn weight_key(name: &str) -> Option<&str> {
     Some(name.strip_prefix("transformer.").unwrap_or(name))
 }
 
-fn bind_weight(context: &mut Context, key: &str, slot: usize, shape: &[usize]) -> Result<()> {
+fn bind_weight(
+    context: &mut Context,
+    key: &str,
+    slot: usize,
+    dtype: DType,
+    shape: &[usize],
+) -> Result<()> {
     if context.tensors.contains_key(key) {
         return Err(format!("duplicate normalized weight {key}").into());
     }
@@ -378,7 +433,7 @@ fn bind_weight(context: &mut Context, key: &str, slot: usize, shape: &[usize]) -
         key.into(),
         TensorSpec {
             slot,
-            dtype: DType::F32,
+            dtype,
             shape: shape.to_vec(),
         },
     );
@@ -390,6 +445,20 @@ mod tests {
     use super::*;
     use safetensors::Dtype;
     use std::io::Cursor;
+
+    #[test]
+    fn native_bf16_read_preserves_every_storage_bit_pattern_without_widening() {
+        let bits: Vec<_> = (0..=u16::MAX).collect();
+        let bytes: Vec<_> = bits.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let output = read_bf16("weight", bytes.len(), &mut Cursor::new(&bytes)).unwrap();
+        assert_eq!(&*output, &bits);
+        assert_eq!(std::mem::size_of_val(&*output), bytes.len());
+        assert!(read_bf16("weight", 3, &mut Cursor::new([0; 3])).is_err());
+        assert!(read_bf16("weight", 4, &mut Cursor::new([0; 2])).is_err());
+        assert!(read_bf16("empty", 0, &mut Cursor::new([]))
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn direct_half_conversion_matches_every_bit_pattern() {

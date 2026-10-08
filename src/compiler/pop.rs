@@ -27,10 +27,19 @@ pub enum DType {
     I32,
     U8,
     F32,
+    BF16,
     WeakInt,
     WeakFloat,
 }
 impl DType {
+    /// Storage may be BF16; arithmetic and reductions accumulate in F32.
+    pub fn compute_dtype(self) -> Self {
+        if self == Self::BF16 {
+            Self::F32
+        } else {
+            self
+        }
+    }
     pub fn is_weak(self) -> bool {
         matches!(self, Self::WeakInt | Self::WeakFloat)
     }
@@ -463,7 +472,10 @@ impl Graph {
                     return Err(Error("PARAM requires ParamArg".into()));
                 };
                 require(
-                    matches!(p.dtype, DType::Bool | DType::I32 | DType::U8 | DType::F32),
+                    matches!(
+                        p.dtype,
+                        DType::Bool | DType::I32 | DType::U8 | DType::F32 | DType::BF16
+                    ),
                     "PARAM subset requires a concrete scalar dtype",
                 )?;
                 (p.dtype, Some(p.size.into_iter().collect()))
@@ -520,7 +532,10 @@ impl Graph {
                     return Err(Error("CAST requires a dtype argument".into()));
                 };
                 require(
-                    matches!(dtype, DType::Bool | DType::I32 | DType::U8 | DType::F32),
+                    matches!(
+                        dtype,
+                        DType::Bool | DType::I32 | DType::U8 | DType::F32 | DType::BF16
+                    ),
                     "CAST subset requires a concrete scalar dtype",
                 )?;
                 require(src[0].dtype != DType::Void, "cannot cast void")?;
@@ -532,7 +547,7 @@ impl Graph {
                     require(src[0].dtype == DType::Bool, "WHERE condition must be bool")?;
                     promote(&src[1..])?
                 } else {
-                    promote(src)?
+                    promote(src)?.compute_dtype()
                 };
                 let shapes = src.iter().map(|s| shape(s)).collect::<Result<Vec<_>>>()?;
                 if op == Op::Fdiv {
@@ -550,11 +565,11 @@ impl Graph {
                 plain()?;
                 if op != Op::Neg {
                     require(
-                        matches!(src[0].dtype, DType::F32 | DType::WeakFloat),
+                        matches!(src[0].dtype, DType::F32 | DType::BF16 | DType::WeakFloat),
                         "float operation requires floating-point input",
                     )?;
                 }
-                (src[0].dtype, Some(shape(src[0])?))
+                (src[0].dtype.compute_dtype(), Some(shape(src[0])?))
             }
             Op::Reshape | Op::Expand => {
                 plain()?;
@@ -656,7 +671,10 @@ impl Graph {
                 };
                 let input = shape(src[0])?;
                 require(*num_axes <= input.len(), "REDUCE axis count exceeds rank")?;
-                (src[0].dtype, Some(input[*num_axes..].to_vec())) // leading axes
+                (
+                    src[0].dtype.compute_dtype(),
+                    Some(input[*num_axes..].to_vec()),
+                ) // leading axes
             }
             Op::Index => {
                 plain()?;
@@ -704,14 +722,20 @@ fn promote(src: &[&Pop]) -> Result<DType> {
         src.iter().all(|s| s.dtype != DType::Void),
         "ALU/STACK sources cannot be void",
     )?;
-    let strong = src.iter().find(|s| !s.dtype.is_weak()).map(|s| s.dtype);
+    let strong = src
+        .iter()
+        .find(|s| s.dtype == DType::F32)
+        .or_else(|| src.iter().find(|s| !s.dtype.is_weak()))
+        .map(|s| s.dtype);
     let dtype = strong.unwrap_or(if src.iter().any(|s| s.dtype == DType::WeakFloat) {
         DType::WeakFloat
     } else {
         DType::WeakInt
     });
     require(
-        src.iter().all(|s| s.dtype == dtype || s.dtype.is_weak()),
+        src.iter().all(|s| {
+            s.dtype == dtype || s.dtype.is_weak() || (dtype == DType::F32 && s.dtype == DType::BF16)
+        }),
         "source dtypes must match; use CAST explicitly",
     )?;
     // Mixed weak float + concrete integer needs promotion/casts beyond this subset.

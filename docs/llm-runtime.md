@@ -54,12 +54,13 @@ latest events and keeps up to 200 entries; repeated download progress updates
 share one entry per file. `/logs` toggles the panel, which hides automatically in
 terminals narrower than 110 columns. Detailed build events do not enter chat history.
 
-Checkpoint loading includes both disk reads and conversion to the runtime's F32
-weights. The Activity panel reports these times separately. The loader reuses a
-read buffer of at most 4 MiB and converts directly into the final shared weight
-allocation, avoiding an intermediate F32 vector and its full copy. F32, F16 and
-BF16 checkpoints, shard validation, deterministic bindings and tied weights use
-the same path; conversion preserves the previous values, including NaN handling.
+BF16 checkpoint weights stay BF16 in host and device memory by default. They are
+read directly into the final shared two-byte buffers; no full F32 weight copy is
+created. F32 weights stay F32, while F16 weights are widened with a reusable read
+buffer of at most 4 MiB. The Activity panel reports read/conversion times, actual
+weight bytes and the number of native BF16 tensors. Shard validation, deterministic
+bindings and tied weights are unchanged. Kernels widen BF16 values as they are
+consumed, with F32 activations, matrix accumulation, attention and KV state.
 
 Enter a prompt to stream its response. The selected model stays loaded between
 requests, and recent user/assistant turns are included in each prompt. Changing
@@ -146,6 +147,9 @@ prompt operation.
 
 Enter sends the prompt; Shift+Enter inserts a newline. The composer grows up to
 six lines and scrolls to keep the cursor visible. Pasting preserves line breaks.
+The mouse wheel over the chat scrolls three displayed lines at a time;
+PageUp/PageDown scroll ten. Scrolling up holds your position while a reply streams.
+Scrolling back to the bottom resumes following new text.
 Modified keys use the terminal's enhanced keyboard protocol; Ctrl+J also inserts
 a newline on terminals that cannot distinguish Shift+Enter.
 Arrow keys move the composer cursor, including between wrapped lines. Home/End
