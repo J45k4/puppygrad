@@ -25,6 +25,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # caches
 .eslintcache
 .cache
+puppygrad.db
+puppygrad.db-wal
+puppygrad.db-shm
 *.tsbuildinfo
 
 # IntelliJ based IDEs

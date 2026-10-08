@@ -13,7 +13,7 @@ settings and chooses whether to register a token callback.
 
 Running `puppygrad` with no arguments in a terminal opens the interactive UI
 (`cargo run --release` from a checkout). Explicit `puppygrad tui` accepts
-`--device`, `--cache-dir`, and `--catalog`. Without a terminal, the no-argument
+`--device`, `--cache-dir`, `--catalog`, and `--db`. Without a terminal, the no-argument
 command prints help; existing command-line operations remain available for scripts.
 
 Type `/model` to browse GPT-2 small and Qwen3-0.6B. The list distinguishes downloaded,
@@ -23,8 +23,8 @@ Downloads run in the background with file/byte progress, and completed files are
 published atomically. `/download [id]` also downloads assets directly.
 
 Enter a prompt to stream its response. The selected model stays loaded between
-requests, while each prompt is currently independent (conversation history is not
-added automatically). Changing the model or device frees the previous provider
+requests, and recent user/assistant turns are included in each prompt. Changing
+the model or device preserves the conversation but frees the previous provider
 before loading the next one. `/device cpu|cuda:0|hip:0`, `/temperature N`, and
 `/tokens auto|N` adjust execution; `/help` lists commands. Esc stops an operation between
 download progress updates or generation callbacks, and `/quit` or Ctrl-C without
@@ -32,6 +32,74 @@ a composer selection exits
 after the current operation returns. The terminal is restored on normal exit and
 errors. First-response time and overall tokens/sec include model loading and cold
 compilation where applicable.
+
+The TUI starts a fresh chat by default and saves completed turns, including
+visible partial replies when generation is interrupted, in SQLite. The default
+database is `puppygrad.db` in the calling directory. `PUPPYGRAD_DB` selects another
+path for both chat sessions and GPU kernel bookkeeping; `puppygrad tui --db PATH`
+takes precedence over the environment (`--session-db` and `--history-file` remain
+compatibility aliases). Relative paths resolve from the calling directory. For example:
+
+```sh
+PUPPYGRAD_DB=/path/to/shared/puppygrad.db puppygrad tui
+puppygrad tui --db ./project-chat.db
+```
+
+New databases have mode 0600 on Unix. SQLite uses WAL, foreign keys and atomic
+transactions. Multiple TUIs may use separate sessions; stale writes to a session
+changed by another TUI are rejected with a request to resume it again.
+
+`/sessions` and `/resume` open a keyboard picker showing each chat's first-message
+title, ID, last update, model and turn count. Use Up/Down and Enter to resume;
+Esc closes the picker. `/resume ID` accepts a full ID or an unambiguous prefix,
+and `/resume latest` opens the most recently updated chat. `puppygrad tui --resume`
+resumes the latest chat at startup; `--resume ID` selects one. Resuming restores
+the last eight turns and the last model if it is still in the catalog. Earlier
+turns remain available through `FETCH_OLDER`, scoped to that session.
+`/new` starts another chat without deleting saved sessions; empty chats are not
+stored. `/clear` only clears the display. `/history` shows the database path.
+
+On first open, the TUI imports the previous cache-directory `conversation.sqlite3`
+into the selected database. If it does not exist, `conversation.jsonl` is imported
+instead. Each old reset marker separates sessions; empty groups
+are skipped. The original JSONL file is left untouched and successful imports
+are recorded to prevent duplicates. An explicit old JSONL path is also supported:
+it imports into a sibling `.sqlite3` database. Invalid or incomplete archives
+roll back the whole import; close an old TUI that still holds the archive lock
+before migrating.
+
+Before each answer, the runtime counts the formatted prompt tokens and removes
+the oldest complete user/assistant turns until the input uses at most 80% of the
+model's context limit. The latest user message is never truncated; it can use
+more than that soft limit if it fits the model. Removed turns stay in SQLite,
+and the UI reports their removal from active context. This procedure drops old
+turns rather than summarizing them.
+
+When older messages exist outside the active window, a system instruction tells
+the model how many are available and allows it to return exactly `FETCH_OLDER N` as its entire response. `N` counts
+messages, from 1 to 1024, rounded up to complete user/assistant pairs. The runtime
+reads the next older turns from SQLite, prepends them in chronological order,
+and reruns the pending question. A possible control response is held back while
+decoding; ordinary text still streams. Control responses are neither displayed
+as answers nor saved as conversation turns. With no older messages, ordinary
+chat uses the model's normal conversation template without retrieval instructions.
+
+Retrieval may use up to 95% of the context window, borrowing some reply headroom.
+It preserves all recent turns and the current question. Oversized requests or an
+empty archive produce feedback to the model instead of silently dropping recent
+messages. At most three fetches are allowed per question. If the enlarged prompt
+fails before generating output, the runtime restores the preceding active window
+and retries with a refusal notice. Existing provider memory checks still apply;
+a prompt that fits the position limit can exceed the device-memory budget.
+Qwen uses its system/user/assistant template; other models receive plain role
+labels. Retrieval depends on the model following the instruction: GPT-2 is a
+base completion model and may not reliably follow this protocol.
+
+Conversation continuity currently comes from replaying the formatted history:
+the provider still resets KV contents and prefills the supplied prompt each time.
+It reuses weights, kernels and allocation capacity, rather than retaining KV
+contents across chat turns. The noninteractive `llm` command remains a single
+prompt operation.
 
 Enter sends the prompt; Shift+Enter inserts a newline. The composer grows up to
 six lines and scrolls to keep the cursor visible. Pasting preserves line breaks.
@@ -120,6 +188,35 @@ live under `$XDG_CACHE_HOME/puppygrad/models/<id>/<revision>`, falling back to
 `~/.cache/puppygrad`. Programs, compiled kernels, and `tui.log` diagnostics use the
 same UI cache root; `--cache-dir` overrides it. An existing local directory is
 treated as caller-provided assets; its revision is not independently verified.
+
+CUDA/HIP kernel bookkeeping uses the same `puppygrad.db` as chat sessions, with
+the same `PUPPYGRAD_DB` override. For the TUI, generated `.cu`/`.hip` source and
+`.ptx`/`.hsaco` binaries remain files under `compiled/cuda/` and `compiled/hip/`
+in its cache root. The `kernel_modules` table records the absolute cache directory
+and relative file paths, SHA-256 hashes, byte
+sizes, backend, architecture, RTC compiler version/options, kernel/GEMM counts,
+first registration and last successful load times, and load/hit/compile counts.
+Times are Unix milliseconds. Entries are keyed by cache directory and module key,
+so one database can track multiple cache directories. An existing per-directory
+`cache.sqlite3` is imported once without modifying the original.
+
+Existing files are adopted as they are successfully loaded, so bookkeeping does
+not require recompiling the cache. Indexed compatibility or checksum mismatches,
+and missing or empty files, trigger recompilation. Metadata updates occur on
+module loads rather than token generation or individual GPU launches. Counters
+describe activity observed since registration. Kernel bookkeeping can be rebuilt
+lazily by clearing only `kernel_modules`, preserving saved chat sessions in the
+shared database. Metadata errors are logged while file caching and inference continue.
+
+For example, an SQLite client can inspect cache usage with:
+
+```sql
+SELECT cache_dir, backend, architecture, binary_path, binary_bytes,
+       kernel_count, load_count, hit_count, compile_count,
+       datetime(last_used_at / 1000, 'unixepoch', 'localtime') AS last_loaded
+FROM kernel_modules
+ORDER BY last_used_at DESC;
+```
 
 `llm MODEL`, `llm run MODEL`, and `run MODEL` execute the same runtime.
 `llm benchmark [MODEL]` measures CPU thread scaling:

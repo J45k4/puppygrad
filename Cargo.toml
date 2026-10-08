@@ -31,8 +31,10 @@ libc = "0.2"
 nokhwa = { version = "0.10", default-features = false, features = ["decoding", "input-native"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache", "unstable-rendered-line-info"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 safetensors = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokenizers = "0.23"
 unicode-segmentation = "1"

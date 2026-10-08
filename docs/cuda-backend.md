@@ -173,6 +173,10 @@ Generated `.cu` and `.ptx` files are cached under `.cache/pup/cuda/`, keyed by
 source, compute capability, and NVRTC major/minor version. Runtime compilation
 uses NVRTC even when retrieving a cached module to identify the compiler version.
 Cache writes replace files atomically. No weights are embedded in emitted code.
+The shared `./puppygrad.db` (overridden with `PUPPYGRAD_DB`) records file paths, SHA-256
+hashes, sizes, compiler compatibility and module-load statistics. Existing files
+are indexed on use; generated source and PTX remain files. See
+[kernel cache bookkeeping](llm-runtime.md) for fields and an inspection query.
 
 ## Current limits and next steps
 

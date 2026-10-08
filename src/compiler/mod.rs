@@ -10,6 +10,7 @@ pub mod device;
 mod expression;
 pub mod gpu;
 pub mod hip;
+mod kernel_cache;
 pub mod pop;
 pub mod rewrite;
 pub mod source;

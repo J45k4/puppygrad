@@ -891,3 +891,15 @@ fn cached_qwen3_cuda_reusable_prefill_preserves_positions_logits_and_streaming()
 fn cached_qwen3_cuda_reusable_prefill_falls_back_to_decode_under_memory_pressure() {
     reusable_prefill_provider(Some(gpu::Backend::Cuda), true);
 }
+
+#[test]
+#[ignore = "requires HIP; synthetic model buffers capped at 1 MiB"]
+fn cached_qwen3_hip_reusable_prefill_preserves_positions_logits_and_streaming() {
+    reusable_prefill_provider(Some(gpu::Backend::Hip), false);
+}
+
+#[test]
+#[ignore = "requires HIP; synthetic model buffers capped below 1 MiB"]
+fn cached_qwen3_hip_reusable_prefill_falls_back_to_decode_under_memory_pressure() {
+    reusable_prefill_provider(Some(gpu::Backend::Hip), true);
+}

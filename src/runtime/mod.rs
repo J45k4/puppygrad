@@ -1,4 +1,5 @@
 pub mod catalog;
+mod conversation;
 pub mod data;
 pub mod llm;
 pub mod llm_benchmark;

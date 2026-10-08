@@ -294,6 +294,83 @@ fn hip_bounds_failures_recover_and_weight_copy_on_write_refreshes() {
 }
 
 #[test]
+#[ignore = "requires AMD GPU and HIPRTC"]
+fn hip_kernel_index_adopts_files_and_rebuilds_changed_or_missing_binaries() {
+    let cache =
+        std::env::temp_dir().join(format!("puppygrad-hip-kernel-index-{}", std::process::id()));
+    std::fs::create_dir_all(&cache).unwrap();
+    let db_path = cache.join("puppygrad.db");
+    let _database_scope = puppygrad::database::use_path(&db_path).unwrap();
+    let program = source::parse("x = param(0, f32, 3)\noutput x * 2").unwrap();
+    let runtime = hip::Runtime::new(0).unwrap();
+    let first = hip::compile_with_runtime(&program.graph, program.root, &cache, &runtime).unwrap();
+    let binary_path = first.source_path.with_extension("hsaco");
+    let expected = std::fs::read(&binary_path).unwrap();
+    // A pre-index cache remains usable and is registered without compilation.
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute("DELETE FROM kernel_modules", [])
+        .unwrap();
+    let load = || {
+        let executable =
+            hip::compile_with_runtime(&program.graph, program.root, &cache, &runtime).unwrap();
+        assert_eq!(
+            executable
+                .run(&[cpu::Tensor::F32(vec![1., 2., 3.].into())])
+                .unwrap()[0]
+                .f32()
+                .unwrap(),
+            &[2., 4., 6.]
+        );
+        executable
+    };
+    assert!(load().cache_hit);
+    assert!(load().cache_hit);
+    let counts = || {
+        let db = rusqlite::Connection::open(&db_path).unwrap();
+        db.query_row(
+            "SELECT load_count,hit_count,compile_count FROM kernel_modules",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(counts(), (2, 2, 0));
+    let mut changed = expected.clone();
+    *changed.last_mut().unwrap() ^= 1; // Same length, different SHA-256.
+    std::fs::write(&binary_path, changed).unwrap();
+    assert!(!load().cache_hit);
+    assert_eq!(std::fs::read(&binary_path).unwrap(), expected);
+    assert_eq!(counts(), (3, 2, 1));
+    std::fs::remove_file(&binary_path).unwrap();
+    assert!(!load().cache_hit);
+    assert_eq!(counts(), (4, 2, 2));
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let (backend, architecture, source_hash, binary_hash, source_path): (String, String, String, String, String) = db.query_row("SELECT backend,architecture,source_sha256,binary_sha256,source_path FROM kernel_modules", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+    assert_eq!(backend, "hip");
+    assert!(!architecture.is_empty());
+    assert_eq!((source_hash.len(), binary_hash.len()), (64, 64));
+    assert_eq!(cache.join(source_path), first.source_path);
+    // Unsupported bookkeeping must leave the valid file cache usable.
+    db.execute_batch("PRAGMA user_version=3").unwrap();
+    assert!(load().cache_hit);
+    assert_eq!(
+        db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
+            .unwrap(),
+        3
+    );
+    drop(db);
+    drop(first);
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
 #[ignore = "requires HIPRTC, but no GPU"]
 fn hiprtc_compiles_image_ddim_example_stage() {
     let (program, _) =

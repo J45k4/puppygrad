@@ -120,7 +120,10 @@ Set `PUPPYGRAD_HIP_REDUCTIONS=0`, `PUPPYGRAD_HIP_ROW_FUSION=0`, or
 `PUPPYGRAD_HIP_EXPRESSIONS=0` before compilation to disable the corresponding
 schedules. CUDA's switches affect CUDA only. Generated `.hip` and `.hsaco` files
 are cached under `.cache/pup/hip`, keyed by source, backend, architecture and RTC
-major/minor version. Tensor cores, GPU event profiling and provider-library export
+major/minor version. The shared `./puppygrad.db` (overridden with `PUPPYGRAD_DB`) records
+paths, SHA-256 hashes, sizes, compatibility and module-load statistics; source and
+binary files stay on disk. See [kernel cache bookkeeping](llm-runtime.md) for
+fields and an inspection query. Tensor cores, GPU event profiling and provider-library export
 are not implemented; `emit --backend hip --profile` reports an explicit error.
 The thread-scaling LLM benchmark remains CPU-only.
 

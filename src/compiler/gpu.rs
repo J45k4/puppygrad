@@ -709,10 +709,45 @@ pub(crate) fn compile_lowered_with_runtime(
     let stem = format!("{:016x}", hash.finish());
     let source_path = cache.join(format!("{stem}.{}", backend.source_extension()));
     let ptx_path = cache.join(format!("{stem}.{}", backend.binary_extension()));
+    let compiler_version = format!("{}.{}", version.0, version.1);
+    let compiler_options = serde_json::to_string(&rtc_options(backend, architecture))
+        .map_err(|e| Error(e.to_string()))?;
+    let identity = super::kernel_cache::Identity {
+        key: &stem,
+        backend: backend.tag(),
+        architecture,
+        compiler_version: &compiler_version,
+        compiler_options: &compiler_options,
+    };
+    // Cache bookkeeping is disposable. A missing/unavailable index must not
+    // prevent the existing file cache and GPU compiler from working.
+    let index = match super::kernel_cache::Index::open(cache) {
+        Ok(index) => Some(index),
+        Err(error) => {
+            eprintln!("Kernel cache index unavailable: {error}; using file cache");
+            None
+        }
+    };
     let cached = std::fs::read_to_string(&source_path)
         .ok()
         .filter(|s| s == &lowered.source)
-        .and_then(|_| std::fs::read(&ptx_path).ok());
+        .and_then(|_| std::fs::read(&ptx_path).ok())
+        .filter(|binary| {
+            if binary.is_empty() {
+                return false;
+            }
+            let Some(index) = &index else {
+                return true;
+            };
+            let artifacts = super::kernel_cache::Artifacts::new(lowered.source.as_bytes(), binary);
+            match index.allows(&identity, &artifacts) {
+                Ok(allowed) => allowed,
+                Err(error) => {
+                    eprintln!("Kernel cache metadata lookup failed: {error}; recompiling module");
+                    false
+                }
+            }
+        });
     let cache_hit = cached.is_some();
     let ptx = if let Some(ptx) = cached {
         ptx
@@ -722,6 +757,7 @@ pub(crate) fn compile_lowered_with_runtime(
         write_atomic(&ptx_path, &ptx)?;
         ptx
     };
+    let artifacts = super::kernel_cache::Artifacts::new(lowered.source.as_bytes(), &ptx);
     let current = context.driver.enter(context.handle)?;
     let driver = &context.driver;
     // CUDA loads zero-terminated PTX; HIP loads an ELF code object containing NUL bytes.
@@ -749,6 +785,21 @@ pub(crate) fn compile_lowered_with_runtime(
             "find kernel",
         )?;
         functions.push(function);
+    }
+    // Register only modules whose image and all expected functions loaded.
+    // Timestamps/counts describe module loads, not individual GPU launches.
+    if let Some(index) = &index {
+        if let Err(error) = index.record(
+            &identity,
+            &artifacts,
+            source_path.file_name().unwrap().to_str().unwrap(),
+            ptx_path.file_name().unwrap().to_str().unwrap(),
+            lowered.kernels.len(),
+            lowered.gemm_count,
+            cache_hit,
+        ) {
+            eprintln!("Kernel cache metadata update failed: {error}");
+        }
     }
     std::mem::forget(module);
     drop(current);

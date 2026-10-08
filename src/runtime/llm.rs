@@ -272,6 +272,49 @@ pub(super) fn tokenize_with(
     Ok(input)
 }
 
+pub(super) fn tokenize_conversation_with(
+    tokenizer: &tokenizers::Tokenizer,
+    model_dir: &Path,
+    turns: &[super::conversation::Turn],
+    prompt: &str,
+    older_messages: usize,
+    feedback: Option<&str>,
+) -> std::result::Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let formatted = format_chat_prompt(
+        is_qwen3(model_dir)?,
+        turns,
+        prompt,
+        older_messages,
+        feedback,
+    );
+    Ok(tokenizer
+        .encode(formatted, true)
+        .map_err(|e| e.to_string())?
+        .get_ids()
+        .to_vec())
+}
+
+fn format_chat_prompt(
+    qwen3: bool,
+    turns: &[super::conversation::Turn],
+    prompt: &str,
+    older_messages: usize,
+    feedback: Option<&str>,
+) -> String {
+    let system = (older_messages > 0 || feedback.is_some()).then(|| format!(
+        "You are a helpful assistant. The app saves the conversation to a file. Earlier messages outside your context: {older_messages}.\n\nTo read earlier messages, your ENTIRE response must be FETCH_OLDER N, with no explanation, quotes or other text. N is a positive integer from 1 to 1024. Example response: FETCH_OLDER 2\n\nWhen asked about an earlier detail that is absent from the visible conversation, fetch earlier messages before answering. Never pretend that you fetched them, and never invent a missing detail. The app will insert the retrieved user/assistant turns before the recent messages and ask the same question again. If a fetch is refused, request fewer messages or explain that the detail is unavailable. If no earlier messages remain, answer from the visible conversation."
+    ));
+    // Put the result beside the pending question so the model sees that the
+    // previous control request has already been handled, rather than repeating it.
+    let continued_prompt = feedback.map(|feedback| format!("{prompt}\n\n[Application FETCH_OLDER result: {feedback} Earlier messages still outside context: {older_messages}. Continue answering the question above using the visible conversation. Do not repeat a successful fetch. Request additional messages only if the required detail is still absent.]"));
+    format_conversation(
+        qwen3,
+        turns,
+        continued_prompt.as_deref().unwrap_or(prompt),
+        system.as_deref(),
+    )
+}
+
 pub(super) fn validate_tokenizer(
     model: &Model,
     tokenizer: &tokenizers::Tokenizer,
@@ -292,19 +335,105 @@ fn format_prompt(
     model_dir: &Path,
     prompt: &str,
 ) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    Ok(format_conversation(is_qwen3(model_dir)?, &[], prompt, None))
+}
+
+fn is_qwen3(model_dir: &Path) -> std::result::Result<bool, Box<dyn std::error::Error>> {
     let config = model_dir.join("config.json");
     if config.is_file() {
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
-        if config.get("model_type").and_then(|v| v.as_str()) == Some("qwen3") {
-            return Ok(format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        return Ok(config.get("model_type").and_then(|v| v.as_str()) == Some("qwen3"));
+    }
+    Ok(false)
+}
+
+fn format_conversation(
+    qwen3: bool,
+    turns: &[super::conversation::Turn],
+    prompt: &str,
+    system: Option<&str>,
+) -> String {
+    let mut text = String::new();
+    if qwen3 {
+        if let Some(system) = system {
+            text.push_str(&format!("<|im_start|>system\n{system}<|im_end|>\n"));
+        }
+        for turn in turns {
+            text.push_str(&format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}<|im_end|>\n",
+                turn.user, turn.assistant
+            ));
+        }
+        text.push_str(&format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+    } else {
+        if let Some(system) = system {
+            text.push_str(&format!("System: {system}\n\n"));
+        }
+        for turn in turns {
+            text.push_str(&format!(
+                "User: {}\nAssistant: {}\n\n",
+                turn.user, turn.assistant
+            ));
+        }
+        if turns.is_empty() && system.is_none() {
+            text.push_str(prompt);
+        } else {
+            text.push_str(&format!("User: {prompt}\nAssistant:"));
         }
     }
-    Ok(prompt.to_owned())
+    text
 }
 
 #[cfg(test)]
 mod prompt_tests {
     use super::*;
+    #[test]
+    fn archive_control_instructions_only_appear_when_older_messages_exist() {
+        let turns = [super::super::conversation::Turn {
+            user: "My name is puppy".into(),
+            assistant: "Hello puppy".into(),
+        }];
+        let ordinary = format_chat_prompt(true, &turns, "What is my name", 0, None);
+        assert_eq!(
+            ordinary,
+            format_conversation(true, &turns, "What is my name", None)
+        );
+        assert!(!ordinary.contains("FETCH_OLDER"));
+        let archived = format_chat_prompt(true, &turns, "What is my name", 2, None);
+        assert!(archived.starts_with("<|im_start|>system\n"));
+        assert!(archived.contains("Earlier messages outside your context: 2"));
+        assert!(archived.contains("FETCH_OLDER N"));
+        let fetched = format_chat_prompt(
+            true,
+            &turns,
+            "What is my name",
+            0,
+            Some("Added 2 older messages."),
+        );
+        assert!(fetched.starts_with("<|im_start|>system\n"));
+        assert!(fetched.contains("[Application FETCH_OLDER result: Added 2 older messages."));
+    }
+
+    #[test]
+    fn conversation_roles_and_fetch_feedback_precede_the_current_question() {
+        let turns = [super::super::conversation::Turn {
+            user: "My name is Teppo".into(),
+            assistant: "Hello Teppo".into(),
+        }];
+        let formatted = format_conversation(
+            true,
+            &turns,
+            "What is my name?",
+            Some("FETCH_OLDER result: Added 2 messages."),
+        );
+        assert_eq!(formatted, "<|im_start|>system\nFETCH_OLDER result: Added 2 messages.<|im_end|>\n<|im_start|>user\nMy name is Teppo<|im_end|>\n<|im_start|>assistant\nHello Teppo<|im_end|>\n<|im_start|>user\nWhat is my name?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        assert_eq!(
+            format_conversation(false, &turns, "What is my name?", None),
+            "User: My name is Teppo\nAssistant: Hello Teppo\n\nUser: What is my name?\nAssistant:"
+        );
+    }
     #[test]
     fn qwen3_non_thinking_template_matches_official_single_user_prefix() {
         let dir =
