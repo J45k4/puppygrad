@@ -13,7 +13,7 @@ settings and chooses whether to register a token callback.
 
 Running `puppygrad` with no arguments in a terminal opens the interactive UI
 (`cargo run --release` from a checkout). Explicit `puppygrad tui` accepts
-`--device`, `--cache-dir`, `--catalog`, and `--db`. Without a terminal, the no-argument
+`--device`, `--cache-dir`, `--catalog`, `--db`, and `--tool-root`. Without a terminal, the no-argument
 command prints help; existing command-line operations remain available for scripts.
 
 Typing `/` opens suggestions for every slash command, including aliases. Keep
@@ -53,6 +53,57 @@ prompts. Incomplete reasoning is also excluded from replay. Retrieval examines
 the final answer, so a `FETCH_OLDER N` after reasoning still works. Output token
 limits and context limits include both reasoning and answer tokens. The single
 prompt `llm` command continues to use non-thinking mode.
+
+`/tools on` enables native Qwen3 function calling with `read_file` and `write_file` tools.
+It defaults off on every launch, including resumed chats; `/tools off` disables
+new calls, and `/tools` shows the setting and allowed root. The root is the launch
+directory by default; `puppygrad tui --tool-root /path/to/project` selects another
+directory. The header shows whether tools are enabled. Try:
+
+```text
+/model qwen3-4b
+/tools on
+Read docs/qwen3.md and summarize the supported model sizes.
+```
+
+Qwen emits a native `<tool_call>` JSON block. Puppygrad validates and executes it,
+adds a `<tool_response>` with the result, then generates the final answer. Calls
+must occupy the entire final answer; quoted examples and calls inside reasoning
+are not executed. Reads are confined to the root, including symlink resolution,
+and accept only regular UTF-8 text files. Arguments are `path`, optional byte
+`offset` (default 0), and `max_bytes` (default 4096, range 4–16384). Results include
+`content`, `bytes_read`, `next_offset`, `eof`, and `size_bytes`; further calls can
+page through a file. Filename casing is preserved exactly; a missing file error
+includes the requested path and reminds the model to correct a spelling mismatch
+instead of repeating the same failed request. File access errors return to the model. There are at most
+four tool rounds and eight calls per round. Results are shortened if necessary
+to fit context, with a corrected paging offset. `/tokens N` covers all generated
+tokens across tool rounds, including reasoning and call JSON.
+
+`write_file` takes `path`, `content`, and optional `overwrite` (default false).
+It creates a file, or replaces the complete contents when `overwrite: true` is
+explicitly supplied. Content is UTF-8 text without NUL bytes, up to 65536 bytes;
+parent directories must already exist. Writes use a staged file and atomic
+publication in the destination directory. Creating a file never clobbers an
+existing path, including concurrent creates. Existing symlinks, directories and
+special files are refused; replacing a hard link leaves its other names untouched.
+New files are private (0600 on Unix), and replacements preserve permission bits.
+Write support currently requires Unix. A typical prompt is:
+
+```text
+Create hello.py that prints "Hello puppy!".
+```
+
+`/tools on` enables both reading and writing within the root. Writes return
+`path`, `bytes_written`, and `operation` (`created` or `replaced`). The Activity
+panel logs requests and results; chat shows compact read and write indicators.
+SQLite schema version 5 stores the tool exchanges, arguments, returned contents,
+and their UTC millisecond timestamps in `tool_exchanges`, attached to the saved
+turn. Resume and older-message retrieval retain these exchanges, and token counts
+include their contents. Historical reasoning is excluded from replay, while
+reasoning in the current tool sequence is retained. Saved results remain visible
+in context even with tools off. The file tools do not execute commands.
+Tool calling is currently available in the TUI for Qwen3 models.
 
 A second header row always shows `Context: USED / LIMIT tokens · Chat: TOTAL tokens`.
 Context counts the actual formatted prompt and generated tokens during a reply;
@@ -94,9 +145,11 @@ the model or device preserves the conversation but frees the previous provider
 before loading the next one. `/device cpu|cuda:0|hip:0`, `/temperature N`, and
 `/tokens auto|N` adjust execution; `/help` lists commands. Esc stops an operation between
 download progress updates or generation callbacks, and `/quit` or Ctrl-C without
-a composer selection exits
-after the current operation returns. The terminal is restored on normal exit and
-errors. First-response time and overall tokens/sec include model loading and cold
+a composer selection cancels the operation and exits, allowing up to three seconds
+for partial output to be saved. Press Ctrl-C again to exit immediately. Loading,
+compilation and prefill may not reach a cancellation callback during this grace
+period; immediate or timed-out exit may leave the current response unsaved.
+The terminal is restored on normal exit and errors. First-response time and overall tokens/sec include model loading and cold
 compilation where applicable.
 
 The TUI starts a fresh chat by default and saves completed turns, including
@@ -126,8 +179,9 @@ and `/resume latest` opens the most recently updated chat. `puppygrad tui --resu
 resumes the latest chat at startup; `--resume ID` selects one. Resuming restores
 the last eight turns and the last model if it is still in the catalog. Earlier
 turns remain available through `FETCH_OLDER`, scoped to that session.
-`/new` starts another chat without deleting saved sessions; empty chats are not
-stored. `/clear` only clears the display. `/history` shows the database path.
+`/new` cancels any current operation, waits for it to return, then starts a fresh
+chat without deleting saved sessions. Interrupted responses are saved when they
+have produced text. Empty chats are not stored. `/clear` only clears the display. `/history` shows the database path.
 
 On first open, the TUI imports the previous cache-directory `conversation.sqlite3`
 into the selected database. If it does not exist, `conversation.jsonl` is imported

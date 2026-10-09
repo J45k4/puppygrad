@@ -4,6 +4,7 @@ use super::{
     conversation::{fetch_count, fetch_prefix, Conversation, Session, Turn},
     llm,
     llm_ffi::{Generation, Model},
+    tools::{self, FileTools, ToolExchange, ToolResult},
 };
 use crossterm::{
     event::{
@@ -32,6 +33,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const QUIT_GRACE: Duration = Duration::from_secs(3);
 use unicode_segmentation::UnicodeSegmentation;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -56,6 +59,9 @@ pub struct Options {
     /// Resume the latest saved chat, or the given session ID/prefix.
     #[arg(long, num_args = 0..=1, default_missing_value = "latest")]
     pub resume: Option<String>,
+    /// Root directory accessible to read_file and write_file when /tools on is enabled.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub tool_root: Option<PathBuf>,
     #[arg(skip)]
     pub max_memory: Option<super::memory_limit::MemoryLimit>,
 }
@@ -77,6 +83,7 @@ enum Request {
         device: String,
         prompt: String,
         thinking: bool,
+        tools: bool,
         temperature: f32,
         limit: Option<u64>,
     },
@@ -103,6 +110,7 @@ enum Update {
         thinking: bool,
     },
     NewConversation(Session),
+    NewConversationFailed(String),
     Sessions(Vec<Session>),
     Resumed {
         session: Session,
@@ -164,6 +172,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/download", "Download model assets [id]"),
     ("/device", "Choose cpu, cuda:0 or hip:0"),
     ("/thinking", "Set Qwen3 thinking on or off"),
+    ("/tools", "Enable or disable file tools for this run"),
     ("/temperature", "Set sampling temperature N"),
     ("/tokens", "Set output length auto or N"),
     ("/history", "Show the session database path"),
@@ -205,11 +214,16 @@ struct App {
     temperature: f32,
     thinking: bool,
     thinking_changed: bool,
+    tools: bool,
+    tool_root: PathBuf,
     limit: Option<u64>,
     busy: bool,
     warming: bool,
     auto_warmup: bool,
+    pending_new: bool,
     quitting: bool,
+    quit_started: Option<Instant>,
+    force_quit: bool,
     scroll: u16,
     chat_area: Rect,
     chat_max_scroll: u16,
@@ -245,8 +259,9 @@ impl App {
             history_file: None,
             session: None, sessions: None, session_browser: false, session_preview_requested: false, session_cursor: ListState::default(),
             status: "Ready".into(), device,
-            temperature: 0.7, thinking: false, thinking_changed: false, limit: None,
-            busy: false, warming: false, auto_warmup: true, quitting: false, scroll: 0,
+            temperature: 0.7, thinking: false, thinking_changed: false, tools: false, tool_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), limit: None,
+            busy: false, warming: false, auto_warmup: true, pending_new: false,
+            quitting: false, quit_started: None, force_quit: false, scroll: 0,
             chat_area: Rect::default(), chat_max_scroll: 0,
             clock: Instant::now(), requests, cancel,
         }
@@ -425,7 +440,8 @@ impl App {
     }
 
     fn warmup(&mut self) {
-        if !self.auto_warmup
+        if self.quitting
+            || !self.auto_warmup
             || self.busy
             || self.entries[self.selected].status(&self.cache) != Status::Downloaded
         {
@@ -470,6 +486,9 @@ impl App {
     }
 
     fn submit(&mut self) {
+        if self.quitting {
+            return;
+        }
         let text = self.input.text.trim().to_owned();
         if text.is_empty() {
             self.input.clear();
@@ -509,6 +528,7 @@ impl App {
                 device: self.device.clone(),
                 prompt: text.clone(),
                 thinking: self.thinking,
+                tools: self.tools,
                 temperature: self.temperature,
                 limit: self.limit,
             })
@@ -575,6 +595,16 @@ impl App {
                     _ => self.status = "Use /thinking on or /thinking off.".into(),
                 }
             }
+            "/tools" => {
+                match (parts.next(), parts.next()) {
+                    (None, None) => self.status = format!("Tools: {} · read_file, write_file · root {}", if self.tools { "on" } else { "off" }, self.tool_root.display()),
+                    (Some(value @ ("on" | "off")), None) => {
+                        self.tools = value == "on";
+                        self.status = format!("Tools: {value} · read_file, write_file · root {} · applies to the next reply", self.tool_root.display());
+                    }
+                    _ => self.status = "Use /tools on or /tools off.".into(),
+                }
+            }
             "/temperature" => {
                 if let Some(value) = parts.next().and_then(|s| s.parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.) {
                     self.temperature = value;
@@ -599,10 +629,18 @@ impl App {
                 self.status = if self.show_activity { "Activity log shown on wide terminals" } else { "Activity log hidden" }.into();
             }
             "/new" => {
-                if self.busy { self.status = "Stop the current operation before starting a new conversation.".into(); return; }
-                self.cancel.store(false, Ordering::Relaxed);
-                self.busy = self.requests.send(Request::NewConversation).is_ok();
-                self.status = "Starting a new conversation…".into();
+                if self.pending_new || self.quitting { return; }
+                let stopping = self.busy;
+                self.cancel.store(true, Ordering::Relaxed);
+                if self.requests.send(Request::NewConversation).is_ok() {
+                    self.pending_new = true;
+                    self.busy = true;
+                    self.warming = false;
+                    self.status = if stopping { "Stopping current operation; starting a new chat…" } else { "Starting a new conversation…" }.into();
+                } else {
+                    self.busy = false;
+                    self.status = "Model worker exited; could not start a new chat.".into();
+                }
             }
             "/sessions" | "/resume" => {
                 if let Some(id) = parts.next().filter(|_| text.starts_with("/resume")) {
@@ -613,17 +651,31 @@ impl App {
             }
             "/history" => self.status = self.history_file.as_ref().map_or_else(|| "Session database is opening…".into(), |path| format!("Session database: {}", path.display())),
             "/quit" | "/exit" => self.quit(),
-            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/thinking on|off — Qwen3 reasoning (saved; default off)\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\nContext counts active prompt/reply tokens; Chat counts all saved messages, including archived turns and reasoning.\n\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nUp/Down recalls this chat’s submitted prompts at the first/last composer row; Down past the newest restores your draft. Shift+arrows selects text.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nMouse wheel over the chat or PageUp/PageDown scrolls. Scroll to the bottom to follow new replies. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
+            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/thinking on|off — Qwen3 reasoning (saved; default off)\n/tools on|off — allow read_file and write_file within the tool root (default off each launch; --tool-root selects directory)\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — stop the current operation and start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\nContext counts active prompt/reply tokens; Chat counts all saved messages, including archived turns and reasoning.\n\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nUp/Down recalls this chat’s submitted prompts at the first/last composer row; Down past the newest restores your draft. Shift+arrows selects text.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits; press again to exit immediately); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nMouse wheel over the chat or PageUp/PageDown scrolls. Scroll to the bottom to follow new replies. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
             _ => self.status = "Unknown command. Type /help.".into(),
         }
     }
 
     fn quit(&mut self) {
-        self.quitting = true;
-        if self.busy {
-            self.cancel.store(true, Ordering::Relaxed);
-            self.status = "Stopping; waiting for the current operation to return…".into();
+        if self.quitting {
+            self.force_quit = true;
         }
+        self.quitting = true;
+        self.quit_started.get_or_insert_with(Instant::now);
+        self.cancel.store(true, Ordering::Relaxed);
+        if self.busy {
+            self.status =
+                "Stopping… Ctrl+C again exits immediately (automatic exit after 3s).".into();
+        }
+    }
+
+    fn should_exit(&self) -> bool {
+        self.quitting
+            && (!self.busy
+                || self.force_quit
+                || self
+                    .quit_started
+                    .is_some_and(|start| start.elapsed() >= QUIT_GRACE))
     }
 
     fn copy_selection(&mut self, cut: bool) {
@@ -658,6 +710,26 @@ impl App {
     }
 
     fn update(&mut self, update: Update) {
+        // The worker processes requests in order. A stopped operation can still
+        // finish before the reset; its updates must not release the reset's busy
+        // state or start another warmup and clear cancellation prematurely.
+        if self.pending_new {
+            match &update {
+                Update::Status(message) | Update::Error(message) => {
+                    self.log_activity(message.clone(), false);
+                    return;
+                }
+                Update::Chunk(_)
+                | Update::Done { .. }
+                | Update::Warmed { .. }
+                | Update::Downloaded
+                | Update::Progress { .. }
+                | Update::Context { .. }
+                | Update::ContextTrimmed(_)
+                | Update::Resumed { .. } => return,
+                _ => {}
+            }
+        }
         match update {
             Update::Context { index, usage } => {
                 if index == self.selected || index == usize::MAX {
@@ -688,7 +760,8 @@ impl App {
                 for turn in turns {
                     restored.push_str(&format!(
                         "\nYou: {}\n\nAssistant:\n{}\n",
-                        turn.user, turn.assistant
+                        turn.user,
+                        saved_answer(&turn)
                     ));
                 }
                 // File loading is asynchronous: keep restored turns before a
@@ -701,6 +774,12 @@ impl App {
                 self.warmup();
             }
             Update::NewConversation(session) => {
+                self.pending_new = false;
+                self.warming = false;
+                self.downloading = None;
+                self.input.clear();
+                self.browser = false;
+                self.response_started = false;
                 self.prompt_history.clear();
                 self.history_cursor = None;
                 self.history_draft = None;
@@ -714,6 +793,14 @@ impl App {
                 self.transcript.clear();
                 self.scroll = 0;
                 self.status = "New chat · previous chats are available in /sessions".into();
+            }
+            Update::NewConversationFailed(error) => {
+                self.pending_new = false;
+                self.warming = false;
+                self.busy = false;
+                self.downloading = None;
+                self.status = format!("Could not start a new chat: {error}");
+                self.log_activity(self.status.clone(), false);
             }
             Update::Sessions(sessions) => {
                 let selected = self
@@ -744,7 +831,8 @@ impl App {
                 for turn in &turns {
                     self.transcript.push_str(&format!(
                         "\nYou: {}\n\nAssistant:\n{}\n",
-                        turn.user, turn.assistant
+                        turn.user,
+                        saved_answer(&turn)
                     ));
                 }
                 self.scroll = 0;
@@ -902,11 +990,12 @@ impl App {
         ])
         .areas(frame.area());
         let title = format!(
-            "Puppygrad · {} · {} · temperature {} · thinking {} · {} · {}",
+            "Puppygrad · {} · {} · temperature {} · thinking {} · tools {} · {} · {}",
             self.entries[self.selected].manifest.name,
             self.device,
             self.temperature,
             if self.thinking { "on" } else { "off" },
+            if self.tools { "on" } else { "off" },
             self.limit
                 .map_or_else(|| "output auto".into(), |n| format!("max {n} tokens")),
             self.session
@@ -1269,16 +1358,20 @@ impl App {
         terminal: &mut DefaultTerminal,
     ) -> io::Result<()> {
         loop {
-            loop {
+            // Keep keyboard input responsive even if updates arrive continuously.
+            for _ in 0..256 {
                 match updates.try_recv() {
                     Ok(update) => self.update(update),
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(io::Error::other("model worker exited"))
+                        if self.quitting {
+                            return Ok(());
+                        }
+                        return Err(io::Error::other("model worker exited"));
                     }
                 }
             }
-            if self.quitting && !self.busy {
+            if self.should_exit() {
                 break;
             }
             self.refresh_session_preview();
@@ -1293,7 +1386,9 @@ impl App {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         match key.code {
-                            KeyCode::Char('c') if self.input.selection().is_some() => {
+                            KeyCode::Char('c')
+                                if !self.quitting && self.input.selection().is_some() =>
+                            {
                                 self.copy_selection(false);
                                 continue;
                             }
@@ -1714,6 +1809,28 @@ impl Composer {
     }
 }
 
+fn saved_answer(turn: &Turn) -> String {
+    let mut text = String::new();
+    for exchange in &turn.tools {
+        let reasoning = exchange
+            .assistant
+            .split_once("</think>")
+            .map(|(reasoning, _)| format!("{reasoning}</think>\n"))
+            .unwrap_or_default();
+        text.push_str(&reasoning);
+        for result in &exchange.results {
+            let detail = tools::result_detail(result);
+            text.push_str(&format!(
+                "[{} {}: {detail}]\n",
+                result.name,
+                result.arguments["path"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    text.push_str(&turn.assistant);
+    text
+}
+
 struct TokenWriter<'a> {
     updates: &'a Sender<Update>,
     cancel: &'a AtomicBool,
@@ -1722,6 +1839,7 @@ struct TokenWriter<'a> {
     text: String,
     visible: bool,
     thinking: bool,
+    tools: bool,
     reasoning_end: Option<usize>,
     emitted: usize,
 }
@@ -1771,7 +1889,9 @@ impl TokenWriter<'_> {
                 self.thinking = false;
             }
         }
-        if self.visible || !fetch_prefix(self.answer()) {
+        if self.visible
+            || (!fetch_prefix(self.answer()) && !(self.tools && tools::call_prefix(self.answer())))
+        {
             self.finish()?;
         }
         Ok(())
@@ -1780,10 +1900,9 @@ impl TokenWriter<'_> {
 impl Write for TokenWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.cancel.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Generation stopped",
-            ));
+            // Write::write_all retries Interrupted forever. Cancellation must
+            // terminate the callback rather than look like a transient signal.
+            return Err(io::Error::other("Generation stopped"));
         }
         if !bytes.is_empty() {
             let text = std::str::from_utf8(bytes)
@@ -1795,10 +1914,7 @@ impl Write for TokenWriter<'_> {
     }
     fn flush(&mut self) -> io::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
-            Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Generation stopped",
-            ))
+            Err(io::Error::other("Generation stopped"))
         } else {
             Ok(())
         }
@@ -1806,6 +1922,7 @@ impl Write for TokenWriter<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn worker(
     entries: Vec<Entry>,
     cache: PathBuf,
@@ -1815,6 +1932,31 @@ fn worker(
     max_memory: Option<super::memory_limit::MemoryLimit>,
     history_file: PathBuf,
     resume: Option<String>,
+) {
+    worker_with_tools(
+        entries,
+        cache,
+        requests,
+        updates,
+        cancel,
+        max_memory,
+        history_file,
+        resume,
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_with_tools(
+    entries: Vec<Entry>,
+    cache: PathBuf,
+    requests: Receiver<Request>,
+    updates: Sender<Update>,
+    cancel: Arc<AtomicBool>,
+    max_memory: Option<super::memory_limit::MemoryLimit>,
+    history_file: PathBuf,
+    resume: Option<String>,
+    tool_root: PathBuf,
 ) {
     // ABI handles are deliberately created and freed on this one owner thread.
     let activity = updates.clone();
@@ -1912,6 +2054,7 @@ fn worker(
     );
     for request in requests {
         let shutdown = matches!(&request, Request::Shutdown);
+        let resetting = matches!(&request, Request::NewConversation);
         let warming = matches!(&request, Request::Warmup { .. });
         let inference = matches!(&request, Request::Warmup { .. } | Request::Generate { .. });
         let refresh_context = !matches!(
@@ -1940,6 +2083,9 @@ fn worker(
                 }
                 Request::NewConversation => {
                     conversation.reset()?;
+                    // Clear cancellation only after every older queued request
+                    // has returned. The UI holds submissions until this ack.
+                    cancel.store(false, Ordering::Relaxed);
                     let _ = updates.send(Update::NewConversation(conversation.current()));
                 }
                 Request::ListSessions => match conversation.sessions() {
@@ -1986,22 +2132,24 @@ fn worker(
                     let _ = updates.send(Update::Downloaded);
                 }
                 request @ (Request::Generate { .. } | Request::Warmup { .. }) => {
-                    let (index, device, prompt, thinking, temperature, limit) = match request {
-                        Request::Generate {
-                            index,
-                            device,
-                            prompt,
-                            thinking,
-                            temperature,
-                            limit,
-                        } => (index, device, prompt, thinking, temperature, limit),
-                        Request::Warmup {
-                            index,
-                            device,
-                            limit,
-                        } => (index, device, String::new(), false, 0., limit),
-                        _ => unreachable!(),
-                    };
+                    let (index, device, prompt, thinking, tools_enabled, temperature, limit) =
+                        match request {
+                            Request::Generate {
+                                index,
+                                device,
+                                prompt,
+                                thinking,
+                                tools,
+                                temperature,
+                                limit,
+                            } => (index, device, prompt, thinking, tools, temperature, limit),
+                            Request::Warmup {
+                                index,
+                                device,
+                                limit,
+                            } => (index, device, String::new(), false, false, 0., limit),
+                            _ => unreachable!(),
+                        };
                     if cancel.load(Ordering::Relaxed) {
                         return Err("Operation stopped".into());
                     }
@@ -2011,6 +2159,15 @@ fn worker(
                         save_model_preference(&conversation, &entry.manifest.id, &updates);
                     }
                     let dir = entry.model_dir(&cache);
+                    let reader = if tools_enabled {
+                        if !llm::is_qwen3(&dir)? {
+                            return Err("Tool calling currently requires a Qwen3 model; use /tools off for this model".into());
+                        }
+                        Some(FileTools::new(&tool_root)?)
+                    } else {
+                        None
+                    };
+                    let tool_instructions = reader.as_ref().map(FileTools::instructions);
                     if tokenizer
                         .as_ref()
                         .is_none_or(|(old_index, _)| *old_index != index)
@@ -2026,7 +2183,7 @@ fn worker(
                     let input = if warming {
                         vec![0]
                     } else {
-                        llm::tokenize_conversation_with(
+                        llm::tokenize_conversation_tools(
                             tokenizer,
                             &dir,
                             &[],
@@ -2034,6 +2191,8 @@ fn worker(
                             0,
                             None,
                             thinking,
+                            tool_instructions.as_deref(),
+                            &[],
                         )?
                     };
                     // Only the prompt must fit initially. Output grows the retained
@@ -2148,7 +2307,7 @@ fn worker(
                     if !warming {
                         conversation.model = Some(entry.manifest.id.clone());
                     }
-                    generate_conversation(
+                    generate_conversation_tools(
                         model,
                         tokenizer,
                         &dir,
@@ -2160,6 +2319,7 @@ fn worker(
                         &cancel,
                         started,
                         thinking,
+                        reader.as_ref(),
                     )?;
                     let _ = updates.send(Update::ModelState(Some(ModelState {
                         index,
@@ -2188,6 +2348,8 @@ fn worker(
                     error: Some(error.to_string()),
                     elapsed: warmup_started.elapsed(),
                 });
+            } else if resetting {
+                let _ = updates.send(Update::NewConversationFailed(error.to_string()));
             } else {
                 let _ = updates.send(Update::Error(error.to_string()));
             }
@@ -2273,6 +2435,7 @@ fn save_model_preference(conversation: &Conversation, id: &str, updates: &Sender
 /// The provider ABI resets KV state each time. Conversation continuity comes
 /// from the formatted message history, including any retrieved turns.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn generate_conversation(
     model: &mut Model,
     tokenizer: &tokenizers::Tokenizer,
@@ -2286,7 +2449,46 @@ fn generate_conversation(
     started: Instant,
     thinking: bool,
 ) -> Result<()> {
+    generate_conversation_tools(
+        model,
+        tokenizer,
+        dir,
+        conversation,
+        prompt,
+        temperature,
+        limit,
+        updates,
+        cancel,
+        started,
+        thinking,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_conversation_tools(
+    model: &mut Model,
+    tokenizer: &tokenizers::Tokenizer,
+    dir: &std::path::Path,
+    conversation: &mut Conversation,
+    prompt: &str,
+    temperature: f32,
+    limit: Option<u64>,
+    updates: &Sender<Update>,
+    cancel: &AtomicBool,
+    started: Instant,
+    thinking: bool,
+    reader: Option<&FileTools>,
+) -> Result<()> {
     let thinking = thinking && llm::is_qwen3(dir)?;
+    if reader.is_some() && !llm::is_qwen3(dir)? {
+        return Err("Tool calling requires Qwen3".into());
+    }
+    let instructions = reader.map(FileTools::instructions);
+    let mut exchanges: Vec<ToolExchange> = Vec::new();
+    let mut total_generated = 0;
+    let mut first_token = None;
+    let mut fetch_feedback: Option<String> = None;
     let context = usize::try_from(model.info.context_length)?;
     let full_chat_tokens = llm::full_chat_prompt_token_count(
         tokenizer,
@@ -2297,7 +2499,17 @@ fn generate_conversation(
     )?;
 
     let (mut input, dropped, budget) = conversation.prepare(context, |turns, older| {
-        llm::tokenize_conversation_with(tokenizer, dir, turns, prompt, older, None, thinking)
+        llm::tokenize_conversation_tools(
+            tokenizer,
+            dir,
+            turns,
+            prompt,
+            older,
+            None,
+            thinking,
+            instructions.as_deref(),
+            &exchanges,
+        )
     })?;
     if dropped != 0 {
         let _ = updates.send(Update::ContextTrimmed(dropped));
@@ -2308,7 +2520,30 @@ fn generate_conversation(
     let mut fetched_from = None;
     loop {
         if cancel.load(Ordering::Relaxed) {
+            if !exchanges.is_empty() {
+                conversation.append_with_tools(
+                    prompt.into(),
+                    "[Generation stopped.]".into(),
+                    exchanges,
+                )?;
+            }
             return Err("Generation stopped".into());
+        }
+        let round_limit = if reader.is_some() {
+            limit.map(|n| n.saturating_sub(total_generated as u64))
+        } else {
+            limit
+        };
+        if round_limit == Some(0) {
+            conversation.append_with_tools(
+                prompt.into(),
+                "[Output limit reached before the final answer.]".into(),
+                exchanges,
+            )?;
+            return Err(
+                "Output limit reached during tool calling; raise /tokens or use /tokens auto"
+                    .into(),
+            );
         }
         let _ = updates.send(Update::Status(format!(
             "Processing {} input tokens; compiling kernels if needed…",
@@ -2320,9 +2555,9 @@ fn generate_conversation(
             .checked_sub(input.len() as u64)
             .ok_or("Conversation exceeds the model context")?
             + 1;
-        let context_bound = limit.is_none_or(|n| n >= remaining);
+        let context_bound = round_limit.is_none_or(|n| n >= remaining);
         let generation = Generation {
-            max_new_tokens: limit.unwrap_or(remaining).min(remaining),
+            max_new_tokens: round_limit.unwrap_or(remaining).min(remaining),
             temperature,
             seed: 299_792_458,
             reserved: 0,
@@ -2335,15 +2570,20 @@ fn generate_conversation(
             text: String::new(),
             visible: false,
             thinking,
+            tools: reader.is_some(),
             reasoning_end: None,
             emitted: 0,
         };
+        let trace_tokens = tokenizer
+            .encode(tools::format_exchanges(&exchanges, true), true)
+            .map_err(|e| e.to_string())?
+            .len();
         let mut progress = |generated: usize| {
             let _ = updates.send(Update::Context {
                 index: usize::MAX,
                 usage: ContextUsage {
                     active: input.len() + generated,
-                    chat: full_chat_tokens + generated,
+                    chat: full_chat_tokens + trace_tokens + generated,
                     limit: Some(context),
                 },
             });
@@ -2366,17 +2606,101 @@ fn generate_conversation(
                     if let Some(previous_turns) = fetched_from.take() {
                         conversation.undo_fetch(previous_turns);
                         let _ = updates.send(Update::Status("Fetched messages could not be processed; continuing with recent context…".into()));
-                        input = llm::tokenize_conversation_with(tokenizer, dir, &conversation.turns, prompt, conversation.older_messages(), Some("The requested messages could not be processed within current resources. Answer using recent context; do not repeat this fetch."), thinking)?;
+                        input = llm::tokenize_conversation_tools(tokenizer, dir, &conversation.turns, prompt, conversation.older_messages(), Some("The requested messages could not be processed within current resources. Answer using recent context; do not repeat this fetch."), thinking, instructions.as_deref(), &exchanges)?;
                         continue;
                     }
                 }
-                if !writer.text.is_empty() && fetch_count(writer.answer()).is_none() {
-                    writer.finish()?;
-                    conversation.append(prompt.into(), writer.text)?;
+                if !exchanges.is_empty()
+                    || (!writer.text.is_empty() && fetch_count(writer.answer()).is_none())
+                {
+                    if !tools::call_prefix(writer.answer()) {
+                        writer.finish()?;
+                    }
+                    conversation.append_with_tools(prompt.into(), writer.text, exchanges)?;
                 }
                 return Err(error.into());
             }
         };
+        total_generated += output.tokens.len();
+        first_token = first_token.or(writer.first);
+        if let Some(reader) = reader {
+            match tools::parse_calls(writer.answer()) {
+                Ok(None) => {}
+                parsed => {
+                    if exchanges.len() >= tools::MAX_ROUNDS {
+                        conversation.append_with_tools(
+                            prompt.into(),
+                            "[Tool-call limit reached; try a more specific request.]".into(),
+                            exchanges,
+                        )?;
+                        return Err("The model reached the four-round tool-call limit".into());
+                    }
+                    let results = match parsed {
+                        Ok(Some(calls)) => calls
+                            .into_iter()
+                            .map(|call| {
+                                let request_detail = if call.name == "write_file" {
+                                    format!(
+                                        "write_file {} · {} content bytes · overwrite {}",
+                                        call.arguments["path"].as_str().unwrap_or("<invalid path>"),
+                                        call.arguments["content"].as_str().map_or(0, str::len),
+                                        call.arguments["overwrite"].as_bool().unwrap_or(false)
+                                    )
+                                } else {
+                                    format!("{} {}", call.name, call.arguments)
+                                };
+                                let _ = updates.send(Update::Activity(request_detail));
+                                let result = reader.execute(call);
+                                let detail = tools::result_detail(&result);
+                                let _ = updates
+                                    .send(Update::Activity(format!("{}: {detail}", result.name)));
+                                let _ = updates.send(Update::Chunk(format!(
+                                    "\n[{} {}: {detail}]\n",
+                                    result.name,
+                                    result.arguments["path"].as_str().unwrap_or("")
+                                )));
+                                result
+                            })
+                            .collect(),
+                        Err(error) => vec![ToolResult {
+                            name: "tool_call".into(),
+                            arguments: serde_json::Value::Null,
+                            output: serde_json::json!({"error":error,"hint":"Return a complete valid JSON tool call. Inside JSON strings, escape each quote once as \" and each newline as \\n. Only claim completion after a successful tool response."}),
+                        }],
+                        Ok(None) => unreachable!(),
+                    };
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_millis() as i64;
+                    exchanges.push(ToolExchange {
+                        assistant: writer.text,
+                        results,
+                        created_at: timestamp,
+                    });
+                    loop {
+                        input = llm::tokenize_conversation_tools(
+                            tokenizer,
+                            dir,
+                            &conversation.turns,
+                            prompt,
+                            conversation.older_messages(),
+                            fetch_feedback.as_deref(),
+                            thinking,
+                            instructions.as_deref(),
+                            &exchanges,
+                        )?;
+                        if input.len() <= fetch_budget && input.len() < context {
+                            break;
+                        }
+                        if !tools::shrink(&mut exchanges.last_mut().unwrap().results) {
+                            conversation.append_with_tools(prompt.into(), "[Tool results exceeded available context; try a shorter prompt or smaller read.]".into(), exchanges)?;
+                            return Err("Tool results exceed the model context; shorten the prompt or read fewer bytes".into());
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         if !writer.visible {
             if let Some(count) = fetch_count(writer.answer()) {
                 if fetches >= 3 {
@@ -2389,7 +2713,7 @@ fn generate_conversation(
                 let previous_turns = conversation.turns.len();
                 let (fetched_input, feedback) =
                     conversation.fetch(count, fetch_budget, |turns, older, feedback| {
-                        llm::tokenize_conversation_with(
+                        llm::tokenize_conversation_tools(
                             tokenizer,
                             dir,
                             turns,
@@ -2397,11 +2721,13 @@ fn generate_conversation(
                             older,
                             Some(feedback),
                             thinking,
+                            instructions.as_deref(),
+                            &exchanges,
                         )
                     })?;
                 if fetched_input.is_empty() {
                     fetched_from = None;
-                    input = llm::tokenize_conversation_with(
+                    input = llm::tokenize_conversation_tools(
                         tokenizer,
                         dir,
                         &conversation.turns,
@@ -2409,16 +2735,19 @@ fn generate_conversation(
                         conversation.older_messages(),
                         Some(&feedback),
                         thinking,
+                        instructions.as_deref(),
+                        &exchanges,
                     )?;
                 } else {
                     fetched_from = Some(previous_turns);
                     input = fetched_input;
                 }
+                fetch_feedback = Some(feedback);
                 continue;
             }
         }
         writer.finish()?;
-        conversation.append(prompt.into(), writer.text)?;
+        conversation.append_with_tools(prompt.into(), writer.text, exchanges)?;
         let _ = updates.send(Update::Context {
             index: usize::MAX,
             usage: ContextUsage {
@@ -2429,14 +2758,14 @@ fn generate_conversation(
         });
         let _ = updates.send(Update::Done {
             session: conversation.current(),
-            tokens: output.tokens.len(),
+            tokens: total_generated,
             reason: if context_bound && output.reason == super::llm_ffi::DONE_LIMIT {
                 super::llm_ffi::DONE_CONTEXT
             } else {
                 output.reason
             },
             elapsed: started.elapsed(),
-            first_token: writer.first,
+            first_token,
         });
         return Ok(());
     }
@@ -2477,6 +2806,14 @@ pub fn run(options: Options) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("The TUI needs an interactive terminal; use puppygrad llm for scripts.".into());
     }
+    let tool_root = options
+        .tool_root
+        .unwrap_or(std::env::current_dir()?)
+        .canonicalize()?;
+    if !tool_root.is_dir() {
+        return Err("--tool-root must be a directory".into());
+    }
+    let worker_tool_root = tool_root.clone();
     let entries = catalog::load(options.catalog.as_deref())?;
     let cache = options.cache_dir.unwrap_or_else(catalog::default_cache_dir);
     fs::create_dir_all(&cache)?;
@@ -2504,7 +2841,7 @@ pub fn run(options: Options) -> Result<()> {
     let worker_cache = cache.clone();
     let worker_cancel = cancel.clone();
     let handle = thread::spawn(move || {
-        worker(
+        worker_with_tools(
             worker_entries,
             worker_cache,
             received,
@@ -2513,9 +2850,11 @@ pub fn run(options: Options) -> Result<()> {
             options.max_memory,
             history_file,
             options.resume,
+            worker_tool_root,
         )
     });
     let mut app = App::new(entries, cache, device, requests.clone(), cancel.clone());
+    app.tool_root = tool_root;
     app.auto_warmup = !options.no_warmup;
     let mut enhanced_keyboard = false;
     let outcome = (|| {
@@ -2545,10 +2884,17 @@ pub fn run(options: Options) -> Result<()> {
     ratatui::restore();
     cancel.store(true, Ordering::Relaxed);
     let _ = requests.send(Request::Shutdown);
-    // An ordinary quit waits for cancellation before restoring the terminal.
-    // On terminal I/O failure, let process exit stop a still-running worker.
+    // Loading, compilation and prefill may not reach a cancellation callback.
+    // Give the worker bounded time to save partial output, then let process exit
+    // stop it. Never join an unfinished worker after a forced/expired quit.
     if outcome.is_ok() {
-        handle.join().map_err(|_| "model worker panicked")?;
+        let started = app.quit_started.unwrap_or_else(Instant::now);
+        while !handle.is_finished() && !app.force_quit && started.elapsed() < QUIT_GRACE {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if handle.is_finished() {
+            handle.join().map_err(|_| "model worker panicked")?;
+        }
     }
     outcome?;
     Ok(())
@@ -2855,6 +3201,7 @@ mod tests {
                 device: "cpu".into(),
                 prompt: "prompt".into(),
                 thinking: false,
+                tools: false,
                 temperature: 0.,
                 limit: Some(3),
             })
@@ -3020,6 +3367,7 @@ mod tests {
             "/download",
             "/device",
             "/thinking",
+            "/tools",
             "/temperature",
             "/tokens",
             "/history",
@@ -3182,6 +3530,550 @@ mod tests {
     }
 
     #[test]
+    fn tools_are_opt_in_and_request_snapshots_survive_toggles() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(!app.tools);
+        app.command("/tools on extra");
+        assert!(!app.tools);
+        app.command("/tools on");
+        assert!(app.tools);
+        app.command("/tools");
+        assert!(app.status.contains("read_file") && app.status.contains("root"));
+        app.input.insert("read a file");
+        app.submit();
+        app.command("/tools off");
+        assert!(!app.tools);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Request::Generate { tools: true, .. }
+        ));
+    }
+
+    #[test]
+    fn fragmented_tool_calls_stay_hidden_but_thoughts_and_plain_answers_stream() {
+        for thinking in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let mut writer = TokenWriter {
+                updates: &tx,
+                cancel: &cancel,
+                started: Instant::now(),
+                first: None,
+                text: String::new(),
+                visible: false,
+                thinking,
+                tools: true,
+                reasoning_end: None,
+                emitted: 0,
+            };
+            let thought = if thinking {
+                "<think>Read the file.</think>"
+            } else {
+                ""
+            };
+            let call =
+                "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}</tool_call>";
+            for c in format!("{thought}\n{call}").chars() {
+                writer.write_all(c.to_string().as_bytes()).unwrap();
+            }
+            let shown: String = rx
+                .try_iter()
+                .filter_map(|u| {
+                    if let Update::Chunk(s) = u {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(shown, thought);
+            assert!(!writer.visible);
+            assert_eq!(
+                tools::parse_calls(writer.answer()).unwrap().unwrap()[0].name,
+                "read_file"
+            );
+        }
+    }
+
+    /// A deterministic provider calls the tool until its input contains the file's
+    /// unique marker, then answers. This tests dispatch without GPU/model downloads.
+    fn tool_fixture() -> WarmupFixture {
+        let mut f = WarmupFixture::new();
+        let dir = f.entries[0].model_dir(&f.cache);
+        fs::write(
+            dir.join("config.json"),
+            r#"{"model_type":"qwen3","vocab_size":9,"n_positions":1024,"eos_token_id":5}"#,
+        )
+        .unwrap();
+        let call="<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"fixture.txt\",\"max_bytes\":16384}}</tool_call>";
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("tokenizer.json")).unwrap()).unwrap();
+        let mut added = Vec::new();
+        for (id, content, special) in [
+            (5, "[UNK]", true),
+            (6, call, false),
+            (7, "unique_file_marker", false),
+            (8, "verified", false),
+        ] {
+            tokenizer["model"]["vocab"][content] = id.into();
+            added.push(serde_json::json!({"id":id,"content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":special}));
+        }
+        tokenizer["added_tokens"] = serde_json::json!(added);
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer).unwrap(),
+        )
+        .unwrap();
+        fs::write(f.root.join("tiny.pup"),"tokens = input(\"tokens\")\nlast = load(index(tokens, cast(dim(tokens, 0) - 1, i32)))\nfound = reduce(cast(cmplt(cast(6, i32), tokens), f32), add, 1) > 0.0\nrow = where(last > cast(7, i32), 1, where(last < cast(6, i32), where(found, 2, 0), 1))\noutput load(index(weight(\"scores\"), cast(row, i32)))\n").unwrap();
+        let bytes = [6, 5, 8]
+            .into_iter()
+            .flat_map(|chosen| (0..9).map(move |id| if id == chosen { 100f32 } else { -100f32 }))
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![3, 9], &bytes)
+                .unwrap();
+        fs::write(
+            dir.join("model.safetensors"),
+            safetensors::tensor::serialize([("scores", view)], None).unwrap(),
+        )
+        .unwrap();
+        f.entries = catalog::load(Some(&f.root)).unwrap();
+        f
+    }
+
+    #[test]
+    fn native_tool_loop_executes_persists_and_shortens_results_to_context() {
+        let f = tool_fixture();
+        fs::write(
+            f.root.join("fixture.txt"),
+            format!("unique_file_marker {}", "word ".repeat(3000)),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (updates, output) = mpsc::channel();
+        tx.send(Request::Generate {
+            index: 0,
+            device: "cpu".into(),
+            prompt: "read fixture.txt".into(),
+            thinking: false,
+            tools: true,
+            temperature: 0.,
+            limit: Some(10),
+        })
+        .unwrap();
+        tx.send(Request::Shutdown).unwrap();
+        let path = f.root.join("tools.db");
+        worker_with_tools(
+            f.entries.clone(),
+            f.cache.clone(),
+            rx,
+            updates,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            path.clone(),
+            None,
+            f.root.clone(),
+        );
+        let events = output.try_iter().collect::<Vec<_>>();
+        assert!(
+            !events.iter().any(|u| matches!(u, Update::Error(_))),
+            "{:?}",
+            events
+                .iter()
+                .filter_map(|u| if let Update::Error(e) = u {
+                    Some(e)
+                } else {
+                    None
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(events
+            .iter()
+            .any(|u| matches!(u, Update::Done { tokens: 4, .. })));
+        let mut chat = Conversation::open(&path).unwrap();
+        chat.resume("latest").unwrap();
+        let turn = &chat.turns[0];
+        assert_eq!(turn.assistant, "verified");
+        assert_eq!(turn.tools.len(), 1);
+        let result = &turn.tools[0].results[0].output;
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["eof"], false);
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("unique_file_marker"));
+        assert_eq!(
+            result["next_offset"].as_u64().unwrap(),
+            result["content"].as_str().unwrap().len() as u64
+        );
+        let shown: String = events
+            .iter()
+            .filter_map(|u| {
+                if let Update::Chunk(s) = u {
+                    Some(s.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(shown.contains("read_file fixture.txt") && shown.ends_with("verified"));
+        assert!(!shown.contains("<tool_call>"));
+        let tokenizer = tokenizers::Tokenizer::from_file(
+            f.entries[0].model_dir(&f.cache).join("tokenizer.json"),
+        )
+        .unwrap();
+        let usage = llm::history_token_count(
+            &tokenizer,
+            &f.entries[0].model_dir(&f.cache),
+            &chat.turns,
+            false,
+        )
+        .unwrap();
+        assert!(usage > 100); // File contents are part of saved chat, not just UI logs.
+        assert!(events
+            .iter()
+            .any(|u| matches!(u,Update::Context {usage:u,..} if u.active==usage)));
+    }
+
+    #[test]
+    fn native_write_call_dispatches_and_survives_resume_with_write_details() {
+        let mut f = tool_fixture();
+        let dir = f.entries[0].model_dir(&f.cache);
+        let mut tokenizer: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("tokenizer.json")).unwrap()).unwrap();
+        let old = tokenizer["added_tokens"][1]["content"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let call="<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"output.txt\",\"content\":\"unique_file_marker\"}}</tool_call>";
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&old);
+        tokenizer["model"]["vocab"][call] = 6.into();
+        tokenizer["added_tokens"][1]["content"] = call.into();
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer).unwrap(),
+        )
+        .unwrap();
+        // The provider answers once a write result's bytes_written token exists.
+        tokenizer["model"]["vocab"]["bytes_written"] = 7.into();
+        tokenizer["added_tokens"][2]["content"] = "bytes_written".into();
+        tokenizer["model"]["vocab"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unique_file_marker");
+        fs::write(
+            dir.join("tokenizer.json"),
+            serde_json::to_vec(&tokenizer).unwrap(),
+        )
+        .unwrap();
+        f.entries = catalog::load(Some(&f.root)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (updates, output) = mpsc::channel();
+        tx.send(Request::Generate {
+            index: 0,
+            device: "cpu".into(),
+            prompt: "create output.txt".into(),
+            thinking: false,
+            tools: true,
+            temperature: 0.,
+            limit: Some(10),
+        })
+        .unwrap();
+        tx.send(Request::Shutdown).unwrap();
+        let path = f.root.join("writes.db");
+        worker_with_tools(
+            f.entries.clone(),
+            f.cache.clone(),
+            rx,
+            updates,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            path.clone(),
+            None,
+            f.root.clone(),
+        );
+        let events = output.try_iter().collect::<Vec<_>>();
+        assert!(
+            !events.iter().any(|u| matches!(u, Update::Error(_))),
+            "{:?}",
+            events
+                .iter()
+                .filter_map(|u| if let Update::Error(e) = u {
+                    Some(e)
+                } else {
+                    None
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fs::read_to_string(f.root.join("output.txt")).unwrap(),
+            "unique_file_marker"
+        );
+        let mut chat = Conversation::open(&path).unwrap();
+        chat.resume("latest").unwrap();
+        let turn = &chat.turns[0];
+        assert_eq!(turn.assistant, "verified");
+        assert_eq!(turn.tools[0].results[0].name, "write_file");
+        assert_eq!(turn.tools[0].results[0].output["bytes_written"], 18);
+        assert!(saved_answer(turn).contains("bytes written · created"));
+        assert!(events
+            .iter()
+            .any(|u| matches!(u,Update::Activity(s) if s.contains("bytes written"))));
+        assert!(events.iter().any(|u| matches!(u, Update::Done { .. })));
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-4B checkpoint and an AMD GPU"]
+    fn qwen_write_file_creates_and_replaces_text_through_native_calls() {
+        let f = WarmupFixture::new();
+        let dir = PathBuf::from("models/qwen3-4b");
+        let mut chat = Conversation::open(&f.root.join("write-hip.db")).unwrap();
+        let _scope = crate::database::use_path(&chat.path).unwrap();
+        let file_tools = FileTools::new(&f.root).unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let mut model = llm::load_model_with_policy(
+            std::path::Path::new("examples/qwen3_cached.pup"),
+            &dir,
+            "hip:0",
+            None,
+            false,
+            crate::compiler::cpu::CpuTarget::Generic,
+            llm::LoadPolicy {
+                grow_context: true,
+                cache_dir: Some(&PathBuf::from(".cache/pup/read-file-validation")),
+                context_request: Some(super::super::llm_capacity::ContextRequest {
+                    capacity: 4096,
+                    prompt_tokens: 1,
+                    minimum_capacity: Some(1),
+                }),
+                max_memory: None,
+            },
+        )
+        .unwrap();
+        let artifacts = PathBuf::from(".cache/write-file-validation");
+        fs::create_dir_all(&artifacts).unwrap();
+        for (thinking, overwrite, content) in [
+            (false, false, "Hello puppy!\n"),
+            (true, true, "Updated puppy!\n"),
+        ] {
+            let encoded = serde_json::to_string(content).unwrap();
+            let prompt = if overwrite {
+                "Replace the entire contents of greeting.txt with Updated puppy! followed by exactly one newline character.".to_owned()
+            } else {
+                format!("Create greeting.txt containing exactly the decoded text of this JSON string: {encoded}")
+            };
+            let (tx, rx) = mpsc::channel();
+            generate_conversation_tools(
+                &mut model,
+                &tokenizer,
+                &dir,
+                &mut chat,
+                &prompt,
+                0.,
+                Some(1536),
+                &tx,
+                &AtomicBool::new(false),
+                Instant::now(),
+                thinking,
+                Some(&file_tools),
+            )
+            .unwrap();
+            let turn = chat.turns.last().unwrap();
+            println!(
+                "overwrite={overwrite},thinking={thinking}: {}",
+                turn.assistant
+            );
+            assert_eq!(
+                fs::read_to_string(f.root.join("greeting.txt")).unwrap(),
+                content
+            );
+            let writes = turn
+                .tools
+                .iter()
+                .flat_map(|e| &e.results)
+                .filter(|r| r.name == "write_file")
+                .collect::<Vec<_>>();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].arguments["path"], "greeting.txt");
+            assert!(writes[0].output["error"].is_null());
+            assert_eq!(writes[0].arguments["content"], content);
+            if overwrite {
+                assert_eq!(writes[0].arguments["overwrite"], true);
+            }
+            assert_eq!(
+                writes[0].output["operation"],
+                if overwrite { "replaced" } else { "created" }
+            );
+            assert!(rx.try_iter().any(|u| matches!(u, Update::Done { .. })));
+            assert_eq!(chat.all_turns().unwrap().last().unwrap(), turn);
+            fs::write(
+                artifacts.join(format!("overwrite-{overwrite}.json")),
+                serde_json::to_vec_pretty(turn).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn native_tool_loop_bounds_retries_and_preserves_results_at_output_limit() {
+        for limit in [Some(1), Some(20)] {
+            let f = tool_fixture(); // Deliberately missing file: model keeps asking.
+                                    // Two tool schemas plus four error exchanges must fit this retry test.
+            fs::write(
+                f.entries[0].model_dir(&f.cache).join("config.json"),
+                r#"{"model_type":"qwen3","vocab_size":9,"n_positions":2048,"eos_token_id":5}"#,
+            )
+            .unwrap();
+            let (tx, rx) = mpsc::channel();
+            let (updates, output) = mpsc::channel();
+            tx.send(Request::Generate {
+                index: 0,
+                device: "cpu".into(),
+                prompt: "read fixture.txt".into(),
+                thinking: false,
+                tools: true,
+                temperature: 0.,
+                limit,
+            })
+            .unwrap();
+            tx.send(Request::Shutdown).unwrap();
+            let path = f.root.join("tools.db");
+            worker_with_tools(
+                f.entries.clone(),
+                f.cache.clone(),
+                rx,
+                updates,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                path.clone(),
+                None,
+                f.root.clone(),
+            );
+            let errors = output
+                .try_iter()
+                .filter_map(|u| {
+                    if let Update::Error(e) = u {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(
+                errors[0].contains(if limit == Some(1) {
+                    "Output limit"
+                } else {
+                    "four-round"
+                }),
+                "{errors:?}"
+            );
+            let mut chat = Conversation::open(&path).unwrap();
+            chat.resume("latest").unwrap();
+            assert_eq!(
+                chat.turns[0].tools.len(),
+                if limit == Some(1) { 1 } else { 4 }
+            );
+            assert!(chat.turns[0]
+                .tools
+                .iter()
+                .all(|e| e.results[0].output["error"].is_string()));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-4B checkpoint and an AMD GPU"]
+    fn qwen_read_file_tool_returns_unknown_file_contents_and_retains_results() {
+        let f = WarmupFixture::new();
+        let dir = PathBuf::from("models/qwen3-4b");
+        let mut chat = Conversation::open(&f.root.join("tools-hip.db")).unwrap();
+        let _scope = crate::database::use_path(&chat.path).unwrap();
+        let reader = FileTools::new(&f.root).unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let mut model = llm::load_model_with_policy(
+            std::path::Path::new("examples/qwen3_cached.pup"),
+            &dir,
+            "hip:0",
+            None,
+            false,
+            crate::compiler::cpu::CpuTarget::Generic,
+            llm::LoadPolicy {
+                grow_context: true,
+                cache_dir: Some(&PathBuf::from(".cache/pup/read-file-validation")),
+                context_request: Some(super::super::llm_capacity::ContextRequest {
+                    capacity: 4096,
+                    prompt_tokens: 1,
+                    minimum_capacity: Some(1),
+                }),
+                max_memory: None,
+            },
+        )
+        .unwrap();
+        let artifacts = PathBuf::from(".cache/read-file-validation");
+        fs::create_dir_all(&artifacts).unwrap();
+        for thinking in [false, true] {
+            chat.reset().unwrap();
+            let marker = format!(
+                "puppy-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            fs::write(
+                f.root.join("readme.md"),
+                format!("The verification code is {marker}.\n"),
+            )
+            .unwrap();
+            let (tx, rx) = mpsc::channel();
+            generate_conversation_tools(
+                &mut model,
+                &tokenizer,
+                &dir,
+                &mut chat,
+                "read readme.md file show its content",
+                0.,
+                Some(1024),
+                &tx,
+                &AtomicBool::new(false),
+                Instant::now(),
+                thinking,
+                Some(&reader),
+            )
+            .unwrap();
+            let turn = chat.turns.last().unwrap();
+            println!("thinking={thinking}: {}", turn.assistant);
+            assert!(turn.assistant.contains(&marker), "{}", turn.assistant);
+            assert!(!turn.tools.is_empty());
+            assert_eq!(turn.tools[0].results[0].arguments["path"], "readme.md");
+            assert!(turn.tools[0].results[0].output["content"]
+                .as_str()
+                .unwrap()
+                .contains(&marker));
+            assert!(rx.try_iter().any(|u| matches!(u, Update::Done { .. })));
+            fs::write(
+                artifacts.join(format!("lowercase-readme-thinking-{thinking}.json")),
+                serde_json::to_vec_pretty(turn).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(chat.all_turns().unwrap().last().unwrap(), turn);
+        }
+    }
+
+    #[test]
     fn thinking_streams_fragmented_reasoning_but_hides_fetch_commands() {
         let (tx, rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
@@ -3193,6 +4085,7 @@ mod tests {
             text: String::new(),
             visible: false,
             thinking: true,
+            tools: false,
             reasoning_end: None,
             emitted: 0,
         };
@@ -3242,6 +4135,7 @@ mod tests {
                 text: String::new(),
                 visible: false,
                 thinking: true,
+                tools: false,
                 reasoning_end: None,
                 emitted: 0,
             };
@@ -3433,6 +4327,7 @@ mod tests {
             text: String::new(),
             visible: false,
             thinking: false,
+            tools: false,
             reasoning_end: None,
             emitted: 0,
         };
@@ -3477,6 +4372,7 @@ mod tests {
             turns: vec![Turn {
                 user: "old question".into(),
                 assistant: "old answer".into(),
+                tools: Vec::new(),
                 created_at: None,
             }],
         });
@@ -3485,8 +4381,12 @@ mod tests {
                 < app.transcript.find("new question").unwrap()
         );
         app.command("/new");
-        assert!(received.try_recv().is_err()); // Cannot reset while generation owns the worker.
-        app.busy = false;
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Request::NewConversation
+        ));
+        assert!(app.busy && app.pending_new && app.cancel.load(Ordering::Relaxed));
+        app.update(Update::NewConversation(session()));
         app.command("/clear");
         assert!(app.transcript.is_empty());
         assert!(received.try_recv().is_err());
@@ -3533,7 +4433,6 @@ mod tests {
         assert!(screen.contains("10 turns"));
         app.resume_selected();
         assert!(matches!(rx.try_recv().unwrap(), Request::Resume(id) if id == saved.id));
-        app.command("/new");
         app.command("/resume latest");
         assert!(rx.try_recv().is_err());
         app.update(Update::Resumed {
@@ -3542,6 +4441,7 @@ mod tests {
             turns: vec![Turn {
                 user: "saved question".into(),
                 assistant: "saved answer".into(),
+                tools: Vec::new(),
                 created_at: None,
             }],
         });
@@ -4182,6 +5082,7 @@ mod tests {
                     device: "cpu".into(),
                     prompt: "prompt".into(),
                     thinking: false,
+                    tools: false,
                     temperature: 0.,
                     limit: Some(10),
                 })
@@ -4194,6 +5095,7 @@ mod tests {
                 device: "cpu".into(),
                 prompt: "prompt".into(),
                 thinking: false,
+                tools: false,
                 temperature: 0.,
                 limit: Some(10),
             })
@@ -4284,6 +5186,252 @@ mod tests {
         fs::remove_file(f.entries[0].model_dir(&f.cache).join("model.safetensors")).unwrap();
         app.warmup();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancelled_stream_exits_write_all_and_provider_can_generate_again() {
+        let f = WarmupFixture::new();
+        let dir = f.entries[0].model_dir(&f.cache);
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let mut model = llm::load_model(
+            &f.root.join("tiny.pup"),
+            &dir,
+            "cpu",
+            None,
+            false,
+            crate::compiler::cpu::CpuTarget::Generic,
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut writer = TokenWriter {
+            updates: &tx,
+            cancel: &cancel,
+            started: Instant::now(),
+            first: None,
+            text: String::new(),
+            visible: false,
+            thinking: false,
+            tools: false,
+            reasoning_end: None,
+            emitted: 0,
+        };
+        let generation = Generation {
+            max_new_tokens: 32,
+            temperature: 0.,
+            seed: 1,
+            reserved: 0,
+        };
+        let error = llm::generate_output_observed(
+            &mut model,
+            &tokenizer,
+            &[0],
+            generation,
+            true,
+            false,
+            &mut writer,
+            &mut |count| {
+                if count == 3 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "Generation stopped");
+        assert!(!writer.text.is_empty());
+        assert!(rx.try_iter().any(|u| matches!(u, Update::Chunk(_))));
+        assert_ne!(
+            writer.write(b"hello").unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        cancel.store(false, Ordering::Relaxed);
+        assert_eq!(
+            model.infer(&[0], generation, None).unwrap().tokens.len(),
+            32
+        );
+    }
+
+    #[test]
+    fn new_chat_holds_busy_until_reset_ack_and_ignores_old_operation_updates() {
+        let f = WarmupFixture::new();
+        for warming in [false, true] {
+            let (tx, rx) = mpsc::channel();
+            let mut app = App::new(
+                f.entries.clone(),
+                f.cache.clone(),
+                "cpu".into(),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+            );
+            app.busy = true;
+            app.warming = warming;
+            app.prompt_history.push("old prompt".into());
+            app.transcript = "old response".into();
+            app.command("/new");
+            let status = app.status.clone();
+            assert!(matches!(rx.try_recv().unwrap(), Request::NewConversation));
+            app.command("/new");
+            assert!(rx.try_recv().is_err());
+            for update in [
+                Update::Chunk("stale".into()),
+                Update::Status("Generating".into()),
+                Update::Error("Operation stopped".into()),
+                Update::Warmed {
+                    error: None,
+                    elapsed: Duration::ZERO,
+                },
+                Update::Downloaded,
+                Update::Done {
+                    session: session(),
+                    tokens: 2,
+                    reason: 0,
+                    elapsed: Duration::ZERO,
+                    first_token: None,
+                },
+            ] {
+                app.update(update);
+                assert!(app.busy && app.pending_new && !app.warming);
+                assert!(app.cancel.load(Ordering::Relaxed));
+                assert_eq!(app.status, status);
+                assert_eq!(app.transcript, "old response");
+                assert!(rx.try_recv().is_err());
+            }
+            app.input.insert("blocked until reset");
+            app.submit();
+            assert!(rx.try_recv().is_err());
+            // The worker clears cancellation immediately before acknowledging.
+            app.cancel.store(false, Ordering::Relaxed);
+            app.update(Update::NewConversation(session()));
+            assert!(!app.busy && !app.pending_new && !app.warming);
+            assert!(app.input.text.is_empty() && app.transcript.is_empty());
+            assert!(app.prompt_history.is_empty());
+            app.input.insert("fresh prompt");
+            app.submit();
+            assert!(
+                matches!(rx.try_recv().unwrap(), Request::Generate { prompt, .. } if prompt == "fresh prompt")
+            );
+        }
+    }
+
+    #[test]
+    fn reset_failure_releases_busy_and_keeps_old_chat() {
+        let f = WarmupFixture::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.transcript = "saved response".into();
+        app.command("/new");
+        app.update(Update::NewConversationFailed("database unavailable".into()));
+        assert!(!app.pending_new && !app.busy);
+        assert_eq!(app.transcript, "saved response");
+        assert!(app.status.contains("database unavailable"));
+    }
+
+    #[test]
+    fn quit_cancels_work_bounds_wait_and_second_quit_forces_exit() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.busy = true;
+        app.quit();
+        assert!(app.cancel.load(Ordering::Relaxed));
+        assert!(!app.should_exit());
+        app.input.insert("must not queue");
+        app.submit();
+        assert!(rx.try_recv().is_err());
+        app.quit_started = Some(Instant::now() - QUIT_GRACE);
+        assert!(app.should_exit());
+        app.quit_started = Some(Instant::now());
+        app.quit();
+        assert!(app.force_quit && app.should_exit());
+        app.busy = false;
+        app.warmup();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn worker_reset_cancels_queued_prompt_and_next_generation_uses_fresh_chat() {
+        let f = WarmupFixture::new();
+        let path = f.root.join("reset.db");
+        let mut chat = Conversation::open(&path).unwrap();
+        chat.append("old prompt".into(), "old answer".into())
+            .unwrap();
+        let old_id = chat.session_id.clone();
+        drop(chat);
+        let (requests, rx) = mpsc::channel();
+        let (updates, output) = mpsc::channel();
+        requests
+            .send(Request::Warmup {
+                index: 0,
+                device: "cpu".into(),
+                limit: Some(4),
+            })
+            .unwrap();
+        for prompt in ["queued prompt", "fresh prompt"] {
+            requests
+                .send(Request::Generate {
+                    index: 0,
+                    device: "cpu".into(),
+                    prompt: prompt.into(),
+                    thinking: false,
+                    tools: false,
+                    temperature: 0.,
+                    limit: Some(4),
+                })
+                .unwrap();
+            if prompt == "queued prompt" {
+                requests.send(Request::NewConversation).unwrap();
+            }
+        }
+        requests.send(Request::Shutdown).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        worker(
+            f.entries.clone(),
+            f.cache.clone(),
+            rx,
+            updates,
+            cancel.clone(),
+            None,
+            path.clone(),
+            Some(old_id.clone()),
+        );
+        assert!(!cancel.load(Ordering::Relaxed));
+        let events: Vec<_> = output.try_iter().collect();
+        let reset = events
+            .iter()
+            .position(|u| matches!(u, Update::NewConversation(_)))
+            .unwrap();
+        assert!(events[..reset]
+            .iter()
+            .any(|u| matches!(u, Update::Error(error) if error == "Operation stopped")));
+        assert!(!events[..reset]
+            .iter()
+            .any(|u| matches!(u, Update::Chunk(_) | Update::Done { .. })));
+        let fresh_id = events[reset..]
+            .iter()
+            .find_map(|u| match u {
+                Update::Done { session, .. } => Some(session.id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let mut chat = Conversation::open(&path).unwrap();
+        chat.resume(&fresh_id).unwrap();
+        assert_eq!(chat.turns.len(), 1);
+        assert_eq!(chat.turns[0].user, "fresh prompt");
+        chat.resume(&old_id).unwrap();
+        assert_eq!(chat.turns.len(), 1);
+        assert_eq!(chat.turns[0].assistant, "old answer");
     }
 
     #[test]
@@ -4408,6 +5556,7 @@ mod tests {
                 device: "cpu".into(),
                 prompt: "prompt".into(),
                 thinking: false,
+                tools: false,
                 temperature: 0.,
                 limit: Some(1),
             })
@@ -4454,6 +5603,7 @@ mod tests {
                     device: "cpu".into(),
                     prompt: "prompt".into(),
                     thinking: false,
+                    tools: false,
                     temperature: 0.,
                     limit,
                 })

@@ -14,6 +14,8 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub(super) struct Turn {
     pub user: String,
     pub assistant: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<super::tools::ToolExchange>,
     /// UTC Unix milliseconds when the turn was saved; old records are unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
@@ -262,17 +264,31 @@ impl Conversation {
 
     fn read_session(db: &Connection, session: &str, start: usize, end: usize) -> Result<Vec<Turn>> {
         let mut query = db.prepare("SELECT user,assistant,created_at FROM turns WHERE session_id=?1 AND ordinal>=?2 AND ordinal<?3 ORDER BY ordinal")?;
-        let turns = query
+        let mut turns = query
             .query_map(params![session, start, end], |r| {
                 Ok(Turn {
                     user: r.get(0)?,
                     assistant: r.get(1)?,
+                    tools: Vec::new(),
                     created_at: r.get(2)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if turns.len() != end - start {
             return Err("Session changed while loading; resume it again before continuing".into());
+        }
+        let mut query = db.prepare("SELECT turn_ordinal,assistant,results_json,created_at FROM tool_exchanges WHERE session_id=?1 AND turn_ordinal>=?2 AND turn_ordinal<?3 ORDER BY turn_ordinal,ordinal")?;
+        let mut rows = query.query(params![session, start, end])?;
+        while let Some(row) = rows.next()? {
+            let ordinal: usize = row.get(0)?;
+            let results: String = row.get(2)?;
+            turns[ordinal - start]
+                .tools
+                .push(super::tools::ToolExchange {
+                    assistant: row.get(1)?,
+                    results: serde_json::from_str(&results)?,
+                    created_at: row.get(3)?,
+                });
         }
         Ok(turns)
     }
@@ -298,7 +314,16 @@ impl Conversation {
         Self::read_session(&self.db, &self.session_id, 0, self.count)
     }
 
+    #[cfg(test)]
     pub fn append(&mut self, user: String, assistant: String) -> Result<()> {
+        self.append_with_tools(user, assistant, Vec::new())
+    }
+    pub fn append_with_tools(
+        &mut self,
+        user: String,
+        assistant: String,
+        tools: Vec<super::tools::ToolExchange>,
+    ) -> Result<()> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -325,12 +350,17 @@ impl Conversation {
             "INSERT INTO turns(session_id,ordinal,user,assistant,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![self.session_id, self.count, user, assistant, timestamp],
         )?;
+        for (ordinal, exchange) in tools.iter().enumerate() {
+            tx.execute("INSERT INTO tool_exchanges(session_id,turn_ordinal,ordinal,assistant,results_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![self.session_id,self.count,ordinal,exchange.assistant,serde_json::to_string(&exchange.results)?,exchange.created_at])?;
+        }
         tx.commit()?;
         self.title = first_title;
         self.count += 1;
         self.turns.push(Turn {
             user,
             assistant,
+            tools,
             created_at: Some(timestamp),
         });
         Ok(())
@@ -478,6 +508,40 @@ mod tests {
     fn encode_fetch(turns: &[Turn], older: usize, _: &str) -> Result<Vec<u32>> {
         encode(turns, older)
     }
+    #[test]
+    fn tool_exchanges_survive_resume_compaction_fetch_and_database_import() {
+        use super::super::tools::{ToolExchange, ToolResult};
+        let f = Fixture::new();
+        let path = f.0.join("tools.db");
+        let mut chat = Conversation::open(&path).unwrap();
+        let exchange = ToolExchange {
+            assistant: "<tool_call>{}</tool_call>".into(),
+            results: vec![ToolResult {
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path":"a"}),
+                output: serde_json::json!({"content":"archived file contents"}),
+            }],
+            created_at: 123,
+        };
+        chat.append_with_tools("read a".into(), "answer".into(), vec![exchange.clone()])
+            .unwrap();
+        let id = chat.session_id.clone();
+        for i in 0..9 {
+            chat.append(format!("user{i}"), "reply".into()).unwrap();
+        }
+        drop(chat);
+        let mut chat = Conversation::open(&path).unwrap();
+        chat.resume(&id).unwrap();
+        assert_eq!(chat.older_messages(), 4);
+        assert!(chat.turns.iter().all(|turn| turn.tools.is_empty()));
+        chat.fetch(1024, usize::MAX, |_, _, _| Ok(vec![0])).unwrap();
+        assert_eq!(chat.turns[0].tools, vec![exchange.clone()]);
+        let mut imported = Conversation::open(&f.0.join("imported.db")).unwrap();
+        imported.import_database(&path).unwrap();
+        imported.resume(&id).unwrap();
+        assert_eq!(imported.all_turns().unwrap()[0].tools, vec![exchange]);
+    }
+
     #[test]
     fn sessions_are_isolated_and_resume_recent_turns_then_fetch_their_own_archive() {
         let f = Fixture::new();

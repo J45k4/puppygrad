@@ -74,13 +74,13 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
     let mut db = Connection::open(path)?;
     db.busy_timeout(Duration::from_secs(5))?;
     let version: i32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version > 4 {
+    if version > 5 {
         return Err(
             format!("Database version {version} is newer than this application supports").into(),
         );
     }
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-    if version < 4 {
+    if version < 5 {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let old_kernel_table =
             has_table(&tx, "kernel_modules")? && !has_column(&tx, "kernel_modules", "cache_dir")?;
@@ -101,7 +101,7 @@ pub(crate) fn open(path: &Path) -> Result<Connection> {
             tx.execute(&format!("INSERT INTO kernel_modules(cache_dir,{KERNEL_COLUMNS}) SELECT ?1,{KERNEL_COLUMNS} FROM old_kernel_modules"),[root])?;
             tx.execute_batch("DROP TABLE old_kernel_modules; CREATE INDEX IF NOT EXISTS kernel_modules_last_used ON kernel_modules(last_used_at);")?;
         }
-        tx.execute_batch("PRAGMA user_version=4;")?;
+        tx.execute_batch("PRAGMA user_version=5;")?;
         tx.commit()?;
     }
     Ok(db)
@@ -154,6 +154,10 @@ pub(crate) fn import(db: &mut Connection, source: &Path, destination: &Path) -> 
     for (table, columns) in [
         ("sessions", "id,title,model,created_at,updated_at"),
         ("turns", "session_id,ordinal,user,assistant,created_at"),
+        (
+            "tool_exchanges",
+            "session_id,turn_ordinal,ordinal,assistant,results_json,created_at",
+        ),
         ("legacy_imports", "path"),
     ] {
         if !has_table(&snapshot, table)? {
@@ -176,6 +180,16 @@ pub(crate) fn import(db: &mut Connection, source: &Path, destination: &Path) -> 
                 .map(|i| row.get::<_, Value>(i))
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let added = insert.execute(params_from_iter(&values))?;
+            if table == "tool_exchanges" && added == 0 {
+                let same: bool = tx.query_row(
+                    "SELECT assistant=?4 AND results_json=?5 FROM tool_exchanges WHERE session_id=?1 AND turn_ordinal=?2 AND ordinal=?3",
+                    params_from_iter(values.iter().take(5)), |r| r.get(0))?;
+                if !same {
+                    return Err(
+                        "Conflicting tool exchanges in legacy database; import rolled back".into(),
+                    );
+                }
+            }
             if table == "turns" && added == 0 {
                 let same: bool = tx.query_row(
                     "SELECT user=?3 AND assistant=?4 FROM turns WHERE session_id=?1 AND ordinal=?2",
@@ -232,6 +246,12 @@ const SCHEMA: &str = r#"CREATE TABLE IF NOT EXISTS app_settings (
             session_id TEXT NOT NULL REFERENCES sessions(id), ordinal INTEGER NOT NULL,
             user TEXT NOT NULL, assistant TEXT NOT NULL, created_at INTEGER,
             PRIMARY KEY(session_id, ordinal)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS tool_exchanges (
+            session_id TEXT NOT NULL, turn_ordinal INTEGER NOT NULL, ordinal INTEGER NOT NULL,
+            assistant TEXT NOT NULL, results_json TEXT NOT NULL, created_at INTEGER NOT NULL,
+            PRIMARY KEY(session_id, turn_ordinal, ordinal),
+            FOREIGN KEY(session_id, turn_ordinal) REFERENCES turns(session_id, ordinal)
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS sessions_updated ON sessions(updated_at DESC);
         CREATE TABLE IF NOT EXISTS legacy_imports (path TEXT PRIMARY KEY);
@@ -298,6 +318,42 @@ mod tests {
     }
 
     #[test]
+    fn version_four_upgrade_adds_tool_exchanges_and_keeps_turns_and_settings() {
+        let f = Fixture::new();
+        let path = f.0.join("tools.db");
+        let db = open(&path).unwrap();
+        db.execute_batch("DROP TABLE tool_exchanges; PRAGMA user_version=4; INSERT INTO sessions VALUES('s','chat','qwen3-4b',1,2); INSERT INTO turns VALUES('s',0,'read a','answer',3); INSERT INTO app_settings VALUES('thinking','on');").unwrap();
+        drop(db);
+        let db = open(&path).unwrap();
+        assert!(has_table(&db, "tool_exchanges").unwrap());
+        assert_eq!(
+            db.query_row("SELECT created_at FROM turns", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT value FROM app_settings WHERE key='thinking'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "on"
+        );
+        assert!(db
+            .execute(
+                "INSERT INTO tool_exchanges VALUES('s',1,0,'call','[]',1)",
+                []
+            )
+            .is_err());
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+    }
+
+    #[test]
     fn location_precedence_and_relative_paths_use_the_calling_directory() {
         let cwd = Path::new("/project");
         assert_eq!(resolve(None, None, cwd), cwd.join("puppygrad.db"));
@@ -360,7 +416,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            4
+            5
         );
         #[cfg(unix)]
         {
@@ -394,7 +450,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -434,7 +490,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            4
+            5
         );
     }
 

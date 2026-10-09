@@ -8,6 +8,7 @@ pub mod llm_ffi;
 pub mod memory_limit;
 pub mod profile;
 pub mod thread_pool;
+mod tools;
 pub mod train;
 pub mod tui;
 
