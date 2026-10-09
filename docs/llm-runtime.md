@@ -22,7 +22,7 @@ a suggestion; Tab or Enter completes it in the composer. Press Enter again to
 run the command, or add its arguments. Esc closes suggestions without stopping
 background work. Completion applies to command names, not their arguments.
 
-Type `/models` (or `/model`) to preview GPT-2 small, Qwen3-0.6B and Qwen3-1.7B
+Type `/models` (or `/model`) to preview GPT-2 small, Qwen3-0.6B, Qwen3-1.7B and Qwen3-4B
 as you type, including during background warmup. The list shows missing, partial,
 downloading, downloaded but not loaded, loading, preparing kernels, and ready states.
 Ready includes the device and means warmup or inference succeeded in this process;
@@ -40,6 +40,32 @@ model and remembers that choice. On first upgrade, the most recent saved chat's
 model supplies the default; a model missing from the current catalog falls back
 to Qwen3-0.6B (or the first entry in a custom catalog). Each database keeps its
 own choice, so `PUPPYGRAD_DB` and `--db` also control this preference.
+
+`/thinking on|off` controls Qwen3 reasoning for the next reply; `/thinking` shows
+its current value. It starts off and is saved in `app_settings` in the active
+SQLite database, including changes made during warmup or generation. The header
+shows the setting, and command-name completion includes `/thinking`. This toggle
+applies to Qwen3 models; other providers keep their existing prompt format.
+Thinking mode leaves the assistant prefix open so Qwen3 can generate a
+`<think>...</think>` block before the answer. Reasoning streams in the chat and is
+saved with the reply for resume, but only the final answer is replayed in later
+prompts. Incomplete reasoning is also excluded from replay. Retrieval examines
+the final answer, so a `FETCH_OLDER N` after reasoning still works. Output token
+limits and context limits include both reasoning and answer tokens. The single
+prompt `llm` command continues to use non-thinking mode.
+
+A second header row always shows `Context: USED / LIMIT tokens · Chat: TOTAL tokens`.
+Context counts the actual formatted prompt and generated tokens during a reply;
+afterward it counts the retained message history that will be replayed, excluding
+Qwen reasoning. Chat counts all messages in the current session, including archived
+turns and saved reasoning; during generation it also includes the pending prompt
+and reply. Both include chat role markers, using the selected model's tokenizer.
+Temporary retrieval instructions appear only in the active prompt count. Counts
+refresh after compaction, retrieval, resume, model changes and interrupted replies.
+The limit is the loaded provider's usable position limit, rather than its current
+KV allocation. Before a provider loads, the row shows the token counts without a
+limit. An empty chat starts at zero; `/clear` preserves counts and `/new` resets
+them. Token counting never loads model weights just to display history.
 
 Each saved user/assistant turn also stores `turns.created_at`, the UTC Unix time
 in milliseconds when the pair was saved. Existing turns and imported records
@@ -152,6 +178,15 @@ PageUp/PageDown scroll ten. Scrolling up holds your position while a reply strea
 Scrolling back to the bottom resumes following new text.
 Modified keys use the terminal's enhanced keyboard protocol; Ctrl+J also inserts
 a newline on terminals that cannot distinguish Shift+Enter.
+Up/Down recalls submitted user prompts from the current chat. Up moves to the
+previous prompt; Down moves toward newer prompts and restores the original draft
+and caret after the newest. Resuming also loads prompts from archived turns; `/new`
+resets this navigation and `/clear` preserves it. Slash commands are not included.
+In a multiline or wrapped draft, plain arrows move within the text; history starts
+at the first row with Up. Unedited recalled prompts can be browsed directly,
+including multiline prompts. Shift+arrows still selects text, and command
+suggestions and model/session pickers retain priority.
+
 Arrow keys move the composer cursor, including between wrapped lines. Home/End
 move to the current displayed line's edges; Ctrl+Home/End move to the whole
 prompt's start/end. Typing, pasting, Backspace and Delete edit at the cursor.

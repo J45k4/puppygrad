@@ -121,6 +121,26 @@ impl Conversation {
         Ok(())
     }
 
+    pub fn thinking(&self) -> Result<bool> {
+        let saved: Option<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM app_settings WHERE key='thinking'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(saved.as_deref() == Some("on"))
+    }
+
+    pub fn remember_thinking(&self, enabled: bool) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO app_settings(key,value) VALUES('thinking',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [if enabled { "on" } else { "off" }],
+        )?;
+        Ok(())
+    }
+
     /// Atomic, one-time import; every reset starts another resumable session.
     pub fn import_legacy(&mut self, path: &Path) -> Result<()> {
         let source = path.canonicalize()?.to_string_lossy().into_owned();
@@ -258,6 +278,24 @@ impl Conversation {
     }
     fn read_turns(&mut self, start: usize, end: usize) -> Result<Vec<Turn>> {
         Self::read_session(&self.db, &self.session_id, start, end)
+    }
+
+    pub fn user_prompts(&self) -> Result<Vec<String>> {
+        let mut query = self
+            .db
+            .prepare("SELECT user FROM turns WHERE session_id=?1 ORDER BY ordinal")?;
+        let prompts = query
+            .query_map([&self.session_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if prompts.len() != self.count {
+            return Err("Session changed while loading; resume it again before continuing".into());
+        }
+        Ok(prompts)
+    }
+
+    /// Read this session's complete saved history, including archived turns.
+    pub fn all_turns(&self) -> Result<Vec<Turn>> {
+        Self::read_session(&self.db, &self.session_id, 0, self.count)
     }
 
     pub fn append(&mut self, user: String, assistant: String) -> Result<()> {

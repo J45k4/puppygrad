@@ -25,18 +25,26 @@ def main():
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     model = args.model_dir.resolve()
-    with (model / 'model.safetensors').open('rb') as checkpoint:
-        header_size = int.from_bytes(checkpoint.read(8), 'little')
-        header = json.loads(checkpoint.read(header_size))
-    weight_dtypes = sorted({'BF16' if tensor['dtype'] == 'BF16' else 'F32'
-                           for name, tensor in header.items() if name != '__metadata__'})
+    if (model / 'model.safetensors').is_file():
+        checkpoint_files = ['model.safetensors']
+    else:
+        index = json.loads((model / 'model.safetensors.index.json').read_text())
+        checkpoint_files = ['model.safetensors.index.json'] + sorted(set(index['weight_map'].values()))
+    weight_dtypes = set()
+    for name in checkpoint_files:
+        if name.endswith('.safetensors'):
+            with (model / name).open('rb') as checkpoint:
+                header_size = int.from_bytes(checkpoint.read(8), 'little')
+                header = json.loads(checkpoint.read(header_size))
+            weight_dtypes.update('BF16' if tensor['dtype'] == 'BF16' else 'F32'
+                                 for name, tensor in header.items() if name != '__metadata__')
     fixture = out / 'fixed-length-checkpoint'
     fixture.mkdir(exist_ok=True)
     config = json.loads((model / 'config.json').read_text())
     # Only the provider stop policy changes. All checkpoint tensors are unchanged.
     config.pop('eos_token_id', None)
     (fixture / 'config.json').write_text(json.dumps(config, indent=2)+'\n')
-    for name in ['model.safetensors', 'tokenizer.json']:
+    for name in checkpoint_files + ['tokenizer.json']:
         link = fixture / name
         if link.is_symlink():
             link.unlink()
@@ -65,7 +73,7 @@ def main():
         return int((vram_device/'mem_info_vram_used').read_text()) if vram_device else None
     result = {'date':time.strftime('%Y-%m-%d'), 'backend':'HIP', 'source':str(args.source),
               'source_sha256':hashlib.sha256(args.source.read_bytes()).hexdigest(),
-              'model_dir':str(model), 'dtype':'+'.join(weight_dtypes), 'kv_dtype':'F32', 'build':'release',
+              'model_dir':str(model), 'dtype':'+'.join(sorted(weight_dtypes)), 'kv_dtype':'F32', 'build':'release',
               'capacity_estimate':plan, 'generated_tokens':args.tokens, 'warmups':args.warmups,
               'repeats':args.repeats, 'prompt_lengths':lengths,
               'method':'Fresh production LLM FFI worker per row; synthetic repeated chat token IDs; greedy sampling; EOS stop disabled in a separate config; original tensors unchanged. Warm timers include reset, chunked prefill, host sampling, uploads, host logits and streaming callbacks. Model loading and compilation excluded. Decode throughput excludes first token.',
@@ -177,8 +185,12 @@ def main():
             result['rows'].append(row)
             result.pop('active_row', None)
             save()
-    with (model/'model.safetensors').open('rb') as checkpoint:
-        result['checkpoint_sha256'] = hashlib.file_digest(checkpoint,'sha256').hexdigest()
+    result['checkpoint_files_sha256'] = {}
+    for name in checkpoint_files:
+        with (model / name).open('rb') as checkpoint:
+            result['checkpoint_files_sha256'][name] = hashlib.file_digest(checkpoint, 'sha256').hexdigest()
+    if 'model.safetensors' in result['checkpoint_files_sha256']:
+        result['checkpoint_sha256'] = result['checkpoint_files_sha256']['model.safetensors']
     save()
     if any(r['status'] != 'passed' for r in result['rows']):
         raise RuntimeError('one or more contexts failed; see results.json')

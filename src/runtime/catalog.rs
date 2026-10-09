@@ -235,6 +235,10 @@ pub fn load(directory: Option<&Path>) -> Result<Vec<Entry>> {
                 include_str!("../../examples/qwen3-1.7b.model.json"),
                 include_str!("../../examples/qwen3_cached.pup"),
             ),
+            (
+                include_str!("../../examples/qwen3-4b.model.json"),
+                include_str!("../../examples/qwen3_cached.pup"),
+            ),
         ]
         .into_iter()
         .map(|(text, program)| {

@@ -167,6 +167,9 @@ fn read_bf16(name: &str, byte_len: usize, reader: &mut impl Read) -> Result<Arc<
     let bytes =
         unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<u8>(), byte_len) };
     reader.read_exact(bytes)?;
+    // Little-endian hosts already have the native bits; avoid walking billions
+    // of unchanged values in development builds.
+    #[cfg(target_endian = "big")]
     for value in output {
         *value = u16::from_le(*value);
     }

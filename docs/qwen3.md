@@ -2,7 +2,7 @@
 
 [examples/qwen3_cached.pup](../examples/qwen3_cached.pup) implements the dense Qwen3 decoder
 using ordinary source functions and primitive tensor Pops. The same source supports
-Qwen3-0.6B and Qwen3-1.7B, using dimensions from the checkpoint config. It runs through the
+Qwen3-0.6B, Qwen3-1.7B and Qwen3-4B, using dimensions from the checkpoint config. It runs through the
 existing `llm` application and LLM buffer/FFI contract, on generated C CPU kernels
 or generated CUDA/HIP kernels. There is no Qwen model computation in Rust or Python.
 
@@ -22,6 +22,7 @@ The catalog includes these official Apache-2.0 checkpoints:
 |---|---|---:|---:|
 | [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | `c1899de289a04d12100db370d81485cdf75e47ca` | 1.11 GiB | 2.22 GiB |
 | [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | `70d244cc86ccca08cf5af4e1e306ecf908b1ad5e` | 3.20 GiB | 6.41 GiB |
+| [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B) | `1cfa9a7208912126459214e8b04321603b3df60c` | 7.49 GiB | 14.98 GiB |
 
 Their licenses are retained alongside downloaded models. Assets, generated code, PTX and benchmark logs
 remain under ignored `models/` and `.cache/` directories.
@@ -104,7 +105,9 @@ target/release/puppygrad emit examples/qwen3_cached.pup \
 In the TUI, use `/model qwen3-1.7b` to select the larger model or `/download qwen3-1.7b`
 to download its assets. It uses `qwen3_cached.pup` on CPU, CUDA and HIP just like 0.6B.
 The official 1.7B checkpoint uses two Safetensors shards and an index; all three
-are included in the model manifest. An equivalent command-line run is:
+are included in the model manifest. Qwen3-4B uses three shards and the same
+cached program; select it with `/model qwen3-4b` or download it with
+`/download qwen3-4b`. An equivalent command-line run is:
 
 ```bash
 target/release/puppygrad llm examples/qwen3_cached.pup \
@@ -116,6 +119,8 @@ The runtime recognizes `model_type: qwen3` and formats its command-line user pro
 using the official tokenizer's non-thinking generation prefix. It displays the
 assistant's generated text in both streaming and buffered modes. This is a
 single-turn command-line interface; the TUI supports saved multi-turn sessions.
+The TUI also supports `/thinking on|off` (default off), saved in SQLite. Thinking
+streams before the answer, and saved reasoning is excluded from later prompts.
 The FFI still accepts ordinary token ID buffers.
 
 The checkpoint loader retains BF16 values in BF16 storage on every backend. When
@@ -141,10 +146,60 @@ prompt and 64 output tokens, three release runs after one warmup measured:
 
 These warm timings exclude checkpoint loading and initial compilation. They
 do not predict speed at larger context capacities. Real HIP checks cover
-multi-turn name recall and `FETCH_OLDER` retrieval on both Qwen sizes. Retrieval
-feedback keeps the pending question before and after the result so both models
+multi-turn name recall and `FETCH_OLDER` retrieval on 0.6B and 1.7B. Retrieval
+feedback keeps the pending question before and after the result so these models
 continue answering it after older turns are inserted. Qwen3-1.7B still has small-model
 quality limitations; for example, it interpreted the name "Puppy" as an animal persona.
+
+### Qwen3-4B HIP validation
+
+Qwen3-4B has 36 layers, a 2560-wide hidden state, 32 query heads and 8 KV heads
+with head dimension 128. The same cached graph reads these dimensions from its
+config; it needs no separate model implementation. Its 398 weight tensors stay
+BF16, using 7.49 GiB. F32 KV costs 288 KiB per slot (1.125 GiB at 4096 slots).
+
+On 2026-10-08, the production generation benchmark passed on an RX 9070 XT:
+
+| Prompt tokens | Output tokens | KV capacity | First token | Decode tokens/s |
+|---:|---:|---:|---:|---:|
+| 33 | 32 | 512 | 104.3 ms | 47.3 |
+| 4064 | 32 | 4096 | 7.235 s | 34.8 |
+
+Each row has one warmup and three measured requests, with identical repeated
+greedy token IDs. The benchmark uses synthetic repeated chat token IDs and a
+separate config with EOS stopping disabled. Timers include production reset,
+chunked prefill, sampling and transfers; loading and compilation are excluded.
+Total device VRAM was 12.92 / 14.03 GiB, including desktop and other processes.
+The same full model also generated 64 tokens from a natural 33-token prompt
+with 4096 KV slots: median first token 435.7 ms and decode 35.4 tokens/s.
+Detailed samples and checkpoint hashes are in
+`.cache/qwen3-4b-validation/context-benchmark/results.json` and
+`.cache/qwen3-4b-validation/speed-results.json`.
+
+Full-model HIP checks also passed normal multi-turn name recall and retrieval of
+an archived fact through `FETCH_OLDER`. An isolated TUI startup with cached
+kernels reached Ready in 3.40 s (checkpoint read 1.36 s) and passed two-turn name
+recall. The checkpoint loader skips the no-op
+endianness pass on little-endian hosts, avoiding a walk over four billion values
+in development builds.
+
+Run it directly, or select `/model qwen3-4b` in the TUI:
+
+```bash
+target/release/puppygrad llm examples/qwen3_cached.pup \
+  --model-dir models/qwen3-4b --device hip:0 \
+  --prompt "Explain what a compiler does." --max-new-tokens 64 --stream
+```
+
+The context benchmark accepts single-file and sharded checkpoints:
+
+```bash
+python3 benchmarks/qwen3-hip/generation.py --model-dir models/qwen3-4b \
+  --prompt-lengths 33 4064 --tokens 32 \
+  --output-dir .cache/qwen3-4b-context
+```
+
+### Context capacity
 
 The official [model card](https://huggingface.co/Qwen/Qwen3-0.6B#model-overview)
 advertises a **32,768-token context window**, shared by prompt and generated

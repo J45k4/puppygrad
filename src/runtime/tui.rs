@@ -6,7 +6,9 @@ use super::{
     llm_ffi::{Generation, Model},
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+    },
     execute,
 };
 use ratatui::{
@@ -60,6 +62,7 @@ pub struct Options {
 
 enum Request {
     SelectModel(usize),
+    SetThinking(bool),
     NewConversation,
     ListSessions,
     Resume(String),
@@ -73,23 +76,38 @@ enum Request {
         index: usize,
         device: String,
         prompt: String,
+        thinking: bool,
         temperature: f32,
         limit: Option<u64>,
     },
     Shutdown,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ContextUsage {
+    active: usize,
+    chat: usize,
+    limit: Option<usize>,
+}
+
 enum Update {
+    Context {
+        index: usize,
+        usage: ContextUsage,
+    },
     HistoryLoaded {
         path: PathBuf,
         turns: Vec<Turn>,
         session: Session,
         saved_sessions: Vec<Session>,
+        prompts: Vec<String>,
+        thinking: bool,
     },
     NewConversation(Session),
     Sessions(Vec<Session>),
     Resumed {
         session: Session,
         turns: Vec<Turn>,
+        prompts: Vec<String>,
     },
     ContextTrimmed(usize),
     Status(String),
@@ -145,6 +163,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a fresh chat"),
     ("/download", "Download model assets [id]"),
     ("/device", "Choose cpu, cuda:0 or hip:0"),
+    ("/thinking", "Set Qwen3 thinking on or off"),
     ("/temperature", "Set sampling temperature N"),
     ("/tokens", "Set output length auto or N"),
     ("/history", "Show the session database path"),
@@ -163,11 +182,15 @@ struct App {
     cursor: ListState,
     browser: bool,
     model_state: Option<ModelState>,
+    context_usage: ContextUsage,
     downloading: Option<usize>,
     activity: VecDeque<ActivityLine>,
     show_activity: bool,
     response_started: bool,
     input: Composer,
+    prompt_history: Vec<String>,
+    history_cursor: Option<usize>,
+    history_draft: Option<Composer>,
     completion_prefix: String,
     completion_cursor: ListState,
     transcript: String,
@@ -180,6 +203,8 @@ struct App {
     status: String,
     device: String,
     temperature: f32,
+    thinking: bool,
+    thinking_changed: bool,
     limit: Option<u64>,
     busy: bool,
     warming: bool,
@@ -210,16 +235,17 @@ impl App {
         Self {
             entries, cache, selected, cursor, selection_changed: false,
             browser: false,
-            model_state: None, downloading: None,
+            model_state: None, context_usage: ContextUsage::default(), downloading: None,
             activity: VecDeque::new(), show_activity: true, response_started: false,
             input: Composer::default(),
+            prompt_history: Vec::new(), history_cursor: None, history_draft: None,
             completion_prefix: String::new(),
             completion_cursor: ListState::default(),
             transcript: "Welcome to Puppygrad. Type /models to choose or download a model.\n\nChats are saved automatically. /sessions or /resume opens saved chats. /new starts a fresh chat. Type /help for commands.\n".into(),
             history_file: None,
             session: None, sessions: None, session_browser: false, session_preview_requested: false, session_cursor: ListState::default(),
             status: "Ready".into(), device,
-            temperature: 0.7, limit: None,
+            temperature: 0.7, thinking: false, thinking_changed: false, limit: None,
             busy: false, warming: false, auto_warmup: true, quitting: false, scroll: 0,
             chat_area: Rect::default(), chat_max_scroll: 0,
             clock: Instant::now(), requests, cancel,
@@ -322,6 +348,7 @@ impl App {
     }
 
     fn select_model(&mut self, index: usize) {
+        self.context_usage = ContextUsage::default();
         self.selected = index;
         self.selection_changed = true;
         self.cursor.select(Some(index));
@@ -450,6 +477,8 @@ impl App {
         }
         if text.starts_with('/') {
             self.input.clear();
+            self.history_cursor = None;
+            self.history_draft = None;
             self.command(&text);
             return;
         }
@@ -478,7 +507,8 @@ impl App {
             .send(Request::Generate {
                 index: self.selected,
                 device: self.device.clone(),
-                prompt: text.into(),
+                prompt: text.clone(),
+                thinking: self.thinking,
                 temperature: self.temperature,
                 limit: self.limit,
             })
@@ -488,6 +518,9 @@ impl App {
                 "Model worker unavailable; restart after fixing the reported error.".into();
             return;
         }
+        self.prompt_history.push(text);
+        self.history_cursor = None;
+        self.history_draft = None;
         self.status = if queued {
             "Prompt queued; finishing model warmup…"
         } else {
@@ -521,10 +554,26 @@ impl App {
                 if let Some(value) = parts.next() {
                     if value == "cpu" || crate::compiler::gpu::device(value).is_ok() {
                         self.device = value.into();
+                        self.context_usage.limit = None;
                         self.status = format!("Device: {value}");
                         self.warmup();
                     } else { self.status = "Use /device cpu, cuda:0 or hip:0.".into(); }
                 } else { self.status = format!("Device: {}", self.device); }
+            }
+            "/thinking" => {
+                match (parts.next(), parts.next()) {
+                    (None, None) => self.status = format!("Thinking: {} (Qwen3)", if self.thinking { "on" } else { "off" }),
+                    (Some(value @ ("on" | "off")), None) => {
+                        self.thinking = value == "on";
+                        self.thinking_changed = true;
+                        if self.requests.send(Request::SetThinking(self.thinking)).is_err() {
+                            self.status = "Model worker unavailable; thinking preference could not be saved.".into();
+                        } else {
+                            self.status = format!("Thinking: {value} · applies to the next Qwen3 reply");
+                        }
+                    }
+                    _ => self.status = "Use /thinking on or /thinking off.".into(),
+                }
             }
             "/temperature" => {
                 if let Some(value) = parts.next().and_then(|s| s.parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.) {
@@ -564,7 +613,7 @@ impl App {
             }
             "/history" => self.status = self.history_file.as_ref().map_or_else(|| "Session database is opening…".into(), |path| format!("Session database: {}", path.display())),
             "/quit" | "/exit" => self.quit(),
-            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nMouse wheel over the chat or PageUp/PageDown scrolls. Scroll to the bottom to follow new replies. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
+            "/help" => self.transcript.push_str("\n/models or /model [id] — browse model availability and readiness, or select by ID\n/download [id] — download missing assets\n/device cpu|cuda:0|hip:0 — choose device\n/thinking on|off — Qwen3 reasoning (saved; default off)\n/temperature N — sampling temperature\n/tokens auto|N — automatic output length (default) or a response cap\n/new — start a fresh chat\n/sessions or /resume — browse saved chats\n/resume ID or latest — resume a saved chat\n/history — show the SQLite database\nContext counts active prompt/reply tokens; Chat counts all saved messages, including archived turns and reasoning.\n\n/logs — show or hide the model activity panel\n/clear — clear display, keep conversation\n/quit — stop and exit\n\nSlash commands show suggestions as you type; Up/Down chooses and Tab or Enter completes. Press Enter again to run.\nUp/Down recalls this chat’s submitted prompts at the first/last composer row; Down past the newest restores your draft. Shift+arrows selects text.\nEnter submits. Shift+Enter inserts a newline. Ctrl+A selects the whole prompt; Shift+arrows select text.\nCtrl+Left/Right moves by word; add Shift to select words.\nCtrl+C copies selected text (otherwise quits); Ctrl+X cuts; Ctrl+V pastes.\nTerminal paste with Ctrl+Shift+V also works.\nBackspace/Delete removes selected text; typing or pasting replaces it.\nEsc stops an operation or closes the browser.\nMouse wheel over the chat or PageUp/PageDown scrolls. Scroll to the bottom to follow new replies. Older turns leave context when needed; the model can request FETCH_OLDER N to retrieve them.\n"),
             _ => self.status = "Unknown command. Type /help.".into(),
         }
     }
@@ -610,12 +659,23 @@ impl App {
 
     fn update(&mut self, update: Update) {
         match update {
+            Update::Context { index, usage } => {
+                if index == self.selected || index == usize::MAX {
+                    self.context_usage = usage;
+                }
+            }
             Update::HistoryLoaded {
                 path,
                 turns,
                 session,
                 saved_sessions,
+                prompts,
+                thinking,
             } => {
+                self.prompt_history.splice(0..0, prompts);
+                if !self.thinking_changed {
+                    self.thinking = thinking;
+                }
                 self.session_cursor
                     .select((!saved_sessions.is_empty()).then_some(0));
                 self.sessions = Some(saved_sessions);
@@ -641,7 +701,14 @@ impl App {
                 self.warmup();
             }
             Update::NewConversation(session) => {
+                self.prompt_history.clear();
+                self.history_cursor = None;
+                self.history_draft = None;
                 self.session = Some(session);
+                self.context_usage = ContextUsage {
+                    limit: self.context_usage.limit,
+                    ..Default::default()
+                };
                 self.session_browser = false;
                 self.busy = false;
                 self.transcript.clear();
@@ -661,7 +728,14 @@ impl App {
                 );
                 self.sessions = Some(sessions);
             }
-            Update::Resumed { session, turns } => {
+            Update::Resumed {
+                session,
+                turns,
+                prompts,
+            } => {
+                self.prompt_history = prompts;
+                self.history_cursor = None;
+                self.history_draft = None;
                 self.busy = false;
                 self.session_browser = false;
                 self.browser = false;
@@ -800,6 +874,15 @@ impl App {
         }
     }
 
+    fn context_label(&self) -> String {
+        let usage = self.context_usage;
+        let context = usage.limit.map_or_else(
+            || format!("Context: {} tokens", usage.active),
+            |limit| format!("Context: {} / {} tokens", usage.active, limit),
+        );
+        format!("{context} · Chat: {} tokens", usage.chat)
+    }
+
     fn render(&mut self, frame: &mut Frame) {
         self.chat_area = Rect::default();
         let suggestions = self.refresh_command_suggestions();
@@ -812,17 +895,18 @@ impl App {
             .min(frame.area().height.saturating_sub(7).clamp(1, 6) as usize)
             as u16;
         let [header, body, input, status] = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(composer_height + 3),
             Constraint::Length(1),
         ])
         .areas(frame.area());
         let title = format!(
-            "Puppygrad · {} · {} · temperature {} · {} · {}",
+            "Puppygrad · {} · {} · temperature {} · thinking {} · {} · {}",
             self.entries[self.selected].manifest.name,
             self.device,
             self.temperature,
+            if self.thinking { "on" } else { "off" },
             self.limit
                 .map_or_else(|| "output auto".into(), |n| format!("max {n} tokens")),
             self.session
@@ -830,7 +914,11 @@ impl App {
                 .map_or("New chat", |s| s.title.as_str())
         );
         frame.render_widget(
-            Paragraph::new(title).block(Block::new().borders(Borders::BOTTOM)),
+            Paragraph::new(Text::from(vec![
+                Line::from(title),
+                Line::from(self.context_label()),
+            ]))
+            .block(Block::new().borders(Borders::BOTTOM)),
             header,
         );
         let body = if self.show_activity && body.width >= 110 && body.height >= 6 {
@@ -1041,7 +1129,7 @@ impl App {
         } else if !suggestions.is_empty() {
             " · ↑↓ choose · Tab/Enter complete · Esc close"
         } else {
-            " · Enter send · Shift+Enter newline · /models · /help · Ctrl-C quit"
+            " · ↑↓ history · Enter send · Shift+Enter newline · /models · /help · Ctrl-C quit"
         };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -1120,6 +1208,49 @@ impl App {
         } else {
             self.scroll.saturating_sub(lines)
         };
+    }
+
+    fn prompt_history_key(&mut self, key: KeyEvent, columns: usize) -> bool {
+        if !key.modifiers.is_empty()
+            || !matches!(key.code, KeyCode::Up | KeyCode::Down)
+            || self.browser
+            || self.session_browser
+            || self.input.selection().is_some()
+            || self.prompt_history.is_empty()
+        {
+            return false;
+        }
+        let down = key.code == KeyCode::Down;
+        let recalled = self
+            .history_cursor
+            .and_then(|i| self.prompt_history.get(i))
+            .is_some_and(|text| *text == self.input.text);
+        if !recalled {
+            let layout = self.input.layout(columns);
+            if (!down && layout.cursor_row != 0)
+                || (down && layout.cursor_row + 1 != layout.rows.len())
+            {
+                return false;
+            }
+        }
+        let next = match (self.history_cursor, down) {
+            (None, true) => return false,
+            (None, false) => {
+                self.history_draft = Some(self.input.clone());
+                Some(self.prompt_history.len() - 1)
+            }
+            (Some(i), false) => Some(i.saturating_sub(1)),
+            (Some(i), true) if i + 1 < self.prompt_history.len() => Some(i + 1),
+            (Some(_), true) => None,
+        };
+        self.history_cursor = next;
+        if let Some(i) = next {
+            self.input.clear();
+            self.input.insert(&self.prompt_history[i]);
+        } else {
+            self.input = self.history_draft.take().unwrap_or_default();
+        }
+        true
     }
 
     fn mouse(&mut self, mouse: MouseEvent) {
@@ -1268,11 +1399,15 @@ impl App {
                                 let columns =
                                     terminal.size()?.width.saturating_sub(1).max(1) as usize;
                                 match key.code {
-                                    KeyCode::Up | KeyCode::Down => self.input.vertical(
-                                        key.code == KeyCode::Down,
-                                        columns,
-                                        key.modifiers.contains(KeyModifiers::SHIFT),
-                                    ),
+                                    KeyCode::Up | KeyCode::Down => {
+                                        if !self.prompt_history_key(key, columns) {
+                                            self.input.vertical(
+                                                key.code == KeyCode::Down,
+                                                columns,
+                                                key.modifiers.contains(KeyModifiers::SHIFT),
+                                            );
+                                        }
+                                    }
                                     KeyCode::Home | KeyCode::End => self.input.line_edge(
                                         key.code == KeyCode::End,
                                         key.modifiers.contains(KeyModifiers::CONTROL),
@@ -1371,7 +1506,7 @@ fn clipboard_read() -> io::Result<String> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Composer {
     text: String,
     // Byte offset, always at a Unicode grapheme boundary.
@@ -1586,15 +1721,58 @@ struct TokenWriter<'a> {
     first: Option<Duration>,
     text: String,
     visible: bool,
+    thinking: bool,
+    reasoning_end: Option<usize>,
+    emitted: usize,
 }
 impl TokenWriter<'_> {
-    fn finish(&mut self) -> io::Result<()> {
-        if !self.visible && !self.text.is_empty() {
+    fn answer(&self) -> &str {
+        if self.thinking && self.reasoning_end.is_none() {
+            ""
+        } else {
+            &self.text[self.reasoning_end.unwrap_or(0)..]
+        }
+    }
+
+    fn emit_to(&mut self, end: usize) -> io::Result<()> {
+        if end > self.emitted {
             self.first.get_or_insert_with(|| self.started.elapsed());
             self.updates
-                .send(Update::Chunk(self.text.clone()))
+                .send(Update::Chunk(self.text[self.emitted..end].into()))
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "UI closed"))?;
-            self.visible = true;
+            self.emitted = end;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<()> {
+        self.emit_to(self.text.len())?;
+        // Reasoning alone is neither a final answer nor a retrieval command.
+        self.visible = !self.answer().is_empty();
+        Ok(())
+    }
+
+    fn stream(&mut self) -> io::Result<()> {
+        if self.thinking && self.reasoning_end.is_none() {
+            let trimmed = self.text.trim_start();
+            if "<think>".starts_with(trimmed) {
+                return Ok(());
+            }
+            if trimmed.starts_with("<think>") {
+                if let Some(end) = self.text.find("</think>") {
+                    let end = end + "</think>".len();
+                    self.emit_to(end)?;
+                    self.reasoning_end = Some(end);
+                } else {
+                    return self.emit_to(self.text.len());
+                }
+            } else {
+                // Thinking mode also permits a direct answer (/no_think).
+                self.thinking = false;
+            }
+        }
+        if self.visible || !fetch_prefix(self.answer()) {
+            self.finish()?;
         }
         Ok(())
     }
@@ -1611,13 +1789,7 @@ impl Write for TokenWriter<'_> {
             let text = std::str::from_utf8(bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             self.text.push_str(text);
-            if self.visible {
-                self.updates
-                    .send(Update::Chunk(text.into()))
-                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "UI closed"))?;
-            } else if !fetch_prefix(&self.text) {
-                self.finish()?;
-            }
+            self.stream()?;
         }
         Ok(bytes.len())
     }
@@ -1711,6 +1883,18 @@ fn worker(
         path: conversation.path.clone(),
         turns: conversation.turns.clone(),
         session: conversation.current(),
+        prompts: conversation.user_prompts().unwrap_or_else(|error| {
+            let _ = updates.send(Update::Activity(format!(
+                "Could not load prompt history: {error}"
+            )));
+            Vec::new()
+        }),
+        thinking: conversation.thinking().unwrap_or_else(|error| {
+            let _ = updates.send(Update::Activity(format!(
+                "Could not read thinking preference: {error}"
+            )));
+            false
+        }),
         saved_sessions: conversation.sessions().unwrap_or_else(|error| {
             let _ = updates.send(Update::Activity(format!(
                 "Could not load saved chats: {error}"
@@ -1718,14 +1902,37 @@ fn worker(
             Vec::new()
         }),
     });
+    send_context_usage(
+        &entries,
+        &cache,
+        &conversation,
+        loaded.as_ref(),
+        tokenizer.as_ref(),
+        &updates,
+    );
     for request in requests {
         let shutdown = matches!(&request, Request::Shutdown);
         let warming = matches!(&request, Request::Warmup { .. });
         let inference = matches!(&request, Request::Warmup { .. } | Request::Generate { .. });
+        let refresh_context = !matches!(
+            &request,
+            Request::ListSessions
+                | Request::Download(_)
+                | Request::Shutdown
+                | Request::SetThinking(_)
+                | Request::Generate { .. }
+        );
         let warmup_started = Instant::now();
         let result: Result<()> = (|| {
             match request {
                 Request::Shutdown => return Ok(()),
+                Request::SetThinking(enabled) => {
+                    if let Err(error) = conversation.remember_thinking(enabled) {
+                        let _ = updates.send(Update::Activity(format!(
+                            "Could not save thinking preference: {error}"
+                        )));
+                    }
+                }
                 Request::SelectModel(index) => {
                     let id = &entries[index].manifest.id;
                     save_model_preference(&conversation, id, &updates);
@@ -1757,6 +1964,7 @@ fn worker(
                     let _ = updates.send(Update::Resumed {
                         session,
                         turns: conversation.turns.clone(),
+                        prompts: conversation.user_prompts()?,
                     });
                 }
                 Request::Download(index) => {
@@ -1778,19 +1986,20 @@ fn worker(
                     let _ = updates.send(Update::Downloaded);
                 }
                 request @ (Request::Generate { .. } | Request::Warmup { .. }) => {
-                    let (index, device, prompt, temperature, limit) = match request {
+                    let (index, device, prompt, thinking, temperature, limit) = match request {
                         Request::Generate {
                             index,
                             device,
                             prompt,
+                            thinking,
                             temperature,
                             limit,
-                        } => (index, device, prompt, temperature, limit),
+                        } => (index, device, prompt, thinking, temperature, limit),
                         Request::Warmup {
                             index,
                             device,
                             limit,
-                        } => (index, device, String::new(), 0., limit),
+                        } => (index, device, String::new(), false, 0., limit),
                         _ => unreachable!(),
                     };
                     if cancel.load(Ordering::Relaxed) {
@@ -1817,7 +2026,15 @@ fn worker(
                     let input = if warming {
                         vec![0]
                     } else {
-                        llm::tokenize_with(tokenizer, &dir, &prompt)?
+                        llm::tokenize_conversation_with(
+                            tokenizer,
+                            &dir,
+                            &[],
+                            &prompt,
+                            0,
+                            None,
+                            thinking,
+                        )?
                     };
                     // Only the prompt must fit initially. Output grows the retained
                     // allocation on demand, independently of the optional response cap.
@@ -1942,6 +2159,7 @@ fn worker(
                         &updates,
                         &cancel,
                         started,
+                        thinking,
                     )?;
                     let _ = updates.send(Update::ModelState(Some(ModelState {
                         index,
@@ -1952,6 +2170,7 @@ fn worker(
             }
             Ok(())
         })();
+        let refresh_context = refresh_context || (inference && !warming && result.is_err());
         if let Err(error) = result {
             if warming {
                 loaded = None;
@@ -1973,8 +2192,72 @@ fn worker(
                 let _ = updates.send(Update::Error(error.to_string()));
             }
         }
+        if refresh_context {
+            send_context_usage(
+                &entries,
+                &cache,
+                &conversation,
+                loaded.as_ref(),
+                tokenizer.as_ref(),
+                &updates,
+            );
+        }
         if shutdown {
             break;
+        }
+    }
+}
+
+fn send_context_usage(
+    entries: &[Entry],
+    cache: &std::path::Path,
+    conversation: &Conversation,
+    loaded: Option<&(usize, String, Model)>,
+    tokenizer: Option<&(usize, tokenizers::Tokenizer)>,
+    updates: &Sender<Update>,
+) {
+    let remembered = conversation.last_model().ok().flatten();
+    let index = conversation
+        .model
+        .as_deref()
+        .or(remembered.as_deref())
+        .and_then(|id| entries.iter().position(|e| e.manifest.id == id))
+        .or_else(|| loaded.map(|(index, _, _)| *index))
+        .or_else(|| entries.iter().position(|e| e.manifest.id == "qwen3-0.6b"))
+        .unwrap_or(0);
+    let dir = entries[index].model_dir(cache);
+    let limit = loaded
+        .filter(|(i, _, _)| *i == index)
+        .map(|(_, _, model)| model.info.context_length as usize);
+    let result: Result<ContextUsage> = (|| {
+        if conversation.current().turns == 0 {
+            return Ok(ContextUsage {
+                limit,
+                ..Default::default()
+            });
+        }
+        let fallback;
+        let tokenizer = if let Some((_, tokenizer)) = tokenizer.filter(|(i, _)| *i == index) {
+            tokenizer
+        } else {
+            fallback = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+                .map_err(|e| e.to_string())?;
+            &fallback
+        };
+        Ok(ContextUsage {
+            active: llm::history_token_count(tokenizer, &dir, &conversation.turns, false)?,
+            chat: llm::history_token_count(tokenizer, &dir, &conversation.all_turns()?, true)?,
+            limit,
+        })
+    })();
+    match result {
+        Ok(usage) => {
+            let _ = updates.send(Update::Context { index, usage });
+        }
+        Err(error) => {
+            let _ = updates.send(Update::Activity(format!(
+                "Could not count context tokens: {error}"
+            )));
         }
     }
 }
@@ -2001,10 +2284,20 @@ fn generate_conversation(
     updates: &Sender<Update>,
     cancel: &AtomicBool,
     started: Instant,
+    thinking: bool,
 ) -> Result<()> {
+    let thinking = thinking && llm::is_qwen3(dir)?;
     let context = usize::try_from(model.info.context_length)?;
+    let full_chat_tokens = llm::full_chat_prompt_token_count(
+        tokenizer,
+        dir,
+        &conversation.all_turns()?,
+        prompt,
+        thinking,
+    )?;
+
     let (mut input, dropped, budget) = conversation.prepare(context, |turns, older| {
-        llm::tokenize_conversation_with(tokenizer, dir, turns, prompt, older, None)
+        llm::tokenize_conversation_with(tokenizer, dir, turns, prompt, older, None, thinking)
     })?;
     if dropped != 0 {
         let _ = updates.send(Update::ContextTrimmed(dropped));
@@ -2041,8 +2334,22 @@ fn generate_conversation(
             first: None,
             text: String::new(),
             visible: false,
+            thinking,
+            reasoning_end: None,
+            emitted: 0,
         };
-        let result = llm::generate_output_displayed(
+        let mut progress = |generated: usize| {
+            let _ = updates.send(Update::Context {
+                index: usize::MAX,
+                usage: ContextUsage {
+                    active: input.len() + generated,
+                    chat: full_chat_tokens + generated,
+                    limit: Some(context),
+                },
+            });
+        };
+        progress(0);
+        let result = llm::generate_output_observed(
             model,
             tokenizer,
             &input,
@@ -2050,6 +2357,7 @@ fn generate_conversation(
             true,
             false,
             &mut writer,
+            &mut progress,
         );
         let output = match result {
             Ok(output) => output,
@@ -2058,11 +2366,11 @@ fn generate_conversation(
                     if let Some(previous_turns) = fetched_from.take() {
                         conversation.undo_fetch(previous_turns);
                         let _ = updates.send(Update::Status("Fetched messages could not be processed; continuing with recent context…".into()));
-                        input = llm::tokenize_conversation_with(tokenizer, dir, &conversation.turns, prompt, conversation.older_messages(), Some("The requested messages could not be processed within current resources. Answer using recent context; do not repeat this fetch."))?;
+                        input = llm::tokenize_conversation_with(tokenizer, dir, &conversation.turns, prompt, conversation.older_messages(), Some("The requested messages could not be processed within current resources. Answer using recent context; do not repeat this fetch."), thinking)?;
                         continue;
                     }
                 }
-                if !writer.text.is_empty() && fetch_count(&writer.text).is_none() {
+                if !writer.text.is_empty() && fetch_count(writer.answer()).is_none() {
                     writer.finish()?;
                     conversation.append(prompt.into(), writer.text)?;
                 }
@@ -2070,7 +2378,7 @@ fn generate_conversation(
             }
         };
         if !writer.visible {
-            if let Some(count) = fetch_count(&writer.text) {
+            if let Some(count) = fetch_count(writer.answer()) {
                 if fetches >= 3 {
                     return Err("The model reached the three-fetch limit for this question. Try a more specific question.".into());
                 }
@@ -2088,6 +2396,7 @@ fn generate_conversation(
                             prompt,
                             older,
                             Some(feedback),
+                            thinking,
                         )
                     })?;
                 if fetched_input.is_empty() {
@@ -2099,6 +2408,7 @@ fn generate_conversation(
                         prompt,
                         conversation.older_messages(),
                         Some(&feedback),
+                        thinking,
                     )?;
                 } else {
                     fetched_from = Some(previous_turns);
@@ -2109,6 +2419,14 @@ fn generate_conversation(
         }
         writer.finish()?;
         conversation.append(prompt.into(), writer.text)?;
+        let _ = updates.send(Update::Context {
+            index: usize::MAX,
+            usage: ContextUsage {
+                active: llm::history_token_count(tokenizer, dir, &conversation.turns, false)?,
+                chat: llm::history_token_count(tokenizer, dir, &conversation.all_turns()?, true)?,
+                limit: Some(context),
+            },
+        });
         let _ = updates.send(Update::Done {
             session: conversation.current(),
             tokens: output.tokens.len(),
@@ -2251,6 +2569,347 @@ mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
+    fn next_non_context(rx: &Receiver<Update>) -> Update {
+        loop {
+            let update = rx.recv_timeout(Duration::from_secs(15)).unwrap();
+            if !matches!(update, Update::Context { .. }) {
+                return update;
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_history_browses_both_directions_and_restores_the_draft_cursor() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.prompt_history = vec!["first".into(), "second\nline".into()];
+        app.input.insert("draft 🐶");
+        app.input.horizontal(false, false, false);
+        let draft = app.input.clone();
+        app.busy = true;
+        app.warming = true;
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.prompt_history_key(up, 80));
+        assert_eq!(app.input.text, "second\nline");
+        assert!(app.prompt_history_key(up, 80));
+        assert_eq!(app.input.text, "first");
+        assert!(app.prompt_history_key(up, 80));
+        assert_eq!(app.input.text, "first");
+        assert!(app.prompt_history_key(down, 80));
+        assert_eq!(app.input.text, "second\nline");
+        assert!(app.prompt_history_key(down, 80));
+        assert_eq!(app.input.text, draft.text);
+        assert_eq!(app.input.cursor, draft.cursor);
+        assert!(app.history_cursor.is_none());
+        assert!(!app.prompt_history_key(down, 80));
+        assert!(app.busy && app.warming && rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn prompt_history_respects_multiline_editing_selection_and_slash_suggestions() {
+        let f = WarmupFixture::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.prompt_history = vec!["old".into()];
+        app.input.insert("first row\nsecond row");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(!app.prompt_history_key(up, 80));
+        app.input.vertical(false, 80, false);
+        assert!(app.prompt_history_key(up, 80));
+        assert_eq!(app.input.text, "old");
+        assert!(app.prompt_history_key(down, 80));
+        assert_eq!(app.input.text, "first row\nsecond row");
+        assert_eq!(app.input.layout(80).cursor_row, 0);
+        assert!(!app.prompt_history_key(down, 80));
+        app.input.vertical(true, 80, false);
+        assert!(!app.prompt_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT), 80));
+        app.input.vertical(false, 80, true);
+        assert!(app.input.selection().is_some());
+        assert!(!app.prompt_history_key(up, 80));
+        app.input.clear();
+        app.input.insert("/thi");
+        assert!(app.complete_command_key(up));
+        assert_eq!(app.input.text, "/thi");
+        assert!(app.history_cursor.is_none());
+        app.input.clear();
+        app.input.insert("wrapped long draft");
+        assert!(!app.prompt_history_key(up, 6));
+        app.browser = true;
+        assert!(!app.prompt_history_key(up, 80));
+    }
+
+    #[test]
+    fn prompt_history_records_accepted_messages_but_not_commands_or_blocked_submissions() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.input.insert(" first message ");
+        app.submit();
+        assert_eq!(app.prompt_history, ["first message"]);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Request::Generate { prompt, .. } if prompt == "first message")
+        );
+        app.input.insert("blocked");
+        app.submit();
+        assert_eq!(app.prompt_history, ["first message"]);
+        assert_eq!(app.input.text, "blocked");
+        assert!(rx.try_recv().is_err());
+        app.input.clear();
+        app.input.insert("/thinking on");
+        app.submit();
+        assert!(matches!(rx.try_recv().unwrap(), Request::SetThinking(true)));
+        assert_eq!(app.prompt_history, ["first message"]);
+        app.command("/clear");
+        assert_eq!(app.prompt_history, ["first message"]);
+        app.update(Update::NewConversation(session()));
+        assert!(app.prompt_history.is_empty());
+        assert!(!app.prompt_history_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 80));
+    }
+
+    #[test]
+    fn resumed_prompt_history_includes_archived_messages_and_is_scoped_to_the_session() {
+        let f = WarmupFixture::new();
+        let path = f.root.join("history-navigation.db");
+        let mut chat = Conversation::open(&path).unwrap();
+        for i in 0..10 {
+            chat.append(format!("prompt {i}"), "answer".into()).unwrap();
+        }
+        let first = chat.session_id.clone();
+        chat.reset().unwrap();
+        chat.append("other chat".into(), "answer".into()).unwrap();
+        let second = chat.session_id.clone();
+        drop(chat);
+        let (requests, received) = mpsc::channel();
+        let (updates, output) = mpsc::channel();
+        requests.send(Request::Shutdown).unwrap();
+        worker(
+            f.entries.clone(),
+            f.cache.clone(),
+            received,
+            updates,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            path.clone(),
+            Some(first),
+        );
+        let history = next_non_context(&output);
+        assert!(
+            matches!(&history, Update::HistoryLoaded { turns, prompts, .. } if turns.len() == 8 && prompts.len() == 10)
+        );
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.auto_warmup = false;
+        app.prompt_history.push("queued during startup".into());
+        app.update(history);
+        assert_eq!(app.prompt_history[0], "prompt 0");
+        assert_eq!(app.prompt_history.last().unwrap(), "queued during startup");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        for _ in 0..11 {
+            assert!(app.prompt_history_key(up, 80));
+        }
+        assert_eq!(app.input.text, "prompt 0");
+        let mut chat = Conversation::open(&path).unwrap();
+        let session = chat.resume(&second).unwrap();
+        app.update(Update::Resumed {
+            session,
+            turns: chat.turns.clone(),
+            prompts: chat.user_prompts().unwrap(),
+        });
+        assert_eq!(app.prompt_history, ["other chat"]);
+        assert!(app.prompt_history_key(up, 80));
+        assert_eq!(app.input.text, "other chat");
+    }
+
+    #[test]
+    fn context_totals_count_archived_messages_and_reasoning_in_only_the_saved_chat() {
+        let f = WarmupFixture::new();
+        let dir = f.entries[0].model_dir(&f.cache);
+        fs::write(dir.join("config.json"), r#"{"model_type":"qwen3"}"#).unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let mut chat = Conversation::open(&f.root.join("context.db")).unwrap();
+        chat.model = Some(f.entries[0].manifest.id.clone());
+        for _ in 0..10 {
+            chat.append("foo".into(), "<think>foo foo foo</think>\n\nbar".into())
+                .unwrap();
+        }
+        let first = chat.session_id.clone();
+        chat.reset().unwrap();
+        chat.append("other session".into(), "must stay separate".into())
+            .unwrap();
+        chat.resume(&first).unwrap();
+        assert_eq!(chat.turns.len(), 8);
+        assert_eq!(chat.all_turns().unwrap().len(), 10);
+        let (tx, rx) = mpsc::channel();
+        send_context_usage(
+            &f.entries,
+            &f.cache,
+            &chat,
+            None,
+            Some(&(0, tokenizer.clone())),
+            &tx,
+        );
+        let Update::Context { index, usage } = rx.try_recv().unwrap() else {
+            panic!("missing counts")
+        };
+        assert_eq!(index, 0);
+        let active =
+            "<|im_start|>user\nfoo<|im_end|>\n<|im_start|>assistant\nbar<|im_end|>\n".repeat(8);
+        let full = "<|im_start|>user\nfoo<|im_end|>\n<|im_start|>assistant\n<think>foo foo foo</think>\n\nbar<|im_end|>\n".repeat(10);
+        assert_eq!(usage.active, tokenizer.encode(active, true).unwrap().len());
+        assert_eq!(usage.chat, tokenizer.encode(full, true).unwrap().len());
+        assert!(usage.chat > usage.active);
+        assert!(usage.limit.is_none());
+        chat.reset().unwrap();
+        send_context_usage(&f.entries, &f.cache, &chat, None, None, &tx);
+        assert!(
+            matches!(rx.try_recv().unwrap(), Update::Context { usage, .. } if usage == ContextUsage::default())
+        );
+    }
+
+    #[test]
+    fn context_header_persists_through_clear_and_resets_with_a_new_chat() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let f = WarmupFixture::new();
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.update(Update::Context {
+            index: 0,
+            usage: ContextUsage {
+                active: 123,
+                chat: 456,
+                limit: Some(4096),
+            },
+        });
+        app.update(Update::Context {
+            index: 1,
+            usage: ContextUsage::default(),
+        }); // A different model's stale result is ignored.
+        for width in [100, 60] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                screen.contains("Context: 123 / 4096 tokens · Chat: 456 tokens"),
+                "{screen}"
+            );
+        }
+        app.command("/clear");
+        assert_eq!(app.context_usage.chat, 456);
+        app.update(Update::NewConversation(session()));
+        assert_eq!(
+            app.context_usage,
+            ContextUsage {
+                limit: Some(4096),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn context_progress_uses_generated_token_counts_and_refreshes_saved_totals() {
+        let f = WarmupFixture::new();
+        let (requests, received) = mpsc::channel();
+        let (updates, output) = mpsc::channel();
+        requests
+            .send(Request::Generate {
+                index: 0,
+                device: "cpu".into(),
+                prompt: "prompt".into(),
+                thinking: false,
+                temperature: 0.,
+                limit: Some(3),
+            })
+            .unwrap();
+        requests.send(Request::Shutdown).unwrap();
+        worker(
+            f.entries.clone(),
+            f.cache.clone(),
+            received,
+            updates,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            f.root.join("progress.db"),
+            None,
+        );
+        let updates: Vec<_> = output.try_iter().collect();
+        assert!(!updates.iter().any(|u| matches!(u, Update::Error(_))));
+        let progress: Vec<_> = updates
+            .iter()
+            .filter_map(|u| match u {
+                Update::Context { index, usage } if *index == usize::MAX => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        assert!(progress.len() >= 6, "{progress:?}");
+        let start = progress[0];
+        for (i, usage) in progress.iter().take(4).enumerate() {
+            assert_eq!(usage.active, start.active + i);
+            assert_eq!(usage.chat, start.chat + i);
+            assert!(usage.limit.is_some());
+        }
+        assert!(matches!(
+            updates
+                .iter()
+                .find(|u| matches!(u, Update::Done { .. }))
+                .unwrap(),
+            Update::Done { tokens: 3, .. }
+        ));
+        let chat = Conversation::open(&f.root.join("progress.db")).unwrap();
+        let mut resumed = chat;
+        resumed.resume("latest").unwrap();
+        let dir = f.entries[0].model_dir(&f.cache);
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let final_usage = progress.last().unwrap();
+        assert_eq!(
+            final_usage.chat,
+            llm::history_token_count(&tokenizer, &dir, &resumed.all_turns().unwrap(), true)
+                .unwrap()
+        );
+        assert_eq!(
+            final_usage.active,
+            llm::history_token_count(&tokenizer, &dir, &resumed.turns, false).unwrap()
+        );
+    }
+
     #[test]
     fn mouse_scroll_stays_in_chat_and_holds_position_while_streaming() {
         let f = WarmupFixture::new();
@@ -2360,6 +3019,7 @@ mod tests {
             "/new",
             "/download",
             "/device",
+            "/thinking",
             "/temperature",
             "/tokens",
             "/history",
@@ -2522,6 +3182,246 @@ mod tests {
     }
 
     #[test]
+    fn thinking_streams_fragmented_reasoning_but_hides_fetch_commands() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let mut writer = TokenWriter {
+            updates: &tx,
+            cancel: &cancel,
+            started: Instant::now(),
+            first: None,
+            text: String::new(),
+            visible: false,
+            thinking: true,
+            reasoning_end: None,
+            emitted: 0,
+        };
+        // Exercise every tag boundary and UTF-8 text, including a fetch-looking thought.
+        let thought = "<think>\nFETCH_OLDER 4 might help 🐶.\n</think>";
+        for c in thought.chars() {
+            writer.write_all(c.to_string().as_bytes()).unwrap();
+        }
+        let shown: String = rx
+            .try_iter()
+            .filter_map(|u| match u {
+                Update::Chunk(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, thought);
+        assert!(!writer.visible);
+        assert!(writer.first.is_some());
+        assert_eq!(writer.answer(), "");
+        for chunk in ["\n\nFET", "CH_OLDER ", "2"] {
+            writer.write_all(chunk.as_bytes()).unwrap();
+        }
+        assert_eq!(fetch_count(writer.answer()), Some(2));
+        assert!(rx.try_recv().is_err());
+        assert!(!writer.visible);
+        writer.write_all(b" is just an example.").unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), Update::Chunk(s) if s == "\n\nFETCH_OLDER 2 is just an example.")
+        );
+        assert!(writer.visible);
+        writer.write_all(b" Answer.").unwrap();
+        writer.finish().unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), Update::Chunk(s) if s == " Answer."));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn thinking_streams_direct_answers_and_keeps_unfinished_reasoning_out_of_answers() {
+        for text in ["The answer is 2.", "<think>unfinished"] {
+            let (tx, rx) = mpsc::channel();
+            let cancel = AtomicBool::new(false);
+            let mut writer = TokenWriter {
+                updates: &tx,
+                cancel: &cancel,
+                started: Instant::now(),
+                first: None,
+                text: String::new(),
+                visible: false,
+                thinking: true,
+                reasoning_end: None,
+                emitted: 0,
+            };
+            for c in text.chars() {
+                writer.write_all(c.to_string().as_bytes()).unwrap();
+            }
+            writer.finish().unwrap();
+            let shown: String = rx
+                .try_iter()
+                .filter_map(|u| match u {
+                    Update::Chunk(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, text);
+            assert_eq!(
+                writer.answer(),
+                if text.starts_with("<think>") {
+                    ""
+                } else {
+                    text
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_command_persists_without_changing_busy_ownership_and_restores_on_startup() {
+        let f = WarmupFixture::new();
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(
+            f.entries.clone(),
+            f.cache.clone(),
+            "cpu".into(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.auto_warmup = false;
+        let history = || Update::HistoryLoaded {
+            path: f.root.join("thinking.db"),
+            session: session(),
+            turns: vec![],
+            prompts: vec![],
+            saved_sessions: vec![],
+            thinking: true,
+        };
+        app.update(history());
+        assert!(app.thinking);
+        app.command("/thinking");
+        assert!(app.status.contains("on"));
+        for invalid in ["/thinking maybe", "/thinking on extra"] {
+            app.command(invalid);
+            assert!(app.thinking && rx.try_recv().is_err());
+        }
+        app.busy = true;
+        app.warming = true;
+        app.command("/thinking off");
+        assert!(!app.thinking && app.busy && app.warming);
+        app.update(history()); // A late startup update cannot overwrite explicit choice.
+        assert!(!app.thinking);
+        app.command("/thinking on");
+        assert!(app.thinking && app.busy && app.warming);
+        app.busy = false;
+        app.warming = false;
+        app.input.insert("hello");
+        app.submit();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Request::SetThinking(false)
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), Request::SetThinking(true)));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Request::Generate { thinking: true, .. }
+        ));
+
+        // Exercise the actual worker's saved preference through a separate database.
+        let path = f.root.join("thinking.db");
+        for enabled in [true, false] {
+            let (requests, received) = mpsc::channel();
+            let (updates, output) = mpsc::channel();
+            requests.send(Request::SetThinking(enabled)).unwrap();
+            requests.send(Request::Shutdown).unwrap();
+            worker(
+                f.entries.clone(),
+                f.cache.clone(),
+                received,
+                updates,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                path.clone(),
+                None,
+            );
+            assert!(!output.try_iter().any(|u| matches!(u, Update::Error(_))));
+            assert_eq!(
+                Conversation::open(&path).unwrap().thinking().unwrap(),
+                enabled
+            );
+            let (requests, received) = mpsc::channel();
+            let (updates, output) = mpsc::channel();
+            requests.send(Request::Shutdown).unwrap();
+            worker(
+                f.entries.clone(),
+                f.cache.clone(),
+                received,
+                updates,
+                Arc::new(AtomicBool::new(false)),
+                None,
+                path.clone(),
+                None,
+            );
+            assert!(output.try_iter().any(
+                |u| matches!(u, Update::HistoryLoaded { thinking, .. } if thinking == enabled)
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-0.6B checkpoint and an AMD GPU"]
+    fn qwen_thinking_toggle_generates_reasoning_and_then_a_direct_answer() {
+        let f = WarmupFixture::new();
+        let dir = PathBuf::from("models/qwen3-0.6b");
+        let mut chat = Conversation::open(&f.root.join("thinking-hip.db")).unwrap();
+        let _scope = crate::database::use_path(&chat.path).unwrap();
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).unwrap();
+        let mut model = llm::load_model_with_policy(
+            std::path::Path::new("examples/qwen3_cached.pup"),
+            &dir,
+            "hip:0",
+            None,
+            false,
+            crate::compiler::cpu::CpuTarget::Generic,
+            llm::LoadPolicy {
+                grow_context: true,
+                cache_dir: Some(&PathBuf::from(".cache/pup/thinking-validation")),
+                context_request: Some(super::super::llm_capacity::ContextRequest {
+                    capacity: 1024,
+                    prompt_tokens: 1,
+                    minimum_capacity: Some(1),
+                }),
+                max_memory: None,
+            },
+        )
+        .unwrap();
+        for thinking in [true, false] {
+            let (tx, rx) = mpsc::channel();
+            generate_conversation(
+                &mut model,
+                &tokenizer,
+                &dir,
+                &mut chat,
+                "What is 1 + 1? Answer briefly.",
+                0.6,
+                Some(512),
+                &tx,
+                &AtomicBool::new(false),
+                Instant::now(),
+                thinking,
+            )
+            .unwrap();
+            let updates: Vec<_> = rx.try_iter().collect();
+            let shown: String = updates
+                .iter()
+                .filter_map(|u| match u {
+                    Update::Chunk(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            println!("thinking={thinking}: {shown}");
+            assert_eq!(shown.contains("<think>"), thinking);
+            if thinking {
+                assert!(shown.contains("</think>"));
+            }
+            assert!(llm::assistant_answer(&shown).contains('2'));
+            assert_eq!(chat.turns.last().unwrap().assistant, shown);
+            assert!(updates.iter().any(|u| matches!(u, Update::Done { .. })));
+        }
+    }
+
+    #[test]
     fn possible_fetch_commands_are_hidden_and_ordinary_prefixes_stream() {
         let (tx, rx) = mpsc::channel();
         let cancel = AtomicBool::new(false);
@@ -2532,6 +3432,9 @@ mod tests {
             first: None,
             text: String::new(),
             visible: false,
+            thinking: false,
+            reasoning_end: None,
+            emitted: 0,
         };
         for chunk in ["FET", "CH_", "OLDER", " ", "2"] {
             writer.write_all(chunk.as_bytes()).unwrap();
@@ -2567,7 +3470,9 @@ mod tests {
         ));
         app.update(Update::HistoryLoaded {
             session: session(),
+            prompts: vec![],
             saved_sessions: vec![],
+            thinking: false,
             path: f.root.join("conversation.jsonl"),
             turns: vec![Turn {
                 user: "old question".into(),
@@ -2632,6 +3537,7 @@ mod tests {
         app.command("/resume latest");
         assert!(rx.try_recv().is_err());
         app.update(Update::Resumed {
+            prompts: vec![],
             session: saved,
             turns: vec![Turn {
                 user: "saved question".into(),
@@ -2667,7 +3573,9 @@ mod tests {
             path: f.root.join("puppygrad.db"),
             session: session(),
             turns: vec![],
+            prompts: vec![],
             saved_sessions: vec![saved.clone()],
+            thinking: false,
         });
         app.input.insert("/resum");
         app.refresh_session_preview();
@@ -2860,7 +3768,9 @@ mod tests {
             path: f.root.join("puppygrad.db"),
             session: saved.clone(),
             turns: vec![],
+            prompts: vec![],
             saved_sessions: vec![],
+            thinking: false,
         });
         assert_eq!(app.selected, 1);
         assert!(matches!(
@@ -2879,7 +3789,9 @@ mod tests {
             path: f.root.join("puppygrad.db"),
             session: saved,
             turns: vec![],
+            prompts: vec![],
             saved_sessions: vec![],
+            thinking: false,
         });
         assert_eq!(app.selected, 0);
         assert!(rx.try_recv().is_err());
@@ -2925,10 +3837,10 @@ mod tests {
                 None,
             );
             assert!(
-                matches!(received.try_recv().unwrap(), Update::HistoryLoaded { turns, .. } if turns.is_empty())
+                matches!(next_non_context(&received), Update::HistoryLoaded { turns, .. } if turns.is_empty())
             );
             assert!(
-                matches!(received.try_recv().unwrap(), Update::Sessions(sessions) if sessions.len() == 1 && sessions[0].id == old_id)
+                matches!(next_non_context(&received), Update::Sessions(sessions) if sessions.len() == 1 && sessions[0].id == old_id)
             );
         }
         let mut original = Conversation::open(&old_path).unwrap();
@@ -2963,19 +3875,19 @@ mod tests {
             None,
         );
         assert!(
-            matches!(received.try_recv().unwrap(), Update::HistoryLoaded { turns, .. } if turns.is_empty())
+            matches!(next_non_context(&received), Update::HistoryLoaded { turns, .. } if turns.is_empty())
         );
         assert!(
-            matches!(received.try_recv().unwrap(), Update::Sessions(sessions) if sessions.len() == 1)
+            matches!(next_non_context(&received), Update::Sessions(sessions) if sessions.len() == 1)
         );
         assert!(
-            matches!(received.try_recv().unwrap(), Update::Resumed { session, turns } if session.id == old_id && turns[0].assistant == "saved answer")
+            matches!(next_non_context(&received), Update::Resumed { session, turns, .. } if session.id == old_id && turns[0].assistant == "saved answer")
         );
         assert!(
-            matches!(received.try_recv().unwrap(), Update::NewConversation(session) if session.id != old_id)
+            matches!(next_non_context(&received), Update::NewConversation(session) if session.id != old_id)
         );
         assert!(
-            matches!(received.try_recv().unwrap(), Update::Sessions(sessions) if sessions.len() == 1 && sessions[0].id == old_id)
+            matches!(next_non_context(&received), Update::Sessions(sessions) if sessions.len() == 1 && sessions[0].id == old_id)
         );
     }
 
@@ -2989,6 +3901,12 @@ mod tests {
     #[ignore = "requires the full Qwen3-1.7B checkpoint and an AMD GPU"]
     fn qwen17_chat_remembers_a_name_across_normal_turns() {
         qwen_name_chat("qwen3-1.7b");
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-4B checkpoint and an AMD GPU"]
+    fn qwen4_chat_remembers_a_name_across_normal_turns() {
+        qwen_name_chat("qwen3-4b");
     }
 
     fn qwen_name_chat(id: &str) {
@@ -3040,6 +3958,7 @@ mod tests {
                 &tx,
                 &AtomicBool::new(false),
                 Instant::now(),
+                false,
             )
             .unwrap();
             let text = rx
@@ -3069,6 +3988,12 @@ mod tests {
     #[ignore = "requires the full Qwen3-1.7B checkpoint and an AMD GPU"]
     fn qwen17_chat_fetches_archived_messages() {
         qwen_archive_chat("qwen3-1.7b");
+    }
+
+    #[test]
+    #[ignore = "requires the full Qwen3-4B checkpoint and an AMD GPU"]
+    fn qwen4_chat_fetches_archived_messages() {
+        qwen_archive_chat("qwen3-4b");
     }
 
     fn qwen_archive_chat(id: &str) {
@@ -3114,7 +4039,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         generate_conversation(&mut model, &tokenizer, &dir, &mut chat,
             "What was the secret code I told you? If it is not visible, respond with FETCH_OLDER 2.",
-            0., Some(96), &tx, &AtomicBool::new(false), Instant::now()).unwrap();
+            0., Some(96), &tx, &AtomicBool::new(false), Instant::now(), false).unwrap();
         let updates = rx.try_iter().collect::<Vec<_>>();
         let text = updates
             .iter()
@@ -3256,6 +4181,7 @@ mod tests {
                     index: 0,
                     device: "cpu".into(),
                     prompt: "prompt".into(),
+                    thinking: false,
                     temperature: 0.,
                     limit: Some(10),
                 })
@@ -3267,6 +4193,7 @@ mod tests {
                 index: 0,
                 device: "cpu".into(),
                 prompt: "prompt".into(),
+                thinking: false,
                 temperature: 0.,
                 limit: Some(10),
             })
@@ -3390,18 +4317,20 @@ mod tests {
             None,
         );
         assert!(
-            matches!(received.try_recv().unwrap(), Update::HistoryLoaded { turns, .. } if turns.is_empty())
+            matches!(next_non_context(&received), Update::HistoryLoaded { turns, .. } if turns.is_empty())
         );
-        let state = received.try_recv().unwrap();
+        let state = next_non_context(&received);
         assert!(matches!(state, Update::ModelState(None)));
         app.update(state);
-        let update = received.try_recv().unwrap();
+        let update = next_non_context(&received);
         assert!(matches!(&update, Update::Warmed { error: Some(_), .. }));
         app.update(update);
         assert!(!app.busy && !app.warming);
         assert_eq!(app.transcript, transcript);
         assert!(!f.cache.join("compiled").exists());
-        assert!(received.try_recv().is_err());
+        assert!(received
+            .try_iter()
+            .all(|u| matches!(u, Update::Context { .. })));
     }
 
     #[test]
@@ -3439,7 +4368,7 @@ mod tests {
         let mut activity = Vec::new();
         loop {
             match received.recv_timeout(Duration::from_secs(15)).unwrap() {
-                Update::Status(_) | Update::HistoryLoaded { .. } => {}
+                Update::Status(_) | Update::HistoryLoaded { .. } | Update::Context { .. } => {}
                 Update::Activity(message) => activity.push(message),
                 Update::ModelState(Some(state)) => {
                     assert_eq!(state.index, 0);
@@ -3461,7 +4390,9 @@ mod tests {
                 Preparation::Ready
             ]
         );
-        assert!(activity.iter().any(|s| s == "Loading checkpoint weights (read + conversion)…"));
+        assert!(activity
+            .iter()
+            .any(|s| s == "Loading checkpoint weights (read + conversion)…"));
         assert!(activity
             .iter()
             .any(|s| s.starts_with("Compiling CPU module")));
@@ -3476,6 +4407,7 @@ mod tests {
                 index: 0,
                 device: "cpu".into(),
                 prompt: "prompt".into(),
+                thinking: false,
                 temperature: 0.,
                 limit: Some(1),
             })
@@ -3521,6 +4453,7 @@ mod tests {
                     index: 0,
                     device: "cpu".into(),
                     prompt: "prompt".into(),
+                    thinking: false,
                     temperature: 0.,
                     limit,
                 })
@@ -3548,6 +4481,7 @@ mod tests {
                 "prompt",
                 0,
                 None,
+                false,
             )
             .unwrap()
             .len();

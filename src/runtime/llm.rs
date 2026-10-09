@@ -110,6 +110,30 @@ pub(super) fn generate_output_displayed(
     echo_prompt: bool,
     writer: &mut dyn Write,
 ) -> Result<super::llm_ffi::Output> {
+    generate_output_observed(
+        model,
+        tokenizer,
+        input,
+        generation,
+        stream,
+        echo_prompt,
+        writer,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn generate_output_observed(
+    model: &mut Model,
+    tokenizer: &tokenizers::Tokenizer,
+    input: &[u32],
+    generation: Generation,
+    stream: bool,
+    echo_prompt: bool,
+    writer: &mut dyn Write,
+    on_progress: &mut dyn FnMut(usize),
+) -> Result<super::llm_ffi::Output> {
+    let mut generated = 0;
     let mut decoded = String::new();
     let mut decoder = tokenizer.decode_stream(true);
     if stream && echo_prompt {
@@ -125,6 +149,8 @@ pub(super) fn generate_output_displayed(
     }
     let output = if stream {
         let mut on_tokens = |tokens: &[u32]| -> Result<()> {
+            generated += tokens.len();
+            on_progress(generated);
             for &token in tokens {
                 if tokenizer.id_to_token(token).is_none() {
                     return Err("model generated an ID absent from the tokenizer".into());
@@ -149,6 +175,7 @@ pub(super) fn generate_output_displayed(
     {
         return Err("model generated an ID absent from the tokenizer".into());
     }
+    on_progress(output.tokens.len());
     let mut all = if echo_prompt { input.to_vec() } else { vec![] };
     all.extend_from_slice(&output.tokens);
     let complete = tokenizer.decode(&all, true).map_err(|e| e.to_string())?;
@@ -279,6 +306,7 @@ pub(super) fn tokenize_conversation_with(
     prompt: &str,
     older_messages: usize,
     feedback: Option<&str>,
+    thinking: bool,
 ) -> std::result::Result<Vec<u32>, Box<dyn std::error::Error>> {
     let formatted = format_chat_prompt(
         is_qwen3(model_dir)?,
@@ -286,6 +314,7 @@ pub(super) fn tokenize_conversation_with(
         prompt,
         older_messages,
         feedback,
+        thinking,
     );
     Ok(tokenizer
         .encode(formatted, true)
@@ -300,10 +329,16 @@ fn format_chat_prompt(
     prompt: &str,
     older_messages: usize,
     feedback: Option<&str>,
+    thinking: bool,
 ) -> String {
-    let system = (older_messages > 0 || feedback.is_some()).then(|| format!(
+    let mut system = (older_messages > 0 || feedback.is_some()).then(|| format!(
         "You are a helpful assistant. The app saves the conversation to a file. Earlier messages outside your context: {older_messages}.\n\nTo read earlier messages, your ENTIRE response must be FETCH_OLDER N, with no explanation, quotes or other text. N is a positive integer from 1 to 1024. Example response: FETCH_OLDER 2\n\nWhen asked about an earlier detail that is absent from the visible conversation, fetch earlier messages before answering. Never pretend that you fetched them, and never invent a missing detail. The app will insert the retrieved user/assistant turns before the recent messages and ask the same question again. If a fetch is refused, request fewer messages or explain that the detail is unavailable. If no earlier messages remain, answer from the visible conversation."
     ));
+    if qwen3 && thinking {
+        if let Some(system) = &mut system {
+            system.push_str("\nIn thinking mode, FETCH_OLDER N must be the entire final answer after </think>; reasoning may precede it.");
+        }
+    }
     // Keep the question before the fetch result and repeat it afterward. Both
     // Qwen sizes then stay focused on the question as the fetch completes.
     let continued_prompt = feedback.map(|feedback| format!("{prompt}\n\n[Application FETCH_OLDER result: {feedback} Earlier messages still outside context: {older_messages}. Answer the user question below using the visible conversation. Do not repeat a successful fetch. Request additional messages only if the required detail is still absent.]\n\n{prompt}"));
@@ -312,6 +347,7 @@ fn format_chat_prompt(
         turns,
         continued_prompt.as_deref().unwrap_or(prompt),
         system.as_deref(),
+        thinking,
     )
 }
 
@@ -335,10 +371,16 @@ fn format_prompt(
     model_dir: &Path,
     prompt: &str,
 ) -> std::result::Result<String, Box<dyn std::error::Error>> {
-    Ok(format_conversation(is_qwen3(model_dir)?, &[], prompt, None))
+    Ok(format_conversation(
+        is_qwen3(model_dir)?,
+        &[],
+        prompt,
+        None,
+        false,
+    ))
 }
 
-fn is_qwen3(model_dir: &Path) -> std::result::Result<bool, Box<dyn std::error::Error>> {
+pub(super) fn is_qwen3(model_dir: &Path) -> std::result::Result<bool, Box<dyn std::error::Error>> {
     let config = model_dir.join("config.json");
     if config.is_file() {
         let config: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
@@ -347,43 +389,124 @@ fn is_qwen3(model_dir: &Path) -> std::result::Result<bool, Box<dyn std::error::E
     Ok(false)
 }
 
+fn format_history(
+    qwen3: bool,
+    turns: &[super::conversation::Turn],
+    system: Option<&str>,
+    include_reasoning: bool,
+) -> String {
+    let mut text = String::new();
+    if let Some(system) = system {
+        if qwen3 {
+            text.push_str(&format!("<|im_start|>system\n{system}<|im_end|>\n"));
+        } else {
+            text.push_str(&format!("System: {system}\n\n"));
+        }
+    }
+    for turn in turns {
+        let answer = if qwen3 && !include_reasoning {
+            assistant_answer(&turn.assistant)
+        } else {
+            &turn.assistant
+        };
+        if qwen3 {
+            text.push_str(&format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}<|im_end|>\n",
+                turn.user, answer
+            ));
+        } else {
+            text.push_str(&format!("User: {}\nAssistant: {}\n\n", turn.user, answer));
+        }
+    }
+    text
+}
+
+/// Tokenize saved message history without inventing a pending user message.
+pub(super) fn history_token_count(
+    tokenizer: &tokenizers::Tokenizer,
+    model_dir: &Path,
+    turns: &[super::conversation::Turn],
+    include_reasoning: bool,
+) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+    if turns.is_empty() {
+        return Ok(0);
+    }
+    Ok(tokenizer
+        .encode(
+            format_history(is_qwen3(model_dir)?, turns, None, include_reasoning),
+            true,
+        )
+        .map_err(|e| e.to_string())?
+        .len())
+}
+
+pub(super) fn full_chat_prompt_token_count(
+    tokenizer: &tokenizers::Tokenizer,
+    model_dir: &Path,
+    turns: &[super::conversation::Turn],
+    prompt: &str,
+    thinking: bool,
+) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+    Ok(tokenizer
+        .encode(
+            format_conversation_with_reasoning(
+                is_qwen3(model_dir)?,
+                turns,
+                prompt,
+                None,
+                thinking,
+                true,
+            ),
+            true,
+        )
+        .map_err(|e| e.to_string())?
+        .len())
+}
+
 fn format_conversation(
     qwen3: bool,
     turns: &[super::conversation::Turn],
     prompt: &str,
     system: Option<&str>,
+    thinking: bool,
 ) -> String {
-    let mut text = String::new();
+    format_conversation_with_reasoning(qwen3, turns, prompt, system, thinking, false)
+}
+
+fn format_conversation_with_reasoning(
+    qwen3: bool,
+    turns: &[super::conversation::Turn],
+    prompt: &str,
+    system: Option<&str>,
+    thinking: bool,
+    include_reasoning: bool,
+) -> String {
+    let mut text = format_history(qwen3, turns, system, include_reasoning);
     if qwen3 {
-        if let Some(system) = system {
-            text.push_str(&format!("<|im_start|>system\n{system}<|im_end|>\n"));
-        }
-        for turn in turns {
-            text.push_str(&format!(
-                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}<|im_end|>\n",
-                turn.user, turn.assistant
-            ));
-        }
         text.push_str(&format!(
-            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         ));
+        if !thinking {
+            text.push_str("<think>\n\n</think>\n\n");
+        }
+    } else if turns.is_empty() && system.is_none() {
+        text.push_str(prompt);
     } else {
-        if let Some(system) = system {
-            text.push_str(&format!("System: {system}\n\n"));
-        }
-        for turn in turns {
-            text.push_str(&format!(
-                "User: {}\nAssistant: {}\n\n",
-                turn.user, turn.assistant
-            ));
-        }
-        if turns.is_empty() && system.is_none() {
-            text.push_str(prompt);
-        } else {
-            text.push_str(&format!("User: {prompt}\nAssistant:"));
-        }
+        text.push_str(&format!("User: {prompt}\nAssistant:"));
     }
     text
+}
+
+/// Final answer after a leading Qwen reasoning block; unfinished reasoning is not an answer.
+pub(super) fn assistant_answer(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("<think>") {
+        trimmed
+            .split_once("</think>")
+            .map_or("", |(_, answer)| answer.trim_start_matches('\n'))
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
@@ -396,13 +519,13 @@ mod prompt_tests {
             assistant: "Hello puppy".into(),
             created_at: None,
         }];
-        let ordinary = format_chat_prompt(true, &turns, "What is my name", 0, None);
+        let ordinary = format_chat_prompt(true, &turns, "What is my name", 0, None, false);
         assert_eq!(
             ordinary,
-            format_conversation(true, &turns, "What is my name", None)
+            format_conversation(true, &turns, "What is my name", None, false)
         );
         assert!(!ordinary.contains("FETCH_OLDER"));
-        let archived = format_chat_prompt(true, &turns, "What is my name", 2, None);
+        let archived = format_chat_prompt(true, &turns, "What is my name", 2, None, false);
         assert!(archived.starts_with("<|im_start|>system\n"));
         assert!(archived.contains("Earlier messages outside your context: 2"));
         assert!(archived.contains("FETCH_OLDER N"));
@@ -412,6 +535,7 @@ mod prompt_tests {
             "What is my name",
             0,
             Some("Added 2 older messages."),
+            false,
         );
         assert!(fetched.starts_with("<|im_start|>system\n"));
         assert!(fetched.contains("[Application FETCH_OLDER result: Added 2 older messages."));
@@ -437,13 +561,39 @@ mod prompt_tests {
             &turns,
             "What is my name?",
             Some("FETCH_OLDER result: Added 2 messages."),
+            false,
         );
         assert_eq!(formatted, "<|im_start|>system\nFETCH_OLDER result: Added 2 messages.<|im_end|>\n<|im_start|>user\nMy name is Teppo<|im_end|>\n<|im_start|>assistant\nHello Teppo<|im_end|>\n<|im_start|>user\nWhat is my name?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
         assert_eq!(
-            format_conversation(false, &turns, "What is my name?", None),
+            format_conversation(false, &turns, "What is my name?", None, false),
             "User: My name is Teppo\nAssistant: Hello Teppo\n\nUser: What is my name?\nAssistant:"
         );
     }
+    #[test]
+    fn thinking_template_omits_empty_block_and_replays_only_previous_answers() {
+        let turns = [super::super::conversation::Turn {
+            user: "1+1?".into(),
+            assistant: "<think>private earlier steps</think>\n\n2".into(),
+            created_at: None,
+        }];
+        let text = format_chat_prompt(true, &turns, "2+2?", 0, None, true);
+        assert_eq!(text, "<|im_start|>user\n1+1?<|im_end|>\n<|im_start|>assistant\n2<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n");
+        let retrieved =
+            format_chat_prompt(true, &turns, "2+2?", 2, Some("Added 2 messages."), true);
+        assert!(retrieved.contains("FETCH_OLDER N") && retrieved.contains("Added 2 messages."));
+        assert!(retrieved.ends_with("<|im_start|>assistant\n"));
+        assert!(!retrieved.contains("<think>"));
+        assert_eq!(assistant_answer("<think>unfinished"), "");
+        assert_eq!(
+            assistant_answer("an answer mentioning </think>"),
+            "an answer mentioning </think>"
+        );
+        assert_eq!(
+            format_conversation(false, &turns, "2+2?", None, true),
+            format_conversation(false, &turns, "2+2?", None, false)
+        );
+    }
+
     #[test]
     fn qwen3_non_thinking_template_matches_official_single_user_prefix() {
         let dir =
